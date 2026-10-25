@@ -19,7 +19,6 @@ import {
   defaultConfigText,
   homeDir,
   isAbsolutePath,
-  joinPath,
   jobKey,
   isExpired,
   loadRecord,
