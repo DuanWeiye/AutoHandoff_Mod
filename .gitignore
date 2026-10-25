@@ -1,0 +1,13 @@
+# e2e 驱动（Python）运行时生成
+__pycache__/
+*.pyc
+.claude/worktrees/
+
+# Internal working files kept out of the public repository
+HANDOVER.md
+docs/DESIGN-v2.md
+win/desk.sh
+private/
+
+# Claude Code 加载 mod 时生成的类型声明（随版本变化，不入库）
+.claude-plugin/types/

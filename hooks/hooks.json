@@ -1,0 +1,6 @@
+{
+  "description": "AutoHandoff 4: reminds the model as the context fills up, takes the handoff file it registers, then runs /clear or /compact and resumes from that file.",
+  "modules": [
+    "./register.ts"
+  ]
+}

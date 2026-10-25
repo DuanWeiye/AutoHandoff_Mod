@@ -1,0 +1,14 @@
+{
+  "name": "autohandoff",
+  "description": "AutoHandoff for Claude Code: automatic context handoff with /clear or /compact.",
+  "owner": {
+    "name": "Weiye Duan"
+  },
+  "plugins": [
+    {
+      "name": "autohandoff",
+      "source": "./",
+      "description": "Automatic context handoff: at configurable context thresholds the model writes a handoff file, then the conversation is reset (/clear or /compact) and resumed from that file."
+    }
+  ]
+}
