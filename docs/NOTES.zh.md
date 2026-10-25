@@ -41,7 +41,7 @@
   引擎 meta 不解除；用户自己 /clear 出来的对话不带（migrate 清掉）。`/autohandoff status` 显示这一行（第 4 批）。
 - **compact 窗口**（§0 第 23 条）：用户的 /clear 先跑完时立即给 start_context（`ctxGiven`），自家 /compact 随后成功或失败都续接，Esc 静默作废。
   孤儿 job 遇到这种情况只给 start_context，等自家那次 SessionStart(compact)。
-- **v3 残留提示**（§0 第 26 条）：session.start 时 `<CC 配置目录>/autohandoff.toml` 或 `autohandoff-state` 存在 → toast + `ui.log` 一次（模块变量记着，热重载后会再提示一次）。
+- **v3 残留**（§0 第 26 条，4.0.1 起）：`autohandoff.toml`、`autohandoff-state` 不读、不迁移、不删，也不再提示；README 的 Upgrading from version 3 写明手动删。
 - **配置**：每次要用时重读（`readConfig`）；不存在时写一次默认文件（唯一的 `$.fs.write`）。`AUTOHANDOFF_CONFIG` 只认绝对路径，因为 `$.fs` 会把相对路径解析到工程目录下。
   配置目录：`CLAUDE_CONFIG_DIR` 优先；主目录取盘符形式的 USERPROFILE 优先（Git Bash 会把 HOME 设成 `/c/Users/x`，而 CC 用 `os.homedir()`），否则 HOME。
 - **路径规则**（§0 第 3、14、16、27 条）：先查文本（字符白名单、长度、首尾空格（路径内部的普通空格放行）、`~`、`//`/`\\` 开头、盘符相对），再 `stat(resolve:true)` 拿 realPath，realPath 本身也要过字符白名单

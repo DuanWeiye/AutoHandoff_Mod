@@ -48,7 +48,7 @@
 | 2d | `AUTOHANDOFF_CONFIG=ah-test.md`（相对路径） | 被忽略，status 里报一行「is not an absolute path; it is ignored」 | |
 | 2e | 在 **Git Bash** 里启动 claude，且 `CLAUDE_CONFIG_DIR=/c/Users/<你>/.claude-test`（MSYS 形态） | 看配置文件写到了哪里、记忆目录里的交接文件能不能登记（MSYS 形态可能 stat 失败，记忆目录白名单就失效） | |
 | 2f | 在 Git Bash 里启动、不设 `CLAUDE_CONFIG_DIR`（HOME 是 `/c/Users/<你>`） | 配置仍在 `%USERPROFILE%\.claude\autohandoff.md`（取 USERPROFILE） | |
-| 2g | `%USERPROFILE%\.claude\autohandoff.toml` 或 `autohandoff-state\` 还在（v3 残留） | 启动时一次 toast + transcript 一行「no longer reads its version 3 settings…can delete … by hand」；同一进程里不再出现；旧文件原样不动 | |
+| 2g | `%USERPROFILE%\.claude\autohandoff.toml` 或 `autohandoff-state\` 还在（v3 残留） | 没有任何提示；旧文件原样不动 | |
 | 2h | 在 Git Bash 里设 `AUTOHANDOFF_CONFIG=/c/Users/<你>/ah-test.md`（MSYS 形态） | 它以 `/` 开头，会被当成绝对路径；记下实际读写的位置（可能落到 `C:\c\Users\…`），以及 status 的 Configuration 行 | |
 | 2i | 配置文件用**记事本**改过保存（CRLF 换行；分别试 UTF-8 带 BOM、ANSI 编码） | status 里没有解析问题，改过的阈值生效；ANSI 下中文注释乱码可以接受，但设置要能读 | |
 | 2j | **用户名含非 ASCII 字符**（中文或日文用户名）的用户目录 | 配置文件正常生成和读取；记忆目录里的交接文件能登记 | |
@@ -79,7 +79,7 @@
 | 5b | `/compact`（action: compact）排队或正在跑时，用**任务管理器结束 claude 进程**，再 `claude --resume <sid>` | toast「handoff cancelled (AutoHandoff was restarted or reloaded before the reset)」；没有「already queued」的 toast；之后自己 `/clear` 是普通 clear | |
 | 5c | `/compact` 正在跑时改一下插件目录里 `hooks\register.ts`（加一行注释）触发热重载 | 不作废；压缩完由新模块续接**恰好一次** | |
 | 5d | 重置**已排队**（action: compact，`/compact` 正在跑）时关掉标签页或窗口，再 `claude --resume` | 与 5a（登记中）对照：记下走的是 session.end 作废，还是被当成进程重启（toast「AutoHandoff was restarted or reloaded before the reset」）；两者都不应续接两次 | |
-| 5e | **v3 → v4 升级**：在装着 v3 的机器上不用 `--plugin-dir`，先把 v3 会话手上的交接做完或 `/autohandoff off` 并关掉所有会话，再按 README 的 Upgrading from version 3 操作：先 `claude plugin uninstall autohandoff@autohandoff` + `claude plugin marketplace remove autohandoff` 卸掉 v3（v3 仓库 `D:\Claude\AutoHandoff` 可留着不删），再 add/install 本仓库（`claude plugin list` 没有 `Read from:` 行时用 `claude plugin marketplace update autohandoff` + `claude plugin update autohandoff@autohandoff`），然后开新会话 | v3 的 PowerShell 敲键 hook 不再触发；`/plugin` 显示 `1 mod active · autohandoff`；v3 残留提示出现一次 | |
+| 5e | **v3 → v4 升级**：在装着 v3 的机器上不用 `--plugin-dir`，先把 v3 会话手上的交接做完或 `/autohandoff off` 并关掉所有会话，再按 README 的 Upgrading from version 3 操作：先 `claude plugin uninstall autohandoff@autohandoff` + `claude plugin marketplace remove autohandoff` 卸掉 v3（v3 仓库 `D:\Claude\AutoHandoff` 可留着不删），再 add/install 本仓库（`claude plugin list` 没有 `Read from:` 行时用 `claude plugin marketplace update autohandoff` + `claude plugin update autohandoff@autohandoff`），然后开新会话 | v3 的 PowerShell 敲键 hook 不再触发；`/plugin` 显示 `1 mod active · autohandoff` | |
 
 ## 6. 回报
 

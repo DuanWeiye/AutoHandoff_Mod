@@ -874,25 +874,6 @@ test('~/.claude as a symbolic link: a note in the memory folder is accepted unde
   expect((await registerTool($, `${CC_DIR}/settings.json`)).deny).toContain('outside the project folder and the memory folder')
 })
 
-test('v3 leftovers (autohandoff.toml, autohandoff-state/): one toast and one transcript line in this process, nothing read, moved or deleted', async ($, on) => {
-  const x = world(on, { config: null })
-  const { w } = x
-  w.files.set(`${CC_DIR}/autohandoff.toml`, { size: 2_310, mtimeMs: NOW - 20 * 24 * 60 * MIN })
-  w.dirs.add(`${CC_DIR}/autohandoff-state`)
-  await start($)
-  const text =
-    `AutoHandoff 4 no longer reads its version 3 settings or state; settings and prompts now live in "${CONFIG}". ` +
-    `You can delete "${CC_DIR}/autohandoff.toml" and "${CC_DIR}/autohandoff-state" by hand.`
-  expect(w.toasts).toEqual([text])
-  expect(w.logs).toEqual([text])
-  // 只写了新的默认配置，旧文件不读不动
-  expect(w.writes.map((x) => x.path)).toEqual([CONFIG])
-  expect(w.files.has(`${CC_DIR}/autohandoff.toml`)).toBe(true)
-  // 模块变量还在时再触发一次 session.start：不再提示
-  await start($)
-  expect(w.toasts.length).toBe(1)
-})
-
 test('AUTOHANDOFF_CONFIG absolute: the default file is written there', async ($, on) => {
   const own = '/srv/team/autohandoff.md'
   const x = world(on, { env: { AUTOHANDOFF_CONFIG: own }, config: null })

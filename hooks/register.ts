@@ -17,8 +17,6 @@ import {
   configDir,
   configFilePath,
   defaultConfigText,
-  legacyNotice,
-  LEGACY_NAMES,
   homeDir,
   isAbsolutePath,
   joinPath,
@@ -64,8 +62,6 @@ let lowVersionWarned = false
 let clearingFrom: { sid: string; t: number } | null = null
 /** AUTOHANDOFF_CONFIG 是相对路径的提示已记过 */
 let relativeConfigWarned = false
-/** v3 残留的提示已给过（本进程只给一次；热重载会再给一次） */
-let legacyNoticed = false
 /** 记录的读-改-写串行执行（`$.store` 的 get/set 不是原子的；同一进程里的事件会交错） */
 let chain: Promise<unknown> = Promise.resolve()
 
@@ -242,26 +238,6 @@ async function ensureConfigFile($: Api): Promise<void> {
   } catch (err) {
     debug($, `could not write the default configuration${path ? ` to ${path}` : ''}: ${errText(err)}`)
   }
-}
-
-/**
- * v3 留下的 autohandoff.toml 与 autohandoff-state/（CC 配置目录下）还在：本进程第一次见到时 toast 并在 transcript 记一行。
- * 只提示，不读、不迁移、不删（PLAN §0 第 26 条）
- */
-async function noticeLegacy($: Api): Promise<void> {
-  if (legacyNoticed) return
-  const dir = configDir(await envVars($))
-  if (!dir) return
-  const found: string[] = []
-  for (const name of LEGACY_NAMES) {
-    const p = joinPath(dir, name)
-    if (await safely(() => $.fs.exists(p))) found.push(p)
-  }
-  if (!found.length) return
-  legacyNoticed = true
-  const text = legacyNotice(found, (await configPath($)).path)
-  $.ui.toast(text, { timeoutMs: TOAST_MS })
-  $.ui.log(text)
 }
 
 // ───────────────────────── 记录：读写、/clear 后的搬迁 ─────────────────────────
@@ -521,9 +497,8 @@ async function onSessionStart($: Api, isInteractive: boolean): Promise<void> {
   } catch (err) {
     fail($, 'tool.register', err)
   }
-  // 以下几步失败都只是少了默认配置文件、提示或清理，不影响 start 的作废判断
+  // 以下几步失败都只是少了默认配置文件或清理，不影响 start 的作废判断
   await safely(() => ensureConfigFile($))
-  await safely(() => noticeLegacy($))
   await safely(() => cleanupStore($))
   // 进程刚起、--resume 或模块热重载：挂着的 job 由 core 处理（登记中的作废；已排队的看是不是本进程发出的）
   await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job) }))

@@ -25,8 +25,6 @@ export const TOOL_FULL_NAME = `mcp__${PLUGIN_NAME}__${TOOL_NAME}`
 export const COMMAND_NAME = 'autohandoff:autohandoff'
 export const MIN_VERSION = '2.1.304'
 export const CONFIG_FILE_NAME = 'autohandoff.md'
-/** v3 留在 CC 配置目录里的配置文件与状态目录：4.0 不读、不迁移、不删，只在本进程第一次见到时提示一次 */
-export const LEGACY_NAMES = ['autohandoff.toml', 'autohandoff-state'] as const
 export const MAX_PATH_LENGTH = 512
 export const MAX_HANDOFF_BYTES = 1024 * 1024
 /** store 里多久没写的对话记录可以删掉 */
@@ -1498,10 +1496,4 @@ export function versionAtLeast(base: string | undefined, min: string = MIN_VERSI
     if (x !== y) return x > y
   }
   return true
-}
-
-/** v3 残留的提示。found：找到的旧路径；configFile：现在用的配置文件 */
-export function legacyNotice(found: readonly string[], configFile: string | undefined): string {
-  const where = configFile ? `"${configFile}"` : CONFIG_FILE_NAME
-  return `AutoHandoff 4 no longer reads its version 3 settings or state; settings and prompts now live in ${where}. You can delete ${found.map((p) => `"${p}"`).join(' and ')} by hand.`
 }

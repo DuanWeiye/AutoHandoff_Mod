@@ -103,9 +103,8 @@ Start new sessions. Version 4 does **not** read the old configuration:
   thresholds you had changed in `~/.claude/autohandoff.toml`; the keys are the same, without the `takeover.`,
   `context.` and `handoff.` prefixes, and `wait_turn_end_minutes` is now `wait_minutes`. Customised prompts have to be rewritten: the model now calls a tool
   (`{tool}`) instead of running a command (`{cmd}`), and the handoff path is added by AutoHandoff (no `{file}`).
-- `~/.claude/autohandoff.toml` and the `~/.claude/autohandoff-state/` folder are no longer used and can be deleted.
-  While they exist, AutoHandoff shows a one-time notice about them in each Claude Code process; it never reads,
-  moves or deletes them.
+- `~/.claude/autohandoff.toml` and the `~/.claude/autohandoff-state/` folder are no longer used; delete them by hand.
+  AutoHandoff never reads, moves or deletes them.
 - If you added AutoHandoff hooks to a `settings.json` by hand for an older version, remove them.
 - `AUTOHANDOFF_STATE_DIR` and `AUTOHANDOFF_DISABLE` are no longer read; see [Configuration](#configuration).
 

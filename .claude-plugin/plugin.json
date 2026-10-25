@@ -1,6 +1,6 @@
 {
   "name": "autohandoff",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Automatic context handoff: at configurable context thresholds the model writes a handoff file, then the conversation is reset (/clear or /compact) and resumed from that file.",
   "author": {
     "name": "Weiye Duan"
