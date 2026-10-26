@@ -124,6 +124,23 @@
     所以同一台机器上只能装一个：换用 v4 = 关掉所有会话 → `plugin uninstall autohandoff@autohandoff` + `marketplace remove autohandoff`
     → add/install 新仓库（dgx 用本地克隆 `~/Documents/dgx/autohandoff-mod`，就地读取）。不再做 merge、不碰 v3 会话。
 
+以下为 2026-10-26 定（4.1.0）：
+
+30. **交接文件超长：提示词给阅读预算，登记时估大小，超限由新对话先整理（不拦登记）。** 起因：有的工程每次交接都在交接文件里加一个日期小节、从不移走，
+    文件长到新对话 Read 一次读不完（Read 工具单次上限 25000 token），重要的长期约定被挤到截断点之后。用户定：不改用户的 CLAUDE.md，工具兼容各种交接文档习惯。
+    - 新设置 `handoff_max_tokens`（默认 20000；0 关掉检测与提示词里那句；非 0 时至少 1000，否则按错值回落默认）。目标值不另设：取上限的 3/4（默认 15k）。
+    - remind、urge 默认提示词加 `{handoff_note}`（检测关掉时为空），**只给预算、不规定格式**（2026-10-26 需求修改：起初写的是「不要每次在顶上追加新日期小节、就地改写」，
+      改为格式中立。追加、最新在前是模型的稳定习惯，也常是用户自己的约定；交接时刻上下文已满，重写整份文档费力且易丢信息；流水账本身有价值，问题只在新对话要读的部分太长）：
+      格式随工程习惯；要让下个对话能在约 `{handoff_k}`k token 内读完；快超过时把较早、已完结的条目原样（不改写）移到旁边的存档文件；
+      长期约定、等用户定的事项、在跑的代理留在文件前部、在预算内，不随旧条目移走、不被挤到后面。另有 `{handoff_k}` `{handoff_max_k}` 供自写提示词用。
+    - 登记时（路径与 stat 校验通过后）`$.fs.read` 读一次交接文件，`estimateReadTokens` 估算 Read 工具报告的 token 数（含行号前缀，常数往高取，校准见 NOTES §2）。
+      这是 `$.fs.read` 的新用途（§2.2 原来只用它读配置文件）：只数字符，不解析、不把正文放进任何文本；读失败（被删、被别的插件拒绝）只记 debug，不影响登记，这次不做检测。
+    - 超过上限**不拦登记**（交接时上下文已在 300k 以上，不宜逼模型大改）：估算值记进 job（`job.tokens`，随记录跨 /clear 搬迁），debug 记一行；
+      重置后新对话的 start_context 在路径句后面追加新段 `oversize`（配置文件里没有这一节就用内置默认，已生成配置文件的用户不用合并就生效）：
+      交接文件约 N k token，超过上限 M k；先整理再继续：不必通读，按标题把较早、已完结的条目原样剪到旁边的存档文件（建议用脚本按标题切），保持文件自己的格式；
+      长期约定、待用户决定的事项、在跑的代理留在文件前部；整理到约目标值以内后再按交接文件继续。续接正文（resume）不变。
+    - 同一回合里重新登记以新登记的估算为准；检测只在登记时做一次，回合结束时的复查只看文件还在不在。`/autohandoff status` 显示登记文件的估算大小。
+
 ### 0.1 第 0 批验证结论带来的修正（2026-10-25，详见 `docs/mod-feasibility.zh.md` §9）
 - 回合中途用量：**不用 `turn.step`**，在 `classic.PostToolUse` 时读 `$.session.usage().context.tokens`（数值相同且不更晚）。
 - 命令：**不要 `$.command.register('autohandoff')`**（会被 md 命令占名拒绝）。保留 `commands/autohandoff.md`，其真名是 `autohandoff:autohandoff`；用 `on('command.run', {command:'autohandoff:autohandoff'}, …)` 拦截，返回 `{}` 并用 `$.ui.log` 输出（返回 `{text}` 模型下一回合会读到）。
@@ -231,6 +248,7 @@ docs/PLAN-mod.zh.md    本文
 - `$.ui.{status,toast,notify,log}`、`$.clock.{now,after}`
 
 **不用**：`$.process.*`、`$.http.*`、`$.model.*`、`$.env.set`、`$.prompt.fill`。`$.fs.write` 仅此一处例外：配置文件不存在时写一次默认文件（§0 第 17 条）。这样审计面最小。
+`$.fs.read` 除了读配置文件，4.1.0 起还在登记时读一次交接文件估大小（§0 第 30 条；只数字符，路径已过白名单）。
 
 ---
 

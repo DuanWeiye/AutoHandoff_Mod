@@ -9,7 +9,7 @@
 | 文件 | 职责 |
 |---|---|
 | `hooks/core.ts` | 纯逻辑，不碰 `$`：配置解析与默认文件、模板展开、阈值、来源分类、路径规则、记录与状态转移 `transition(rec, ev, env) → {rec, fx}`、`/autohandoff` 输出 |
-| `hooks/prompts.ts` | 10 段内置提示词（英文）与它们在默认配置文件里的说明 |
+| `hooks/prompts.ts` | 11 段内置提示词（英文）与它们在默认配置文件里的说明 |
 | `hooks/register.ts` | 接线薄层：只把主对话事件（无 agentId/agent_id）送进 core；按 sid 读写记录；执行副作用；一切错误 catch 后放行 |
 | `types/autohandoff.d.ts` | `$.state` 的类型契约（plugin.json 的 `types`），只有 `autohandoff.queued` |
 | `commands/autohandoff.md` | 降级说明：mod 没跑时才会走到模型 |
@@ -44,6 +44,24 @@
 - **v3 残留**（§0 第 26 条，4.0.1 起）：`autohandoff.toml`、`autohandoff-state` 不读、不迁移、不删，也不再提示；README 的 Upgrading from version 3 写明手动删。
 - **配置**：每次要用时重读（`readConfig`）；不存在时写一次默认文件（唯一的 `$.fs.write`）。`AUTOHANDOFF_CONFIG` 只认绝对路径，因为 `$.fs` 会把相对路径解析到工程目录下。
   配置目录：`CLAUDE_CONFIG_DIR` 优先；主目录取盘符形式的 USERPROFILE 优先（Git Bash 会把 HOME 设成 `/c/Users/x`，而 CC 用 `os.homedir()`），否则 HOME。
+- **交接文件超长**（§0 第 30 条，4.1.0）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，记进 `job.tokens`；
+  超过 `handoff_max_tokens` 不拦登记，start_context 在路径句后接 `oversize` 段（`startContextText` 第 4 个参数）。上限为 0 时不读文件。
+  估算 = ASCII 字符数 / 3 + 非 ASCII 码点数 × 1.65 + 行数 × 3（行数 = 换行数 + 1，与 Read 显示的行数一致），向上取整。
+  校准（2026-10-26，CC 2.1.310 的 Read 工具对整份文件报告的 token 数；单测 `calibration points` 只存字符构成）：
+
+  | 文件（构成） | ASCII / 非 ASCII / 行 | 实测 | 估算 | 估/实 |
+  |---|---|---|---|---|
+  | 中文交接文档 464 行 | 27655 / 14363 / 464 | 33481 | 34310 | 1.025 |
+  | 中文交接文档 536 行 | 33347 / 16506 / 536 | 39373 | 39959 | 1.015 |
+  | 英文 README ×7 | 172123 / 35 / 2703 | 61621 | 65542 | 1.064 |
+  | 中文计划 ×3 | 65325 / 35823 / 1615 | 73531 | 85728 | 1.166 |
+  | 带中文注释的 TS ×3 | 172656 / 13200 / 4498 | 90568 | 92826 | 1.025 |
+  | 中文笔记 ×2 | 47352 / 16934 / 1445 | 43413 | 48061 | 1.107 |
+  | 9001 行极短行 | 71635 / 0 / 9001 | 39280 | 50882 | 1.295 |
+
+  最小二乘拟合是 ASCII 2.86 字符/token、非 ASCII 1.44 token/字、每行 1.65 token，但中文交接文档（含较多箭头、全角符号）实际要 1.6 左右，
+  所以三个常数都取高：所有校准点都不低估，常见交接文档高估 1.5–17%。Read 工具超过 25000 token 时，旧版本报错「File content (N tokens) exceeds maximum allowed tokens」，
+  2.1.310 改为分页并在页尾报告整份的 token 数，两种说法给的都是整份文件的数。
 - **路径规则**（§0 第 3、14、16、27 条）：先查文本（字符白名单、长度、首尾空格（路径内部的普通空格放行）、`~`、`//`/`\\` 开头、盘符相对），再 `stat(resolve:true)` 拿 realPath，realPath 本身也要过字符白名单
   （它会写进续接文案）。根目录 = cwd、root、repo 根三者的 realPath（去掉 `/`、盘符根、HOME 本身），加 `<配置目录 realPath>/projects/*/memory/`。
   Windows 判定看 cwd 是否盘符形式；比较时大小写不敏感、两种分隔符等价。
