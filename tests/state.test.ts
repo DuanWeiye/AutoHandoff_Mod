@@ -1313,9 +1313,11 @@ test('oversize: an oversize file that is not this round\'s path (the project\'s 
   expect(b.steps[0]!.accepted).toBe(true)
   expect(b.rec.job?.file).toBe(P)
 
-  // 这轮还没给过路径（用户自写提示词、没送过带路径的提醒）：只说另写一份新文件
+  // 这轮还没给过路径（提醒之前就登记，比如用户手动要求交接）：只说另写一份新文件，放在工程目录或记忆目录（与 noteLine(undefined) 同一说法；
+  // 从主目录启动时工程目录不可用，只说工程目录会被判在工程外）
   const c = run(onRecord(), [regAt(HANDOVER, 39_373)])
-  expect(c.steps[0]!.reply).toContain('Instead write the handoff as a new file of about 15k tokens that makes sense on its own, in the project folder.')
+  expect(c.steps[0]!.reply).toContain('Instead write the handoff as a new file of about 15k tokens that makes sense on its own, in the project folder or the Claude Code auto-memory folder.')
+  expect(noteLine(undefined)).toContain('in the project folder or the Claude Code auto-memory folder')
   expect(c.steps[0]!.reply).toContain(`Do not delete from or shorten "${HANDOVER}"`)
   // 只给了文件名（放进记忆目录）：登记的正是记忆目录里那个文件 → 压短；别的文件 → 指向那个文件名
   const mem = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }], defaultConfig(), { dirs: [], sid: SID_A, windows: false })

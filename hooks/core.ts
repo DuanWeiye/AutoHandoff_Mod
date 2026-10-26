@@ -515,7 +515,7 @@ function handoffVars(s: Settings): Record<string, string | number> {
 /**
  * 超长退回的说明（接在「Not registered: 」后面）。按登记的是不是本轮 mod 给的路径分开说：
  * 是 → 压短再登记；不是（多半是工程自己的 HANDOVER.md 之类）→ 不许为此删改它，另写到本轮的路径再登记，
- * 免得模型去截断用户自己的文档、丢内容。note 为 null（这轮还没给过路径）时只说另写一份新文件。
+ * 免得模型去截断用户自己的文档、丢内容。note 为 null（这轮还没给过路径）时只说另写一份新文件，放在哪类地方与 noteLine(undefined) 同一说法。
  */
 export function oversizeText(file: string, fileTokens: number, note: string | null, s: Settings): string {
   const size =
@@ -531,7 +531,7 @@ export function oversizeText(file: string, fileTokens: number, note: string | nu
     note !== null &&
     (isAbsolutePath(note) ? forCompare(note, windows) === forCompare(file, windows) : forCompare(file, windows).endsWith(forCompare(`/${note}`, windows)))
   if (ours) return `${size} Shorten it to ${target}. ${keep}, without cutting those documents for this. Then call the tool again.`
-  const where = note === null ? 'in the project folder' : isAbsolutePath(note) ? `at "${note}"` : `named "${note}" in the Claude Code auto-memory folder`
+  const where = note === null ? 'in the project folder or the Claude Code auto-memory folder' : isAbsolutePath(note) ? `at "${note}"` : `named "${note}" in the Claude Code auto-memory folder`
   return (
     `${size} Do not delete from or shorten "${file}" for this; it may be one of the project's own documents. ` +
     `Instead write the handoff as a new file of ${target} that makes sense on its own, ${where}. ${keep}. Then call the tool with that file's path.`

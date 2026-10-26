@@ -144,3 +144,5 @@
 - `$.state` 是按进程还是按 session id 保存（/clear 换 sid 后还在不在）：文档说 /clear、/resume 会重置它，热重载实测只用了 compact。
   正常路径不受影响，只在 PLAN §9「孤儿 job 遇到用户 /clear 先跑」那类复合窗口里有区别。
 - VS Code 扩展、桌面端、WSL、Remote Control 接入时的行为；/clear 之后权限模式与 plan mode 的状态；hook 超时的实际表现。
+- Linux/macOS 从 `~` 启动（没有可用的工程目录）时，模型按提醒往自动记忆目录 `~/.claude/projects/<p>/memory/` 写交接文件，default 权限模式下会不会弹权限框
+  （`.claude/` 实测是受保护目录；记忆目录应是 auto-memory 放行的位置，但没测过。Windows 见清单 1o）。
