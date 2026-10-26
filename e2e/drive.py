@@ -9,7 +9,7 @@
   drive.py <工作目录> [场景…] [--repeat N] [--keep]
   drive.py <工作目录> --cleanup-only        （--keep 跑过之后清理）
 场景：clear draft dialog deny interject notify cmp slash print
-      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain oversize budget
+      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain limit
       （缺省全跑；--repeat N 每个场景跑 N 次并统计）
 同一个仓库（worktree）同时只跑一组 drive.py：store 文件被同一插件目录的所有 --plugin-dir 会话共用，清理时要改它。
 清理时发现别的 --plugin-dir 会话还在跑、或这次运行期间有别的会话写过记录，就跳过 store 这一步并打印出来。
@@ -313,12 +313,26 @@ CLEAR_TASK = (
 )
 
 
+def note_of(s, old):
+    """remind 审计行里 mod 给的本轮交接文件路径；查它是不是 <测试工程>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md、
+    时间是不是本机本地时间（与现在相差 15 分钟内；按 UTC 生成会差 9 小时）。返回 (路径或 None, 检查说明列表[(ok, 说明)])"""
+    m = next((re.search(r"; handoff file to write: (.+)$", x) for x in s.audit() if x.startswith("remind sent at")), None)
+    note = m.group(1) if m else None
+    base = os.path.realpath(proj(s.work))
+    pat = re.compile(re.escape(base) + r"/\.claude/autohandoff/_AUTOHANDOFF_(\d{8}_\d{6})_" + re.escape(old[:8]) + r"\.md$")
+    mm = pat.match(note or "")
+    checks = [(mm is not None, f"the reminder names <project>/.claude/autohandoff/_AUTOHANDOFF_<date>_<time>_{old[:8]}.md ({note})")]
+    if mm:
+        age = (datetime.now() - datetime.strptime(mm.group(1), "%Y%m%d_%H%M%S")).total_seconds()
+        checks.append((0 <= age < 900, f"its time is this machine's local time ({mm.group(1)}, {age:.0f}s ago)"))
+    return note, checks
+
+
 def scenario_clear(work, tag="clear", draft=None):
-    """场景 1（draft 时为场景 3）：越过 remind → 写交接 → 登记 → 回合结束 → /clear → 续接 → 新对话接着做完"""
+    """场景 1（draft 时为场景 3）：越过 remind → 在 mod 给的路径写交接文件 → 登记 → 回合结束 → /clear → 续接 → 新对话读它、接着做完"""
     reset_project(work)
     c = Check(f"{tag}: remind → handoff → /clear → resume" + (" (draft kept)" if draft else ""))
     s = Session(work, tag)
-    handover = os.path.realpath(os.path.join(proj(work), "docs", "HANDOVER.md"))
     try:
         old = s.sids()[0]
         s.send(CLEAR_TASK)
@@ -333,7 +347,10 @@ def scenario_clear(work, tag="clear", draft=None):
         new = s.sids()[1] if len(s.sids()) > 1 else None
         a = s.audit()
         c.ok(any(x.startswith("remind sent at") for x in a), "remind sent once usage passed remind_at")
-        c.ok(f"handoff registered: {handover}" in "\n".join(a), f"handoff registered ({handover})")
+        handover, checks = note_of(s, old)
+        for ok, what in checks:
+            c.ok(ok, what)
+        c.ok(handover is not None and f"handoff registered: {handover}" in "\n".join(a), "the file at that path was written and registered")
         n_clear = sum(1 for x in a if re.match(r"turn ended; running /clear \(request \d+\)", x))
         c.ok(n_clear == 1, f"turn ended → /clear queued exactly once ({n_clear})")
         c.ok(len(s.sids()) == 2, f"exactly two sessions ({len(s.sids())})")
@@ -349,8 +366,8 @@ def scenario_clear(work, tag="clear", draft=None):
         c.ok(len(resume_entries(ent)) == 1, f"exactly one resume message in the new transcript ({len(resume_entries(ent))})")
         c.ok(r is not None and (r.get("origin") or {}).get("asUser") is True, "resume message in the new transcript: origin plugin autohandoff, asUser")
         c.ok(r is not None and f'Handoff file: "{handover}"' in text_of(r), "resume message names the handoff file in quotes")
-        c.ok(attachments(ent, "This conversation was just reset by AutoHandoff"), "SessionStart additional context in the new transcript")
-        c.ok(read_handoff(ent, handover), "the new conversation read the handoff file")
+        c.ok(attachments(ent, f'Handoff file: \\"{handover}\\"'), "SessionStart additional context in the new transcript names it")
+        c.ok(handover is not None and read_handoff(ent, handover), "the new conversation read that handoff file")
         done = [os.path.exists(os.path.join(proj(work), "notes", f)) for f in ("a.txt", "b.txt", "c.txt")]
         c.ok(all(done), f"work finished across the reset (notes a/b/c: {done})")
         c.ok(sum(1 for x in a if x.startswith("handoff registered")) == 1, "exactly one handoff (no repeated cycle)")
@@ -358,8 +375,12 @@ def scenario_clear(work, tag="clear", draft=None):
             c.ok(draft in s.pane(), "the draft is still in the input box")
             prompts = [h.get("prompt", "") for h in s.hooks() if h.get("hook_event_name") == "UserPromptSubmit"]
             c.ok(not any(draft in p for p in prompts), "the draft was never submitted")
-        regs = [x for x in a if x.startswith(("remind sent", "handoff", "turn ended", "record moved"))]
+        regs = [x for x in a if x.startswith(("remind sent", "handoff", "turn ended", "record moved", "registration"))]
         c.note(" | ".join(regs))
+        # 软观察：交接文件多大、工程自己的 docs/HANDOVER.md 有没有照工程习惯也更新
+        size = est_tokens(open(handover).read()) if handover and os.path.exists(handover) else None
+        changed = subprocess.run(["git", "status", "--porcelain", "docs/HANDOVER.md"], cwd=proj(work), capture_output=True, text=True).stdout.strip()
+        c.note(f"handoff file about {size} tokens; docs/HANDOVER.md {'changed' if changed else 'unchanged'}")
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])
         c.note("\n".join(str(e).splitlines()[1:40]))
@@ -1258,121 +1279,48 @@ def scenario_chain(work):
     return c
 
 
-def handover_history(sections):
-    """一份「每次交接在顶上加一个日期小节、从不移走」长出来的交接文件（合成内容，英文）：最上面一节是当前状态，其余都已完结"""
-    out = ["# Handover", "", "## 2026-10-26 09:40 - current state", "",
-           "- Inventory service: stock_level() in src/stock.py still returns 0; the catalog import is the open item.",
-           "- Standing agreement: keep functions small, one docstring each (see CLAUDE.md).",
-           "- Open question for the user: should reorder thresholds come from data/catalog.md or a new config file?", ""]
-    for i in range(sections):
-        day, hh = 25 - i // 6, 22 - (i % 6) * 2
-        out += [f"## 2026-10-{day:02d} {hh:02d}:10 - batch {sections - i} (finished)", "",
-                f"- Done: refactored the carrier lookup in src/carrier_{i:02d}.py and added tests (12 passed); merged as commit {0x3f2a91c + i * 7919:x}.",
-                f"- Reviewed by the reviewer agent; two Minor findings fixed (naming in zone_{i:02d}, a missing docstring).",
-                "- Measured: reorder report for 800 SKUs takes 1.4 s; the slow part was the supplier join, now cached per batch.",
-                "- Decided with the user: barcodes stay as strings; expiry dates are stored in UTC and shown in JST.",
-                "- Next (done since): wire the cache into the nightly audit count and re-run the variance check.",
-                "", "| check | result |", "|---|---|", f"| audit count, zone {i % 9} | pass |", "| variance report | pass |", ""]
-    return "\n".join(out)
-
-
 def est_tokens(text):
-    """与 hooks/core.ts 的 estimateReadTokens 同一公式（只用来在报告里看整理前后的大小）"""
+    """与 hooks/core.ts 的 estimateReadTokens 同一公式（报告里看交接文件多大）"""
     if not text:
         return 0
     ascii_n = sum(1 for ch in text if ord(ch) < 128)
     return int(-(-(ascii_n / 3 + (len(text) - ascii_n) * 1.65 + (text.count("\n") + 1) * 3) // 1))
 
 
-def scenario_oversize(work):
-    """交接文件超长（PLAN §0 第 30 条）：工程里的交接文件按「顶上加日期小节、不移走」攒到了几十节，配置把 handoff_max_tokens 压到 4000，
-    remind/urge 用不提大小的旧写法（autohandoff-oversize.md），所以登记时文件必然超长。
-    越过 remind → 模型在顶上加一节、登记（超长不拦）→ /clear → 新对话的 start_context 带整理段。
-    硬断言：登记被受理、审计行记下超长、新 transcript 里的 SessionStart 附加上下文含整理段（在路径句之后）、续接恰好一次。
-    软观察（只记 note）：模型有没有把旧小节剪到旁边的存档文件、交接文件整理后多大、原任务有没有接着做完。"""
-    return oversize_run(work, "oversize", True)
-
-
-def scenario_budget(work):
-    """同样的超长交接文件，内置提示词（带 {handoff_note} 预算句）：看模型交接时自己守不守预算。
-    硬断言只有「登记被受理、重置并续接一次」；交接时有没有把旧条目移到存档、登记时多大、超长时新对话有没有收到整理段，都记 note。"""
-    return oversize_run(work, "budget", False)
-
-
-def approve_tidy(s, approved):
-    """整理交接文件时模型常用复合命令（`{ printf …; sed …; } > docs/…`），不在测试 settings 的放行清单里，会弹权限框。
-    只批准跟交接文件有关的命令（框里出现 HANDOVER、没有 rm），别的框不碰（场景会因超时失败，看得出来）。"""
-    pane = s.pane()
-    if "Do you want to proceed?" not in pane:
-        return
-    box = pane[pane.rfind("Bash command"):] if "Bash command" in pane else pane
-    if "HANDOVER" in box and not re.search(r"\brm\b", box):
-        s.keys("1")
-        approved.append(1)
-        time.sleep(1.5)
-
-
-def oversize_run(work, name, strict):
+def scenario_limit(work):
+    """超长退回（PLAN §0 第 30 条）：handoff_max_tokens 压到 2000，提醒要求在交接文件里抄 120 行参考表（autohandoff-limit.md），
+    第一次登记必然超长。断言：登记被退回（审计行有估算与上限）→ 模型压短、同一路径重新登记被受理 → /clear 恰好一次、续接恰好一次、
+    新对话读的是这个文件；登记的文件估算不超过上限。"""
     reset_project(work)
-    c = Check(f"{name}: " + ("an oversize handoff file is registered, and the next conversation is asked to tidy it" if strict
-                             else "the built-in reminders with a handoff file over its budget"))
-    handover = os.path.realpath(os.path.join(proj(work), "docs", "HANDOVER.md"))
-    history = handover_history(30)
-    with open(handover, "w") as f:
-        f.write(history)
-    s = Session(work, name, config=os.path.join(work, f"autohandoff-{name}.md"))
-    approved = []
-
-    def until(cond):
-        def f():
-            approve_tidy(s, approved)
-            return cond()
-        return f
+    c = Check("limit: an oversize handoff file is refused; the model shortens it, registers again and the conversation is reset")
+    s = Session(work, "limit", config=os.path.join(work, "autohandoff-limit.md"))
     try:
+        old = s.sids()[0]
         s.send(CLEAR_TASK)
         s.wait(lambda: s.has("remind sent at"), 180, "the remind")
-        s.wait(until(lambda: s.has("handoff finished") or s.has("handoff cancelled")), 300, "the reset and resume")
-        s.wait(until(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1])), 400, "the resumed turn to end")
-        # 整理可能跨几个回合：等到空闲且没有待批的框
-        for _ in range(20):
-            s.wait_idle()
-            approve_tidy(s, approved)
-            if "Do you want to proceed?" not in s.pane():
-                break
+        s.wait(lambda: s.has("handoff finished") or s.has("handoff cancelled"), 400, "the reset and resume")
+        s.wait(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1]), 300, "the resumed turn to end")
+        s.wait_idle()
         a = s.audit()
-        sids = s.sids()
-        new = sids[1] if len(sids) > 1 else None
-        c.ok(f"handoff registered: {handover}" in "\n".join(a), "the handoff file was registered (not refused)")
-        over = [x for x in a if x.startswith("handoff file is about") and "over handoff_max_tokens (4k)" in x]
+        new = s.sids()[1] if len(s.sids()) > 1 else None
+        note, checks = note_of(s, old)
+        for ok, what in checks:
+            c.ok(ok, what)
+        refused = [x for x in a if x.startswith("registration refused: the handoff file is about")]
+        c.ok(len(refused) >= 1 and "over the 2k limit (handoff_max_tokens)" in refused[0], f"the first registration was refused with the estimate and the limit ({refused[:1]})")
+        regs = [x for x in a if x.startswith("handoff registered: ")]
+        c.ok(len(regs) == 1 and regs[0].startswith(f"handoff registered: {note} (turn "), f"registered exactly once, at that path ({len(regs)})")
+        c.ok(a.index(regs[0]) > a.index(refused[0]) if regs and refused else False, "registered after the refusal")
+        size = est_tokens(open(note).read()) if note and os.path.exists(note) else None
+        c.ok(size is not None and size <= 2000, f"the registered file is within the limit (about {size} tokens)")
         c.ok(s.count("turn ended; running /clear") == 1, "reset exactly once")
+        c.ok("handoff finished: resumed" in a, "resume message submitted")
+        c.ok(not any(x.startswith("handoff cancelled") for x in a), "nothing cancelled")
         ent = s.entries(new) if new else []
-        tidy = attachments(ent, "[AutoHandoff: tidy the handoff file first]")
-        blob = json.dumps(tidy[0], ensure_ascii=False) if tidy else ""
-        c.ok(len(resume_entries(ent)) == 1, f"resumed exactly once ({len(resume_entries(ent))})")
-        c.ok(s.count("handoff registered") == 1, "no second handoff in the new conversation")
-        if strict:
-            c.ok(len(over) >= 1, f"the size check logged the file as over the limit ({over[:1]})")
-            c.ok(len(tidy) >= 1, "the new conversation's SessionStart context carries the tidy section")
-            c.ok(-1 < blob.find("Handoff file:") < blob.find("tidy the handoff file first"), "the tidy section comes after the path line")
-        else:
-            # 超长与整理段要么都有、要么都没有
-            c.ok(bool(over) == bool(tidy), f"the tidy section is given exactly when the registered file was over the limit (over: {bool(over)}, tidy: {bool(tidy)})")
-        # 软观察
-        docs = os.path.join(proj(work), "docs")
-        archives = sorted(f for f in os.listdir(docs) if f != "HANDOVER.md")
-        after = open(handover).read() if os.path.exists(handover) else ""
-        done = [os.path.exists(os.path.join(proj(work), "notes", f)) for f in ("a.txt", "b.txt", "c.txt")]
-        sizes = []
-        for f in archives:
-            try:
-                sizes.append(est_tokens(open(os.path.join(docs, f)).read()))
-            except (OSError, UnicodeDecodeError):
-                sizes.append(None)
-        c.note(f"history before the session: about {est_tokens(history)} tokens; registered: {over[0] if over else '-'}; "
-               f"after the new conversation: about {est_tokens(after)} tokens ({after.count(chr(10)) + 1} lines); "
-               f"other files in docs/: {archives or 'none'} {sizes}; work finished (notes a/b/c): {done}; "
-               f"permission prompts approved by the driver: {len(approved)}")
-        c.note(" | ".join(x for x in a if x.startswith(("remind sent", "handoff", "turn ended", "record moved", "registration", "could not"))))
+        r = resume_entry(ent)
+        c.ok(len(resume_entries(ent)) == 1 and r is not None and f'Handoff file: "{note}"' in text_of(r), "one resume message, naming that file")
+        c.ok(note is not None and read_handoff(ent, note), "the new conversation read that handoff file")
+        c.note(f"refusals: {len(refused)}; " + " | ".join(x for x in a if x.startswith(("remind sent", "registration", "handoff", "turn ended", "record moved"))))
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])
         c.note("\n".join(str(e).splitlines()[1:40]))
@@ -1403,8 +1351,7 @@ SCENARIOS = {
     "urge": scenario_urge,
     "userclear": scenario_userclear,
     "chain": scenario_chain,
-    "oversize": scenario_oversize,
-    "budget": scenario_budget,
+    "limit": scenario_limit,
 }
 
 
