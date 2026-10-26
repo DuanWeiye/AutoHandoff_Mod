@@ -449,7 +449,10 @@ export function isOversize(fileTokens: number | undefined, s: Settings): boolean
   return s.handoff_max_tokens > 0 && fileTokens !== undefined && fileTokens > s.handoff_max_tokens
 }
 
-/** 提示词里要求的交接文件目标大小：上限的 3/4（留出余量，模型写的比要求的长是常事） */
+/**
+ * 提示词里给的交接文件阅读预算：上限的 3/4（留出余量，模型写的比要求的长是常事）。
+ * 只给预算、不规定格式（追加、最新在前都行，PLAN §0 第 30 条）
+ */
 export function handoffTarget(s: Settings): number {
   return Math.floor((s.handoff_max_tokens * 3) / 4)
 }
@@ -461,7 +464,7 @@ function handoffVars(s: Settings): Record<string, string | number> {
     handoff_max_k: kTokens(s.handoff_max_tokens),
     handoff_note:
       s.handoff_max_tokens > 0
-        ? ` Keep the handoff file to the current state (work in progress, next steps, running subagents or background tasks, questions waiting for the user, standing agreements) and within about ${k}k tokens: rewrite or delete outdated parts in place instead of adding a new dated section on top each time, and move finished history to an archive file next to it, which the next conversation does not read by default.`
+        ? ` Keep the handoff file in the form this project uses (appending, newest first or anything else), but make sure the next conversation can read it within about ${k}k tokens: when it gets close, move older, finished entries unchanged (not rewritten) into an archive file next to it, which the next conversation does not read by default. Standing agreements, questions waiting for the user and running subagents or background tasks stay near the top and within that budget; never move them out with the old entries or push them down.`
         : '',
   }
 }

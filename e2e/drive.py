@@ -9,7 +9,7 @@
   drive.py <工作目录> [场景…] [--repeat N] [--keep]
   drive.py <工作目录> --cleanup-only        （--keep 跑过之后清理）
 场景：clear draft dialog deny interject notify cmp slash print
-      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain oversize
+      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain oversize budget
       （缺省全跑；--repeat N 每个场景跑 N 次并统计）
 同一个仓库（worktree）同时只跑一组 drive.py：store 文件被同一插件目录的所有 --plugin-dir 会话共用，清理时要改它。
 清理时发现别的 --plugin-dir 会话还在跑、或这次运行期间有别的会话写过记录，就跳过 store 这一步并打印出来。
@@ -1285,17 +1285,29 @@ def est_tokens(text):
 
 
 def scenario_oversize(work):
-    """交接文件超长（PLAN §0 第 30 条）：工程里的交接文件按「顶上加日期小节、不移走」攒到了几十节，配置把 handoff_max_tokens 压到 4000。
-    越过 remind → 模型更新交接文件、登记（超长不拦）→ /clear → 新对话的 start_context 带整理段。
+    """交接文件超长（PLAN §0 第 30 条）：工程里的交接文件按「顶上加日期小节、不移走」攒到了几十节，配置把 handoff_max_tokens 压到 4000，
+    remind/urge 用不提大小的旧写法（autohandoff-oversize.md），所以登记时文件必然超长。
+    越过 remind → 模型在顶上加一节、登记（超长不拦）→ /clear → 新对话的 start_context 带整理段。
     硬断言：登记被受理、审计行记下超长、新 transcript 里的 SessionStart 附加上下文含整理段（在路径句之后）、续接恰好一次。
     软观察（只记 note）：模型有没有把旧小节剪到旁边的存档文件、交接文件整理后多大、原任务有没有接着做完。"""
+    return oversize_run(work, "oversize", True)
+
+
+def scenario_budget(work):
+    """同样的超长交接文件，内置提示词（带 {handoff_note} 预算句）：看模型交接时自己守不守预算。
+    硬断言只有「登记被受理、重置并续接一次」；交接时有没有把旧条目移到存档、登记时多大、超长时新对话有没有收到整理段，都记 note。"""
+    return oversize_run(work, "budget", False)
+
+
+def oversize_run(work, name, strict):
     reset_project(work)
-    c = Check("oversize: an oversize handoff file is registered, and the next conversation is asked to tidy it")
+    c = Check(f"{name}: " + ("an oversize handoff file is registered, and the next conversation is asked to tidy it" if strict
+                             else "the built-in reminders with a handoff file over its budget"))
     handover = os.path.realpath(os.path.join(proj(work), "docs", "HANDOVER.md"))
     history = handover_history(30)
     with open(handover, "w") as f:
         f.write(history)
-    s = Session(work, "oversize", config=os.path.join(work, "autohandoff-oversize.md"))
+    s = Session(work, name, config=os.path.join(work, f"autohandoff-{name}.md"))
     try:
         s.send(CLEAR_TASK)
         s.wait(lambda: s.has("remind sent at"), 180, "the remind")
@@ -1305,17 +1317,21 @@ def scenario_oversize(work):
         a = s.audit()
         sids = s.sids()
         new = sids[1] if len(sids) > 1 else None
-        c.ok(f"handoff registered: {handover}" in "\n".join(a), "the oversize handoff file was registered (not refused)")
+        c.ok(f"handoff registered: {handover}" in "\n".join(a), "the handoff file was registered (not refused)")
         over = [x for x in a if x.startswith("handoff file is about") and "over handoff_max_tokens (4k)" in x]
-        c.ok(len(over) >= 1, f"the size check logged the file as over the limit ({over[:1]})")
         c.ok(s.count("turn ended; running /clear") == 1, "reset exactly once")
         ent = s.entries(new) if new else []
         tidy = attachments(ent, "[AutoHandoff: tidy the handoff file first]")
-        c.ok(len(tidy) >= 1, "the new conversation's SessionStart context carries the tidy section")
         blob = json.dumps(tidy[0], ensure_ascii=False) if tidy else ""
-        c.ok(-1 < blob.find("Handoff file:") < blob.find("tidy the handoff file first"), "the tidy section comes after the path line")
         c.ok(len(resume_entries(ent)) == 1, f"resumed exactly once ({len(resume_entries(ent))})")
         c.ok(s.count("handoff registered") == 1, "no second handoff in the new conversation")
+        if strict:
+            c.ok(len(over) >= 1, f"the size check logged the file as over the limit ({over[:1]})")
+            c.ok(len(tidy) >= 1, "the new conversation's SessionStart context carries the tidy section")
+            c.ok(-1 < blob.find("Handoff file:") < blob.find("tidy the handoff file first"), "the tidy section comes after the path line")
+        else:
+            # 超长与整理段要么都有、要么都没有
+            c.ok(bool(over) == bool(tidy), f"the tidy section is given exactly when the registered file was over the limit (over: {bool(over)}, tidy: {bool(tidy)})")
         # 软观察
         docs = os.path.join(proj(work), "docs")
         archives = sorted(f for f in os.listdir(docs) if f != "HANDOVER.md")
@@ -1362,6 +1378,7 @@ SCENARIOS = {
     "userclear": scenario_userclear,
     "chain": scenario_chain,
     "oversize": scenario_oversize,
+    "budget": scenario_budget,
 }
 
 

@@ -8,7 +8,9 @@
 #      autohandoff-fallback.md 测 compact_at、autohandoff-urge.md 测 Stop block：这两份把阈值压到一次读大文件就越过，
 #      并把 remind/urge 提示词换成「不必动作」的说明，模拟不理提醒的模型；
 #      autohandoff-chain.md 把 start_context 换成不劝阻再交接的中性说明，让连环交接守卫真正被触发；
-#      autohandoff-oversize.md 把 handoff_max_tokens 压到 4000，交接文件超长检测用；start 时 AH_CONFIG 可指定用哪份）
+#      autohandoff-budget.md 把 handoff_max_tokens 压到 4000（内置提示词，看模型交接时守不守预算）；
+#      autohandoff-oversize.md 同样的上限，但 remind/urge 换成 4.1 之前那种不提大小、按工程习惯在顶上加一节的写法
+#      （模拟没合并新提示词的旧配置文件），保证登记的交接文件超长，测新对话的整理段；start 时 AH_CONFIG 可指定用哪份）
 #   - AUTOHANDOFF_DISABLE=1：万一全局 v3 仍被加载，也让它静默（v4 不读这个变量）
 #
 # 用法：
@@ -74,7 +76,9 @@ d = {
         # 也会弹框：场景里建文件一律用 Write 工具
         "allow": ["Read", "Write", "Edit", "Bash(printf:*)", "Bash(mkdir:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)",
                   "Bash(wc:*)", "Bash(echo:*)", "Bash(sleep:*)", "Bash(python3 -c:*)", "Bash(python3 tools/wait_for.py:*)",
-                  "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)"],
+                  "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)",
+                  # 整理交接文件（oversize/budget 场景）：按标题切文件用得到的命令（Read/Write/Edit 本来就全放行，不加 mv、rm）
+                  "Bash(grep:*)", "Bash(sed:*)", "Bash(awk:*)", "Bash(tail:*)"],
         "ask": ["Bash(touch:*)"],
     },
     "hooks": {e: hook for e in ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"]},
@@ -130,8 +134,12 @@ case "$cmd" in
     # chain：内置 start_context 里「除非有新提醒，不要再交接」那句会劝住新对话，守卫就测不到；换成中性说明
     write_config "$S/autohandoff-chain.md" clear
     printf '\n## start_context\n\n[AutoHandoff e2e] This conversation was reset by AutoHandoff ({action}). Follow the handoff file.\n' >>"$S/autohandoff-chain.md"
-    # oversize：上限压到 4000（目标 3k），一份攒了几十节的交接文件必然超长
+    # budget / oversize：上限压到 4000（目标 3k），一份攒了几十节的交接文件必然超长
+    write_config "$S/autohandoff-budget.md" clear "${REMIND:-52000}" "${URGE:-200000}" "${COMPACT:-900000}" "" true 4000
     write_config "$S/autohandoff-oversize.md" clear "${REMIND:-52000}" "${URGE:-200000}" "${COMPACT:-900000}" "" true 4000
+    for k in remind urge; do
+      printf '\n## %s\n\n[AutoHandoff: hand off] Context usage is about {used_k}k tokens. Finish the step in progress, then hand off before this turn ends: add a new dated section at the top of the handoff file with what is done, what is next and any open question (keep the older sections as they are), call the {tool} tool with its path, and end your turn.\n' "$k" >>"$S/autohandoff-oversize.md"
+    done
     write_settings
     echo "initialized $S (config $S/autohandoff.md, settings $S/settings.json)"
     ;;

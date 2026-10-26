@@ -608,8 +608,11 @@ test('handoff size: the reminders ask for a short handoff file; start_context ge
   const cfg = defaultConfig()
   for (const k of ['remind', 'urge'] as const) {
     const text = renderPrompt(cfg, k, promptVars(cfg, 455_000))
-    expect(text).toContain('within about 15k tokens: rewrite or delete outdated parts in place instead of adding a new dated section on top')
-    expect(text).toContain('archive file next to it')
+    expect(text).toContain('in the form this project uses (appending, newest first or anything else)')
+    expect(text).toContain('can read it within about 15k tokens: when it gets close, move older, finished entries unchanged (not rewritten) into an archive file next to it')
+    expect(text).toContain('never move them out with the old entries or push them down')
+    // 格式中立：不叫模型别追加、不叫它就地重写
+    expect(text).not.toMatch(/instead of adding|rewrite or delete|in place/)
   }
   const sc = startContextText(cfg, HANDOVER, 'clear', 33_481)
   const pathAt = sc.indexOf(`Handoff file: "${HANDOVER}"`)
@@ -631,7 +634,7 @@ test('handoff size: the reminders ask for a short handoff file; start_context ge
   // 检测关掉（0）：提醒里那句也没有
   const off = defaultConfig()
   off.settings.handoff_max_tokens = 0
-  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).not.toContain('within about')
+  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).not.toContain('can read it within about')
   expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).toContain('instead of working. Save your progress')
   expect(startContextText(off, HANDOVER, 'clear', 90_000)).toBe(startContextText(off, HANDOVER, 'clear'))
 })
