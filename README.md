@@ -122,16 +122,31 @@ The on/off choice belongs to the conversation: it survives `/clear` and `/compac
 type (so agent team teammates, which never receive typed input, never switch on by themselves).
 
 `/autohandoff status` shows whether AutoHandoff is on, the current context usage, the thresholds, the registered
-handoff with its stage and estimated size, the configuration file in use and any problems in it.
+handoff with its stage (or, before that, the handoff file the model has been asked to write), the configuration file
+in use and any problems in it.
 
 While a handoff is registered or a reset is running, a status line under the input box says so (Claude Code shows
 plugin status lines with a ⚠ in front). Short notices appear in the top-right corner.
 
 ### What the model does
 
-When a reminder arrives, the model writes its handoff file following the project's conventions, then calls the
-**`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`) with the file's path, and ends its turn.
-The reminder text tells it all of this; it does not need to know the tool in advance. The tool answers immediately
+When a reminder arrives, the model writes a **handoff file for the next conversation** at the path AutoHandoff puts
+at the end of the reminder, then calls the **`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`)
+with that path, and ends its turn. The reminder text tells it all of this; it does not need to know the tool in advance.
+
+The path is `<project folder>/.claude/autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
+was started in (or, if that is the home folder, the working directory or the git root), the local time of the first
+reminder, and the first 8 characters of the session id, so that several conversations open in one project never
+share a file. The path stays the same for the whole handoff (later reminders, registering again after a cancel); the
+next conversation gets a new one when it hands off in turn. Started from the home folder with no project folder at
+all, the model is asked to put the file in the auto-memory folder instead.
+
+The file is written from scratch every time and has to make sense on its own: the next conversation reads it, and
+only it, as the complete handoff. The model carries over what is still open from the handoff file its own
+conversation started from (questions waiting for you, running subagents, standing agreements), never from whatever
+file in the folder is newest. A project's own handoff or progress documents (a `HANDOVER.md` that grows a dated
+section per handoff, say) are updated the way the project does it; AutoHandoff neither reads nor limits them. You may
+want to add `.claude/autohandoff/` to the project's `.gitignore`. The tool answers immediately
 and never asks for permission. Only the main conversation can register; subagents and forks are refused.
 Registering again before the turn ends replaces the earlier registration.
 
@@ -141,6 +156,7 @@ The handoff file must be:
   git repository; or inside Claude Code's **auto-memory folder**, `~/.claude/projects/<project>/memory/`;
 - a regular file (symbolic links are followed and judged by their target), not empty, at most 1 MiB, and modified
   within `fresh_minutes`;
+- by AutoHandoff's estimate, not above `handoff_max_tokens` (see below);
 - named by an absolute path or one relative to the working directory, with only letters (any script), digits,
   spaces and `/ . _ - : @ + ,` (on Windows also `\`, and `~` only inside 8.3 short names such as `PROGRA~1`), at most
   512 characters. Spaces are fine inside the path (`C:\Users\Jane Doe\project\HANDOVER.md`) but not at either end;
@@ -154,23 +170,17 @@ transcripts) is accepted.
 
 1. The turn ends normally. AutoHandoff checks the file once more (still there, same file, not empty) and queues
    `/clear` (or `/compact <compact_focus>` with `action: compact`). The command runs as soon as Claude Code is idle.
-2. The new conversation starts with a note in the model's context (`start_context`) that names the handoff file.
-   If the handoff file was too long when it was registered (see below), the note also asks the model to tidy it
-   first (`oversize`).
+2. The new conversation starts with a note in the model's context (`start_context`) that names the handoff file and
+   says it is the complete handoff; other project documents are read only for details.
 3. AutoHandoff sends the resume message (`resume`) as your message; Claude Code shows it with
    "Prompt from the autohandoff plugin". The model reads the handoff file and continues.
 
-**Handoff file size.** A handoff file that gets a new dated section at every handoff, and never loses the old
-ones, grows until a new conversation cannot read it in one go (Claude Code's Read tool stops at 25,000 tokens) and
-every conversation pays for its history. The format stays the project's (appending, newest first, whatever it
-uses); the reminders only set a budget: the next conversation must be able to read the file within about three
-quarters of `handoff_max_tokens`, so when it gets close, older finished entries are moved unchanged into an archive
-file next to it, while standing agreements, questions waiting for you and running subagents stay near the top and
-within the budget. At registration AutoHandoff reads the file once and estimates its size the way the Read tool counts it (line-number
-prefix included; the estimate errs on the high side). A file above `handoff_max_tokens` is still registered, since
-the conversation is nearly full at that point, but the next conversation is first asked to move finished sections,
-unchanged, into an archive file next to the handoff file, keeping standing agreements, open questions and running
-subagents at the top, and only then to carry on. The format of the handoff file is up to the project.
+**Handoff file size.** The next conversation reads the whole handoff file, and Claude Code's Read tool stops at
+25,000 tokens per read. The reminders ask for about three quarters of `handoff_max_tokens` (15k by default). At
+registration AutoHandoff reads the file once and estimates its size the way the Read tool counts it (line-number
+prefix included; the estimate errs on the high side). A file above `handoff_max_tokens` is not registered: the
+model is told the estimate and the limit, shortens the file and registers again. This applies to any file the
+model registers, including a project's own `HANDOVER.md` if your custom prompts ask for that.
 
 Subagents, background shells and monitors that are still running are not waited for: they keep running across the
 reset, and their reports arrive in the new conversation. The reminders ask the model to list them in the handoff file
@@ -284,12 +294,12 @@ handoff_max_tokens: 20000
 | `wait_minutes` | `60` | Give up if the turn has not ended this long after registering (1–1440). |
 | `urge_block` | `true` | Past `urge_at`, block the first attempt to end a turn without a handoff, once per turn. |
 | `remind_every_turn` | `true` | After the first reminder, add a short reminder to every later message until a handoff is registered. |
-| `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders set a reading budget of about 3/4 of it; a larger registered file makes the next conversation tidy it first. `0` turns the check off; otherwise at least 1000. |
+| `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered, and the model is asked to shorten it. `0` turns the check off; otherwise at least 1000. |
 
 Token values accept `300000`, `300_000` or `300,000`, from 1 to 10,000,000. If `remind_at < urge_at < compact_at` does
 not hold, all three use their defaults.
 
-**Prompts.** Eleven prompts can be replaced; a section you leave out uses the built-in text (the generated file contains
+**Prompts.** Ten prompts can be replaced; a section you leave out uses the built-in text (the generated file contains
 all of them, so you can edit in place):
 
 | Section | Used for |
@@ -304,16 +314,15 @@ all of them, so you can edit in place):
 | `start_context` | Context for the model at the start of the reset conversation. |
 | `resume` | The message sent as you after the reset. |
 | `compact_focus` | Focus instructions passed to `/compact` (`action: compact` and `compact_at`). |
-| `oversize` | Added to `start_context`, after the handoff file's path, when the registered file was above `handoff_max_tokens`: tidy it first. |
 
 Placeholders are written `{name}`: `{used_k}` `{remind_k}` `{urge_k}` `{compact_k}` (thousands of tokens),
-`{compact_note}` (a sentence about `compact_at`), `{handoff_note}` (the sentence setting the handoff file's reading budget,
+`{compact_note}` (a sentence about `compact_at`), `{handoff_note}` (the sentence giving the handoff file's size budget,
 empty when `handoff_max_tokens` is 0), `{handoff_k}` `{handoff_max_k}` (the size to aim for and the limit),
-`{size_k}` (the registered file's estimated size, in `oversize` only), `{tool}` (the registration tool's full name), `{action}` (`/clear`
-or `/compact`), `{reason}` (in `cancelled` only). Each prompt accepts only the ones that make sense for it, and others
-are left as written. The handoff file's path is never a placeholder: AutoHandoff appends it in quotes to
-`start_context` and `resume` itself, marked as notes from the previous conversation rather than instructions from
-you. A prompt that uses `{file}` or the old `{cmd}` falls back to the built-in text.
+`{tool}` (the registration tool's full name), `{action}` (`/clear` or `/compact`), `{reason}` (in `cancelled` only).
+Each prompt accepts only the ones that make sense for it, and others are left as written. Paths are never
+placeholders: AutoHandoff appends the path of the handoff file to write to `remind`, `remind_short`, `urge` and
+`urge_block`, and the registered file's path to `start_context` and `resume` (there marked as notes from the previous
+conversation rather than instructions from you). A prompt that uses `{file}` or the old `{cmd}` falls back to the built-in text.
 
 **Environment variables.**
 
@@ -383,7 +392,7 @@ python3 e2e/drive.py <work dir> --cleanup-only       # after --keep
 ```
 
 Scenarios: `clear draft dialog deny interject notify cmp slash print compact fallback ctype agentdialog reload restart
-esc apierr subreg urge userclear chain oversize budget` (all by default). Each session runs in a separate tmux server (`SOCK`, default
+esc apierr subreg urge userclear chain limit` (all by default). Each session runs in a separate tmux server (`SOCK`, default
 `ahmod`) with `--plugin-dir` pointing at this checkout and `--settings` that disables an installed
 `autohandoff@autohandoff`; the configuration comes from the work directory through `AUTOHANDOFF_CONFIG`. Afterwards
 the driver kills the tmux server and removes exactly what the test sessions left under `~/.claude` (their project

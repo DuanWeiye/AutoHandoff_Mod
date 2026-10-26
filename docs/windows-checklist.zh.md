@@ -37,6 +37,8 @@
 | 1k | **长路径**：工程或交接文件的完整路径超过 260 字符（深目录） | 记下 realPath 是否带 `\\?\` 前缀；带的话会被拒，拒绝原因原文贴上。路径本身超过 512 字符按规则拒绝 | |
 | 1l | **Win32 名称规整**：登记 `docs\HANDOVER.md.`（末尾点）和 `docs\HANDOVER.md `（末尾空格） | 末尾空格：按首尾空格规则拒绝。末尾点：记下是被拒（原因原文）还是受理、答复里的 realPath 是否已去掉末尾点 | |
 | 1m | **junction 或符号链接**：工程目录经 `mklink /J` 链到另一个盘（或交接文件是 `mklink` 的符号链接） | 按链接**目标**判断：目标在工程或记忆目录内受理，否则拒绝；记下答复里的 realPath | |
+| 1n | **mod 指定的交接文件路径**（4.1.0）：在带空格的工程目录（如 `C:\Users\Jane Doe\proj`）里越过 remind_at | 提醒末尾的 `Handoff file to write: "…"` 是 `C:\Users\Jane Doe\proj\.claude\autohandoff\_AUTOHANDOFF_<本地日期>_<本地时间>_<会话 ID 前 8 位>.md`（反斜杠、时间是本机本地时间）；模型用 Write 建出 `.claude\autohandoff\` 目录与文件，登记受理。记下：Write 有没有弹权限框（`.claude` 目录）、登记答复里的 realPath | |
+| 1o | 同上，但在**用户主目录本身**启动 claude（`cd %USERPROFILE%` 后 `claude`） | 提醒改为让模型把 `_AUTOHANDOFF_…md` 放进自动记忆目录 `%USERPROFILE%\.claude\projects\<工程目录名>\memory\`；登记受理 | |
 
 ## 2. 配置文件
 

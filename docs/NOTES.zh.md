@@ -44,8 +44,14 @@
 - **v3 残留**（§0 第 26 条，4.0.1 起）：`autohandoff.toml`、`autohandoff-state` 不读、不迁移、不删，也不再提示；README 的 Upgrading from version 3 写明手动删。
 - **配置**：每次要用时重读（`readConfig`）；不存在时写一次默认文件（唯一的 `$.fs.write`）。`AUTOHANDOFF_CONFIG` 只认绝对路径，因为 `$.fs` 会把相对路径解析到工程目录下。
   配置目录：`CLAUDE_CONFIG_DIR` 优先；主目录取盘符形式的 USERPROFILE 优先（Git Bash 会把 HOME 设成 `/c/Users/x`，而 CC 用 `os.homedir()`），否则 HOME。
-- **交接文件超长**（§0 第 30 条，4.1.0）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，记进 `job.tokens`；
-  超过 `handoff_max_tokens` 不拦登记，start_context 在路径句后接 `oversize` 段（`startContextText` 第 4 个参数）。上限为 0 时不读文件。
+- **本轮交接文件**（§0 第 30 条，4.1.0）：`Rec.note` 存本轮要写的路径，`withNote` 在第一次要用时（remind、urge、短提醒、Stop block）用
+  `handoffNotePath(dir, sid, now)` 生成并追加 `noteLine` 一句到这四种提醒末尾。dir 来自 register.ts 的 `noteDir`：root、cwd、repo 根的 realPath 依次过
+  `usableRoots`（与登记白名单同一规则），取第一个，按进程缓存（session.start 清掉）；都不可用时只给文件名，`noteLine` 改说放进自动记忆目录。
+  只有 submit、postTool、stop 三种事件带 `Env.note`（查不到就不带，提醒不加路径）。`clearLevels` 把各层与 note 一起清掉（afterReset、finish、
+  migrateRecord、sessionStart(clear/compact)、用量回落到 remind_at 以下、兜底压缩完成）；cancelTold 只退一层，不清 note，所以作废后重新登记仍用同一路径。
+  本地时间用 `new Date(now)` 的本地分量（mod 运行时的时区即 CC 进程的时区，e2e 核对过）。mod 不写这个文件，目录与文件由模型的 Write 工具建。
+- **超长退回**（§0 第 30 条）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，超过 `handoff_max_tokens` 就 deny（说明估算值、上限、
+  目标值），不动已有的 armed 登记（与其它 deny 一致）。读失败（估算缺省）照收。上限为 0 时不读文件。
   估算 = ASCII 字符数 / 3 + 非 ASCII 码点数 × 1.65 + 行数 × 3（行数 = 换行数 + 1，与 Read 显示的行数一致），向上取整。
   校准（2026-10-26，CC 2.1.310 的 Read 工具对整份文件报告的 token 数；单测 `calibration points` 只存字符构成）：
 
@@ -114,9 +120,9 @@
   - 测试会话会加载真实的 `~/.claude/CLAUDE.md`，靠模型服从度的场景（chain、urge、interject）会受影响。
   - 模拟「不理提醒的模型」用把 remind/urge 换成「不必动作」的配置（fallback、urge 场景），测的是插件机制不是服从度；chain 场景把 start_context 换成中性说明，
     让 (b) 守卫真正被触发（断言至少拒绝一次）。
-  - `oversize`/`budget`（4.1.0）：交接文件预先攒了 30 节已完结的历史（约 7.9k token），上限压到 4000。`oversize` 的 remind/urge 用 4.1 之前那种不提大小、
-    按习惯在顶上加一节的写法（模拟没合并新提示词的旧配置），保证登记时超长，断言新对话收到整理段；`budget` 用内置提示词，只观察模型守不守预算。
-    模型整理时常用复合命令（`{ printf …; sed …; } > docs/…`、`cd docs && … && git -C ..`），放行清单管不到，驱动只批准框里出现 HANDOVER、不含 rm 的那些。
+  - `clear` 断言交接文件写在 remind 审计行给的路径（`<测试工程>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md`，时间与本机本地时间相差
+    15 分钟内）、登记的就是它、续接与 SessionStart 上下文都指向它、新对话读了它。
+  - `limit`（4.1.0）：上限压到 2000，remind/urge 要模型在交接文件里抄 120 行参考表，保证第一次登记超长；断言退回 → 同一路径压短重登记 → 重置、续接各一次。
   - `fault_proxy.py`：本地反代注入 API 错误，`after:<工具名>:<mode>` 只在交回该工具结果的那个请求上注入一次，OAuth 照常。
 
 ## 5. 未验证 / 待上机
