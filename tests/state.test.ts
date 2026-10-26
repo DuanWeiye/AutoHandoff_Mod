@@ -6,13 +6,14 @@ import {
   RESUME_STUCK_MS,
   TOOL_FULL_NAME,
   defaultConfig,
+  localStamp,
   migrateRecord,
   newRecord,
   transition,
   type Ev,
   type Rec,
 } from '../hooks/core.js'
-import { FILE_OK, HANDOVER, MIN, NOW, cfgWith, contexts, lastSeq, ofType, onRecord, run } from './helpers.js'
+import { FILE_OK, HANDOVER, MIN, NOW, REPO, cfgWith, contexts, lastSeq, ofType, onRecord, run } from './helpers.js'
 
 const T1 = 'f0b6c7a2-6d1e-4c2a-9a51-1f3e0c9b7d10'
 const T2 = '3a9e1d44-0c5b-4f7e-8b2d-6c1a9f0e2b77'
@@ -229,7 +230,7 @@ test('Esc cancels silently; the per-turn short reminder comes back with the next
   expect(ofType(a.all, 'clear')).toEqual([])
   const b = run(a.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 312_000 }])
   expect(contexts(b.all)).toEqual([
-    `[AutoHandoff] Context usage is about 312k tokens, past the first threshold of 300k, and no handoff is registered yet. Before this turn ends, finish the step in progress, write the handoff file, call the ${TOOL_FULL_NAME} tool with its path, and then end the turn.`,
+    `[AutoHandoff] Context usage is about 312k tokens, past the first threshold of 300k, and no handoff is registered yet. Before this turn ends, finish the step in progress, write the handoff file for the next conversation at the path below, call the ${TOOL_FULL_NAME} tool with that path, and then end the turn.`,
   ])
 })
 
@@ -330,7 +331,7 @@ test('Stop block: once per turn, not when stop_hook_active, not when switched of
   expect(blocks).toEqual([
     {
       type: 'block',
-      text: `AutoHandoff: context usage is about 462k tokens, past the 450k handoff threshold, and no handoff is registered. Before ending the turn, write the handoff file and call the ${TOOL_FULL_NAME} tool with its path.`,
+      text: `AutoHandoff: context usage is about 462k tokens, past the 450k handoff threshold, and no handoff is registered. Before ending the turn, write the handoff file for the next conversation at the path below and call the ${TOOL_FULL_NAME} tool with that path.`,
     },
   ])
   // 下一回合又能 block 一次
@@ -1095,14 +1096,14 @@ test('urge layer and a rejected tool: the turn ends without Stop, so no block; t
   expect(ofType(a.all, 'compact')).toEqual([])
   const b = run(a.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 470_000 }])
   expect(contexts(b.all)).toEqual([
-    `AutoHandoff: context usage is about 470k tokens, past the 450k handoff threshold, and no handoff is registered. Before ending the turn, write the handoff file and call the ${TOOL_FULL_NAME} tool with its path.`,
+    `AutoHandoff: context usage is about 470k tokens, past the 450k handoff threshold, and no handoff is registered. Before ending the turn, write the handoff file for the next conversation at the path below and call the ${TOOL_FULL_NAME} tool with that path.`,
   ])
 })
 
 test('remind_every_turn: a short reminder on every later message (human or agent) until registered; none when off, while registered, during a compaction or with unknown usage', () => {
   const sent = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 305_000 }]).rec
   const short = (tokens: number) =>
-    `[AutoHandoff] Context usage is about ${tokens / 1000}k tokens, past the first threshold of 300k, and no handoff is registered yet. Before this turn ends, finish the step in progress, write the handoff file, call the ${TOOL_FULL_NAME} tool with its path, and then end the turn.`
+    `[AutoHandoff] Context usage is about ${tokens / 1000}k tokens, past the first threshold of 300k, and no handoff is registered yet. Before this turn ends, finish the step in progress, write the handoff file for the next conversation at the path below, call the ${TOOL_FULL_NAME} tool with that path, and then end the turn.`
   const a = run(sent, [
     { kind: 'submit', origin: COMPOSER, tokens: 306_000 },
     { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 307_000 },
@@ -1152,65 +1153,140 @@ test('after the reset (resuming), a further /clear or /compact by the user gets 
   expect(a.rec.job?.stage).toBe('resuming')
 })
 
-// ───────── 交接文件超长（PLAN §0 第 30 条） ─────────
+// ───────── 本轮交接文件与超长退回（PLAN §0 第 30 条） ─────────
 
-test('oversize: an oversize handoff file is still registered; its size travels with the job across /clear and the new conversation is asked to tidy it first', () => {
-  const big: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 39_373 }
-  const a = run(onRecord(), [{ kind: 'submit', origin: COMPOSER, tokens: 296_000 }, { kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, big])
-  const reg = a.steps[3]!
-  expect(reg.accepted).toBe(true)
-  // 回给模型的话和以前一样（这时不宜逼它大改），只在 debug 里记一笔
-  expect(reg.reply).toBe(
-    `Handoff registered: "${HANDOVER}". End your turn now: no more tool calls, no questions, no summary. When the turn ends, the conversation is reset with /clear and continued from this file.`,
-  )
-  expect(ofType(reg.fx, 'log').map((l) => l.text)).toContain(
-    'handoff file is about 39k tokens, over handoff_max_tokens (20k); the next conversation will be asked to tidy it',
-  )
-  expect(a.rec.job?.tokens).toBe(39_373)
-  // /autohandoff status 显示大小
-  const st = run(a.rec, [{ kind: 'toggle', args: 'status', tokens: 309_000 }])
-  expect(ofType(st.all, 'log')[0]!.text).toContain(`Handoff: "${HANDOVER}" (armed, about 39k tokens (over the 20k limit; the next conversation tidies it first)).`)
+const SID_A = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
+const SID_B = 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e'
+const NOTE_ENV = { dir: REPO, sid: SID_A }
+const noteAt = (at: number, sid = SID_A, dir = REPO) => `${dir}/.claude/autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
+const lineFor = (path: string) => `Handoff file to write: "${path}" (a new file for this handoff; register this path).`
+const regAt = (path: string, fileTokens?: number): Ev => ({ kind: 'register', verdict: { ok: true, value: path }, ...(fileTokens === undefined ? {} : { fileTokens }) })
 
-  const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE])
-  const moved = migrateRecord(b.rec, NOW)
-  expect(moved.job?.tokens).toBe(39_373)
-  const c = run(moved, [{ kind: 'resetDone', seq: lastSeq(b.all) }, { kind: 'sessionStart', source: 'clear' }])
-  const sc = contexts(c.steps[1]!.fx)
-  expect(sc.length).toBe(1)
-  expect(sc[0]).toContain(`Handoff file: "${HANDOVER}"`)
-  expect(sc[0]).toContain('[AutoHandoff: tidy the handoff file first] The handoff file named above is about 40k tokens, over the 20k limit')
-  // 续接正文不带整理段（只在 start_context 里说一次）
-  expect(ofType(c.steps[0]!.fx, 'resume')[0]!.text).not.toContain('tidy')
+test('handoff file to write: the first reminder fixes the path; short reminders, the urge, the Stop block and registering again after a cancel all use it', () => {
+  const P = noteAt(NOW)
+  const a = run(
+    onRecord(),
+    [
+      { kind: 'submit', origin: COMPOSER, tokens: 296_000 },
+      { kind: 'turnStart', turnId: T1 },
+      { kind: 'postTool', tokens: 301_900 },
+    ],
+    defaultConfig(),
+    NOTE_ENV,
+  )
+  // 越线前不生成；第一次完整提醒末尾带路径，正文里说「末尾给的路径」
+  expect(a.steps[0]!.rec.note).toBeNull()
+  const remind = contexts(a.steps[2]!.fx)[0]!
+  expect(remind.endsWith(`\n\n${lineFor(P)}`)).toBe(true)
+  expect(remind).toContain('as a new file at the path given at the end of this message')
+  expect(a.rec.note).toBe(P)
+  expect(ofType(a.steps[2]!.fx, 'log')[0]!.text).toBe(`remind sent at 301k; handoff file to write: ${P}`)
+
+  // 3 分钟后的下一条消息：短提醒，同一个路径（不按新时刻重算）
+  const b = run(a.rec, [[{ kind: 'submit', origin: COMPOSER, tokens: 306_000 }, NOW + 3 * MIN]], defaultConfig(), NOTE_ENV)
+  expect(contexts(b.all)[0]!.endsWith(lineFor(P))).toBe(true)
+
+  // 登记后用户插话作废；回合里再送的完整提醒、之后的 urge、Stop block 都还是它
+  const c = run(
+    b.rec,
+    [
+      [{ kind: 'turnStart', turnId: T2 }, NOW + 4 * MIN],
+      [regAt(P, 6_100), NOW + 5 * MIN],
+      [{ kind: 'submit', origin: COMPOSER, tokens: 309_000 }, NOW + 6 * MIN],
+      [{ kind: 'postTool', tokens: 311_000 }, NOW + 7 * MIN],
+      [{ kind: 'postTool', tokens: 452_000 }, NOW + 9 * MIN],
+    ],
+    defaultConfig(),
+    NOTE_ENV,
+  )
+  expect(c.steps[1]!.accepted).toBe(true)
+  expect(contexts(c.steps[2]!.fx)[0]).toContain('[AutoHandoff] Your registered handoff was cancelled (a new message from the user arrived)')
+  expect(contexts(c.steps[3]!.fx)[0]!.endsWith(lineFor(P))).toBe(true)
+  expect(contexts(c.steps[4]!.fx)[0]).toContain('[AutoHandoff: hand off now]')
+  expect(contexts(c.steps[4]!.fx)[0]!.endsWith(lineFor(P))).toBe(true)
+  const d = run(c.rec, [[{ kind: 'turnStart', turnId: T1 }, NOW + 10 * MIN], [{ kind: 'stop', active: false, tokens: 455_000 }, NOW + 11 * MIN]], defaultConfig(), NOTE_ENV)
+  expect(ofType(d.all, 'block')[0]!.text.endsWith(lineFor(P))).toBe(true)
+  expect(d.rec.note).toBe(P)
+  // /autohandoff status 也报这个路径
+  const st = run(d.rec, [{ kind: 'toggle', args: 'status', tokens: 455_000 }])
+  expect(ofType(st.all, 'log')[0]!.text).toContain(`Handoff: none registered. Second reminder sent. Handoff file to write: "${P}".`)
 })
 
-test('oversize: under the limit, size unknown (the file could not be read) or the check off: start_context as before', () => {
-  const plain = (fileTokens: number | undefined, cfg = defaultConfig()) => {
-    const reg: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, ...(fileTokens === undefined ? {} : { fileTokens }) }
-    const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, reg], cfg)
-    expect(a.steps[2]!.accepted).toBe(true)
-    const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE], cfg)
-    const c = run(migrateRecord(b.rec, NOW), [{ kind: 'resetDone', seq: lastSeq(b.all) }, { kind: 'sessionStart', source: 'clear' }], cfg)
-    return contexts(c.steps[1]!.fx)[0]!
-  }
-  for (const text of [plain(11_200), plain(undefined), plain(64_000, cfgWith({ handoff_max_tokens: 0 })), plain(64_000, cfgWith({ handoff_max_tokens: 80_000 }))]) {
-    expect(text).toContain(`Handoff file: "${HANDOVER}"`)
-    expect(text).not.toContain('tidy the handoff file')
+test('handoff file to write: the next conversation after the reset (/clear or /compact) gets a new path at its first reminder', () => {
+  for (const action of ['clear', 'compact'] as const) {
+    const cfg = cfgWith({ action })
+    const P = noteAt(NOW)
+    const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, regAt(P, 6_100), { kind: 'stop', active: false, tokens: 318_400 }, DONE], cfg, NOTE_ENV)
+    expect(a.rec.job?.file).toBe(P)
+    // /clear 换 sid、记录搬过去；/compact 不换 sid
+    const rec = action === 'clear' ? migrateRecord(a.rec, NOW + MIN) : a.rec
+    const sid = action === 'clear' ? SID_B : SID_A
+    const later = NOW + 40 * MIN
+    const b = run(
+      rec,
+      [
+        [{ kind: 'resetDone', seq: lastSeq(a.all) }, NOW + MIN],
+        [{ kind: 'sessionStart', source: action }, NOW + MIN],
+        [{ kind: 'resumeDone', seq: lastSeq(a.all) }, NOW + MIN],
+        [{ kind: 'turnStart', turnId: T2 }, later],
+        [{ kind: 'postTool', tokens: 303_000 }, later],
+      ],
+      cfg,
+      { dir: REPO, sid },
+    )
+    // 新对话拿到的交接是旧路径；它自己的第一轮提醒是新路径（新时刻、/clear 时还是新会话 ID）
+    expect(contexts(b.steps[1]!.fx)[0]).toContain(`Handoff file: "${P}"`)
+    const next = noteAt(later, sid)
+    expect(next).not.toBe(P)
+    expect(contexts(b.steps[4]!.fx)[0]!.endsWith(lineFor(next))).toBe(true)
   }
 })
 
-test('oversize: action compact gives the tidy section at SessionStart(compact); re-registering a trimmed file drops it', () => {
-  const cfg = cfgWith({ action: 'compact' })
-  const big: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 52_000 }
-  const trimmed: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 9_800 }
-  const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, big], cfg)
-  expect(a.rec.job?.tokens).toBe(52_000)
-  // 模型在同一回合里精简后重新登记：以新的大小为准
-  const a2 = run(a.rec, [trimmed], cfg)
-  expect(a2.rec.job?.tokens).toBe(9_800)
-  const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE], cfg)
-  expect(b.rec.job?.stage).toBe('compacting')
-  const c = run(b.rec, [{ kind: 'sessionStart', source: 'compact' }], cfg)
-  expect(contexts(c.all)[0]).toContain('is about 52k tokens, over the 20k limit')
-  const b2 = run(a2.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE, { kind: 'sessionStart', source: 'compact' }], cfg)
-  expect(contexts(b2.all)[0]).not.toContain('tidy the handoff file')
+test('handoff file to write: two conversations of one project reminded in the same second get different paths; a compaction that drops usage below remind_at starts a new round', () => {
+  const remindFor = (sid: string) => run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }], defaultConfig(), { dir: REPO, sid }).rec.note
+  expect(remindFor(SID_A)).toBe(noteAt(NOW, SID_A))
+  expect(remindFor(SID_B)).toBe(noteAt(NOW, SID_B))
+  expect(remindFor(SID_A)).not.toBe(remindFor(SID_B))
+
+  const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }], defaultConfig(), NOTE_ENV)
+  // Claude Code 自己压缩过：用量回落，路径作废；再越线时按那时的时刻生成
+  const b = run(a.rec, [[{ kind: 'sessionStart', source: 'compact' }, NOW + 5 * MIN], [{ kind: 'postTool', tokens: 120_000 }, NOW + 6 * MIN]], defaultConfig(), NOTE_ENV)
+  expect(b.rec.note).toBeNull()
+  const c = run(b.rec, [[{ kind: 'postTool', tokens: 300_500 }, NOW + 50 * MIN]], defaultConfig(), NOTE_ENV)
+  expect(c.rec.note).toBe(noteAt(NOW + 50 * MIN))
+  // 没给材料（查不到工程目录）：提醒照送，末尾不加路径
+  const d = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }])
+  expect(d.rec.note).toBeNull()
+  expect(contexts(d.all)[0]).not.toContain('Handoff file to write')
+})
+
+test('oversize: a handoff file over handoff_max_tokens is not registered; the reply gives the estimate, the limit and the size to aim for', () => {
+  const P = noteAt(NOW)
+  const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, regAt(P, 23_400)], defaultConfig(), NOTE_ENV)
+  const refused = a.steps[2]!
+  expect(refused.accepted).toBe(false)
+  expect(refused.reply).toBe(
+    "Not registered: the handoff file is about 24k tokens by AutoHandoff's estimate, over the 20k limit (handoff_max_tokens). The next conversation reads all of it, so shorten it to about 15k tokens: keep what is needed to continue (work in progress, next steps, questions waiting for the user, running subagents or background tasks, standing agreements) and leave details to the project's own documents; then call the tool again.",
+  )
+  expect(ofType(refused.fx, 'log')[0]!.text).toStartWith('registration refused: the handoff file is about 24k tokens')
+  expect(a.rec.job).toBeNull()
+  // 压短后重新登记：受理，路径不变；到下一轮之前提醒照旧用它
+  const b = run(a.rec, [regAt(P, 13_900)])
+  expect(b.steps[0]!.accepted).toBe(true)
+  expect(b.rec.job?.file).toBe(P)
+  expect(b.rec.note).toBe(P)
+})
+
+test('oversize: at the limit, size unknown, the check off (0) or a raised limit: registered, whatever legal path it is', () => {
+  const accepted = (path: string, fileTokens: number | undefined, cfg = defaultConfig()) =>
+    run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, regAt(path, fileTokens)], cfg).steps[2]!.accepted
+  expect(accepted(noteAt(NOW), 20_000)).toBe(true)
+  expect(accepted(noteAt(NOW), 20_001)).toBe(false)
+  // 用户自写提示词、登记工程自己的 HANDOVER.md：不超限就照收
+  expect(accepted(HANDOVER, 11_200)).toBe(true)
+  expect(accepted(HANDOVER, 39_373)).toBe(false)
+  // 读不到正文（估算缺省）
+  expect(accepted(HANDOVER, undefined)).toBe(true)
+  expect(accepted(HANDOVER, 39_373, cfgWith({ handoff_max_tokens: 0 }))).toBe(true)
+  expect(accepted(HANDOVER, 39_373, cfgWith({ handoff_max_tokens: 50_000 }))).toBe(true)
 })

@@ -6,6 +6,7 @@ import {
   transition,
   type Config,
   type Effect,
+  type Env,
   type Ev,
   type Rec,
   type StatLike,
@@ -82,13 +83,17 @@ export interface Trace {
   all: Effect[]
 }
 
-/** 依次送入事件；每个事件的时刻可以用 [ev, at] 指定，否则用 NOW */
-export function run(start: Rec, events: (Ev | [Ev, number])[], cfg: Config = defaultConfig()): Trace {
+/**
+ * 依次送入事件；每个事件的时刻可以用 [ev, at] 指定，否则用 NOW。
+ * note：生成本轮交接文件路径的材料（register.ts 只给 submit、postTool、stop 带，这里同样只给这三种）；缺省不带，提醒末尾就没有路径
+ */
+export function run(start: Rec, events: (Ev | [Ev, number])[], cfg: Config = defaultConfig(), note?: Env['note']): Trace {
   let rec = start
   const steps: Step[] = []
   for (const item of events) {
     const [ev, at] = Array.isArray(item) ? item : [item, NOW]
-    const st = transition(rec, ev, { cfg, now: at })
+    const wants = ev.kind === 'submit' || ev.kind === 'postTool' || ev.kind === 'stop'
+    const st = transition(rec, ev, { cfg, now: at, note: wants ? note : undefined })
     steps.push(st)
     rec = st.rec
   }

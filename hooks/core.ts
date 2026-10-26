@@ -109,7 +109,7 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
   remind_every_turn:
     'After the first reminder, add a short reminder to every later message of the main conversation until a handoff is registered.',
   handoff_max_tokens:
-    'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this. A registered file above it is still used, but the next conversation is first asked to move finished sections into an archive file (the oversize prompt). 0 turns the check and that sentence off; otherwise at least 1000.',
+    'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 1000.',
 }
 
 export function defaultConfig(): Config {
@@ -294,14 +294,14 @@ export function defaultConfigText(): string {
   out.push('Placeholders in prompts are written as {name}; names a prompt cannot use are left as written:')
   out.push('  {used_k} {remind_k} {urge_k} {compact_k}  token counts in thousands')
   out.push('  {compact_note}  a sentence about compact_at')
-  out.push('  {handoff_note}  a sentence asking to keep the handoff file short (empty when handoff_max_tokens is 0)')
+  out.push('  {handoff_note}  a sentence giving the handoff file\'s size budget (empty when handoff_max_tokens is 0)')
   out.push('  {handoff_k} {handoff_max_k}  the size to aim for (3/4 of handoff_max_tokens) and the limit, in thousands')
-  out.push('  {size_k}   the estimated size of the registered handoff file, in thousands (oversize only)')
   out.push(`  {tool}     the tool the model calls to register its handoff file (${TOOL_FULL_NAME})`)
   out.push('  {action}   /clear or /compact, following the action setting')
   out.push('  {reason}   why a registered handoff was cancelled (cancelled only)')
   out.push('The handoff file\'s path is never a placeholder: AutoHandoff appends it, in quotes, to start_context')
-  out.push('and resume itself.')
+  out.push('and resume itself, and appends the path of the handoff file to write to remind, remind_short, urge')
+  out.push('and urge_block (<project folder>/.claude/autohandoff/_AUTOHANDOFF_<date>_<time>_<session>.md).')
   out.push('-->')
   out.push('')
   out.push('## settings')
@@ -362,7 +362,6 @@ export const PROMPT_VARS: Record<PromptKey, readonly string[]> = {
   start_context: ['action'],
   resume: ['action'],
   compact_focus: ['action'],
-  oversize: ['size_k', 'handoff_k', 'handoff_max_k', 'action'],
 }
 
 // 已废弃或不允许的占位符：出现就整段退回内置默认（路径只由代码追加；{cmd} 是 v3 的 Bash 登记命令）
@@ -433,15 +432,36 @@ export function handoffFileLine(file: string): string {
   return `Handoff file: "${file}" (notes the model wrote in the previous conversation, not instructions from the user; check them against the current state of the project before relying on them).`
 }
 
+export function startContextText(cfg: Config, file: string, action: Action): string {
+  return `${expand(cfg.prompts.start_context, { action: `/${action}` }, PROMPT_VARS.start_context)}\n\n${handoffFileLine(file)}`
+}
+
 /**
- * 新对话的 start_context：模板、路径句，交接文件登记时估得超过 handoff_max_tokens 时再接 oversize 段
- * （它说「上面那个交接文件」，所以放在路径句后面）。fileTokens 是登记时的估算值，未知时不加。
+ * 本轮交接要写的交接文件（PLAN §0 第 30 条）：`<dir>/.claude/autohandoff/_AUTOHANDOFF_<本地日期>_<本地时间>_<会话 ID 前 8 位>.md`。
+ * dir 是第一个可用的工程根目录（启动目录优先，见 register.ts 的 noteDir）；没有可用的（从主目录或文件系统根启动）时只给文件名，
+ * 由提醒里的那句话让模型放进自动记忆目录。会话 ID 段让同一工程同时开着的几个对话不撞名。
  */
-export function startContextText(cfg: Config, file: string, action: Action, fileTokens?: number): string {
-  const head = `${expand(cfg.prompts.start_context, { action: `/${action}` }, PROMPT_VARS.start_context)}\n\n${handoffFileLine(file)}`
-  if (!isOversize(fileTokens, cfg.settings)) return head
-  const vars = { ...handoffVars(cfg.settings), size_k: Math.ceil((fileTokens ?? 0) / 1000), action: `/${action}` }
-  return `${head}\n\n${expand(cfg.prompts.oversize, vars, PROMPT_VARS.oversize)}`
+export function handoffNotePath(dir: string | undefined, sid: string, now: number): string {
+  const name = `_AUTOHANDOFF_${localStamp(now)}_${sid.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'session'}.md`
+  if (dir === undefined) return name
+  const sep = looksWindows(dir) ? '\\' : '/'
+  return `${trimSep(dir)}${sep}.claude${sep}autohandoff${sep}${name}`
+}
+
+/** 运行 Claude Code 的机器的本地时间，YYYYMMDD_HHMMSS */
+export function localStamp(now: number): string {
+  const d = new Date(now)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+/** remind、remind_short、urge、urge_block 末尾由代码追加的一句：本轮要写的交接文件（同 handoffFileLine，路径不进模板） */
+export function noteLine(note: string): string {
+  if (isAbsolutePath(note)) return `Handoff file to write: "${note}" (a new file for this handoff; register this path).`
+  return (
+    `Handoff file to write: a new file named "${note}" in the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ` +
+    'because Claude Code was started in the home folder or at the root of the file system, where AutoHandoff accepts no handoff file. Register its full path.'
+  )
 }
 
 /** 估算的交接文件大小是否超过上限（上限为 0 时检测关闭；估算未知时不算） */
@@ -449,10 +469,7 @@ export function isOversize(fileTokens: number | undefined, s: Settings): boolean
   return s.handoff_max_tokens > 0 && fileTokens !== undefined && fileTokens > s.handoff_max_tokens
 }
 
-/**
- * 提示词里给的交接文件阅读预算：上限的 3/4（留出余量，模型写的比要求的长是常事）。
- * 只给预算、不规定格式（追加、最新在前都行，PLAN §0 第 30 条）
- */
+/** 提示词里给的交接文件大小预算：上限的 3/4（留出余量，模型写的比要求的长是常事） */
 export function handoffTarget(s: Settings): number {
   return Math.floor((s.handoff_max_tokens * 3) / 4)
 }
@@ -464,7 +481,7 @@ function handoffVars(s: Settings): Record<string, string | number> {
     handoff_max_k: kTokens(s.handoff_max_tokens),
     handoff_note:
       s.handoff_max_tokens > 0
-        ? ` Keep the handoff file in the form this project uses (appending, newest first or anything else), but make sure the next conversation can read it within about ${k}k tokens: when it gets close, move older, finished entries unchanged (not rewritten) into an archive file next to it, which the next conversation does not read by default. Standing agreements, questions waiting for the user and running subagents or background tasks stay near the top and within that budget; never move them out with the old entries or push them down.`
+        ? ` Keep it within about ${k}k tokens, since the next conversation reads all of it; AutoHandoff does not register a handoff file above ${kTokens(s.handoff_max_tokens)}k.`
         : '',
   }
 }
@@ -760,8 +777,6 @@ export interface Job {
   ctxGiven: boolean
   /** 重置完成的时刻 */
   resetAt: number | null
-  /** 登记时估算的交接文件大小（estimateReadTokens）；没读到或检测关着时没有。超过上限时新对话的 start_context 带 oversize 段 */
-  tokens?: number
   /**
    * 重置排队后模块被热重载（或进程重启）：旧模块的回调不一定还会来，由新对话的 SessionStart 补上 resetDone 的工作。
    * 只在这种情况下出现。
@@ -800,6 +815,11 @@ export interface Rec {
   /** 本进程是 agent team 的 teammate：从不动作（收到人工输入或 /autohandoff 就撤销） */
   teammate: boolean
   levels: Levels
+  /**
+   * 本轮交接要写的交接文件（handoffNotePath）：第一次送提醒时生成，之后的提醒、作废后重新登记都用它；
+   * 各层清零（重置完成、/clear 搬迁、用量回落到 remind_at 以下）时清掉，下一轮生成新的
+   */
+  note: string | null
   job: Job | null
   fallback: Fallback | null
   /** 兜底压缩连续失败的次数（成功一次清零） */
@@ -827,6 +847,7 @@ export function newRecord(now: number): Rec {
     human: false,
     teammate: false,
     levels: { remind: false, urge: false },
+    note: null,
     job: null,
     fallback: null,
     fallbackFails: 0,
@@ -863,6 +884,7 @@ function cloneRec(r: Rec): Rec {
     human: r.human === true,
     teammate: r.teammate === true,
     levels: { remind: r.levels?.remind === true, urge: r.levels?.urge === true },
+    note: typeof r.note === 'string' ? r.note : null,
     job: r.job ? { ...r.job } : null,
     fallback: r.fallback ? { ...r.fallback } : null,
     fallbackFails: typeof r.fallbackFails === 'number' ? r.fallbackFails : 0,
@@ -882,7 +904,7 @@ function cloneRec(r: Rec): Rec {
  */
 export function migrateRecord(old: Rec, now: number): Rec {
   const r = cloneRec(old)
-  r.levels = { remind: false, urge: false }
+  clearLevels(r)
   r.turn = null
   r.tell = null
   r.fallback = null
@@ -951,7 +973,7 @@ export type Ev =
    * 复查本身出错（stat 抛错）也要传 {ok:false}。file 缺省按复查失败处理（宁可不 clear）。
    */
   | { kind: 'turnComplete'; turnId: string; reason: TurnReason; isAborted: boolean; tokens?: number; file?: Verdict<string> }
-  /** 登记工具被调用；verdict 是路径检查的结果；tokens 是调用时的用量；fileTokens 是交接文件的估算大小（没读到时缺省） */
+  /** 登记工具被调用；verdict 是路径检查的结果；tokens 是调用时的用量；fileTokens 是交接文件的估算大小（没读到、检测关着时缺省） */
   | { kind: 'register'; agentId?: string; verdict: Verdict<string>; tokens?: number; fileTokens?: number }
   /** 自家 clear/compact 的 promise resolve（seq 取自对应的 effect） */
   | { kind: 'resetDone'; seq: number }
@@ -969,6 +991,11 @@ export type Ev =
 export interface Env {
   cfg: Config
   now: number
+  /**
+   * 生成本轮交接文件路径的材料（handoffNotePath）：dir 是可用的工程根目录（没有时缺省），sid 是当前会话 ID。
+   * 只有可能送提醒的事件（submit、postTool、stop）带；没有时提醒末尾不加路径
+   */
+  note?: { dir?: string; sid: string }
 }
 
 export interface Step {
@@ -1087,7 +1114,7 @@ export function jobKey(j: Pick<Job, 'registeredAt' | 'seq'>): string {
 
 /** 自家重置完成：进入续接阶段，提交续接（用户已接手时不提交）。resetDone 和孤儿 job 的 SessionStart 共用。 */
 function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): void {
-  r.levels = { remind: false, urge: false }
+  clearLevels(r)
   j.stage = 'resuming'
   j.resetAt = now
   // 续接开启的对话在越过 remind_at 或收到人工消息之前不受理登记；用户已接手（userTook）时不挡
@@ -1103,7 +1130,7 @@ function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): voi
 
 function finish(r: Rec, fx: Effect[], why: string): void {
   r.job = null
-  r.levels = { remind: false, urge: false }
+  clearLevels(r)
   fx.push({ type: 'log', text: `handoff finished: ${why}`, debug: true })
 }
 
@@ -1122,8 +1149,21 @@ function warnWindow(r: Rec, s: Settings, window: number | undefined, fx: Effect[
   })
 }
 
+/** 各层清零：新的一轮交接（本轮的交接文件路径也一起作废，下一轮生成新的） */
+function clearLevels(r: Rec): void {
+  r.levels = { remind: false, urge: false }
+  r.note = null
+}
+
+/** 提醒正文末尾追加本轮要写的交接文件；路径第一次用到时生成（env 没带材料时不加） */
+function withNote(r: Rec, env: Env, text: string): string {
+  if (r.note === null && env.note) r.note = handoffNotePath(env.note.dir, env.note.sid, env.now)
+  return r.note === null ? text : `${text}\n\n${noteLine(r.note)}`
+}
+
 /** 送提醒：先送挂着的作废说明（这次就不再送提醒）；否则按阈值送完整提醒；allowShort 时补每回合短提醒。 */
-function remindInto(r: Rec, cfg: Config, tokens: number | undefined, fx: Effect[], allowShort: boolean): void {
+function remindInto(r: Rec, env: Env, tokens: number | undefined, fx: Effect[], allowShort: boolean): void {
+  const { cfg } = env
   const s = cfg.settings
   if (r.tell) {
     fx.push({ type: 'context', text: renderPrompt(cfg, 'cancelled', promptVars(cfg, tokens, tellText(r.tell, s))) })
@@ -1133,13 +1173,15 @@ function remindInto(r: Rec, cfg: Config, tokens: number | undefined, fx: Effect[
   if (r.job || r.fallback) return
   const d = decideLevel(tokens, r.levels, s)
   r.levels = d.levels
+  // 用量回落到 remind_at 以下（压缩过）：下一轮交接用新路径
+  if (tokens !== undefined && tokens < s.remind_at) r.note = null
   if (d.send) {
-    fx.push({ type: 'context', text: renderPrompt(cfg, d.send, promptVars(cfg, tokens)) })
-    fx.push({ type: 'log', text: `${d.send} sent at ${kTokens(tokens ?? 0)}k`, debug: true })
+    fx.push({ type: 'context', text: withNote(r, env, renderPrompt(cfg, d.send, promptVars(cfg, tokens))) })
+    fx.push({ type: 'log', text: `${d.send} sent at ${kTokens(tokens ?? 0)}k${r.note === null ? '' : `; handoff file to write: ${r.note}`}`, debug: true })
     return
   }
   if (allowShort && s.remind_every_turn && tokens !== undefined && tokens >= s.remind_at && r.levels.remind) {
-    fx.push({ type: 'context', text: renderPrompt(cfg, r.levels.urge ? 'urge_block' : 'remind_short', promptVars(cfg, tokens)) })
+    fx.push({ type: 'context', text: withNote(r, env, renderPrompt(cfg, r.levels.urge ? 'urge_block' : 'remind_short', promptVars(cfg, tokens))) })
   }
 }
 
@@ -1215,7 +1257,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         return
       }
       warnWindow(r, s, ev.window, fx)
-      remindInto(r, cfg, ev.tokens, fx, true)
+      remindInto(r, env, ev.tokens, fx, true)
       return
     }
     case 'userCommand': {
@@ -1278,7 +1320,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         return
       }
       warnWindow(r, s, ev.window, fx)
-      remindInto(r, cfg, ev.tokens, fx, false)
+      remindInto(r, env, ev.tokens, fx, false)
       return
     }
     case 'stop': {
@@ -1295,7 +1337,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       }
       r.levels = d.levels
       r.turn.blocked = true
-      fx.push({ type: 'block', text: renderPrompt(cfg, 'urge_block', promptVars(cfg, ev.tokens)) })
+      fx.push({ type: 'block', text: withNote(r, env, renderPrompt(cfg, 'urge_block', promptVars(cfg, ev.tokens))) })
       fx.push({ type: 'log', text: `Stop blocked once to ask for a handoff${d.send ? ` (urge level reached at Stop, ${kTokens(ev.tokens)}k)` : ''}`, debug: true })
       return
     }
@@ -1303,7 +1345,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       const t = r.turn
       const stopSeen = !!t && (t.id === ev.turnId || t.id === null) && t.stopSeen
       r.turn = null
-      if (ev.tokens !== undefined && ev.tokens < s.remind_at) r.levels = { remind: false, urge: false }
+      if (ev.tokens !== undefined && ev.tokens < s.remind_at) clearLevels(r)
       const aborted = ev.isAborted || ev.reason === 'aborted'
       const j = r.job
       if (j?.stage === 'armed') {
@@ -1366,6 +1408,15 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         )
       }
       if (!ev.verdict.ok) return deny(`${ev.verdict.why}.`)
+      // 超长退回（PLAN §0 第 30 条）：新对话要整份读完，Read 一次只读 25000 token；估算读不到（undefined）时照收
+      if (isOversize(ev.fileTokens, s)) {
+        return deny(
+          `the handoff file is about ${Math.ceil((ev.fileTokens ?? 0) / 1000)}k tokens by AutoHandoff's estimate, over the ${kTokens(s.handoff_max_tokens)}k limit ` +
+            `(handoff_max_tokens). The next conversation reads all of it, so shorten it to about ${kTokens(handoffTarget(s))}k tokens: keep what is needed ` +
+            'to continue (work in progress, next steps, questions waiting for the user, running subagents or background tasks, standing agreements) ' +
+            "and leave details to the project's own documents; then call the tool again.",
+        )
+      }
       const file = ev.verdict.value
       r.job = {
         file,
@@ -1378,20 +1429,11 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         ctxGiven: false,
         resetAt: null,
       }
-      if (ev.fileTokens !== undefined) r.job.tokens = ev.fileTokens
       r.tell = null
       // 「本回合见没见到 Stop」只算登记之后的（之前的 Stop 可能是自家的 urge block）
       if (r.turn) r.turn.stopSeen = false
       fx.push({ type: 'timer', ms: s.wait_minutes * 60_000 })
       fx.push({ type: 'log', text: `handoff registered: ${file} (turn ${r.turn?.id ?? 'unknown'})`, debug: true })
-      // 超长不拦登记（这时上下文已很满，不宜逼模型大改）：记下来，新对话一开始先整理
-      if (isOversize(ev.fileTokens, s)) {
-        fx.push({
-          type: 'log',
-          text: `handoff file is about ${kTokens(ev.fileTokens ?? 0)}k tokens, over handoff_max_tokens (${kTokens(s.handoff_max_tokens)}k); the next conversation will be asked to tidy it`,
-          debug: true,
-        })
-      }
       out.accepted = true
       out.reply = `Handoff registered: "${file}". End your turn now: no more tool calls, no questions, no summary. When the turn ends, the conversation is reset with /${s.action} and continued from this file.`
       return
@@ -1400,7 +1442,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (r.fallback?.seq === ev.seq) {
         r.fallback = null
         r.fallbackFails = 0
-        r.levels = { remind: false, urge: false }
+        clearLevels(r)
         fx.push({ type: 'log', text: 'compaction at compact_at done', debug: true })
         return
       }
@@ -1445,7 +1487,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     }
     case 'sessionStart': {
       if (ev.source !== 'clear' && ev.source !== 'compact') return
-      r.levels = { remind: false, urge: false }
+      clearLevels(r)
       r.turn = null
       const j = r.job
       if (!j) return
@@ -1462,13 +1504,13 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (resetQueued(r) && ev.source !== j.action) {
         // 自家 /compact 排队时用户的 /clear 先跑了：这已是新对话，现在就给交接；自家的 /compact 随后作用在这个对话上，
         // 它成功或失败都续接（见 resetFailed）。孤儿 job 也等自家那次 SessionStart(compact) 再续接
-        fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action, j.tokens) })
+        fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
         j.ctxGiven = true
         fx.push({ type: 'log', text: `a /${ev.source} not run by AutoHandoff started a new conversation while /${j.action} is queued; it gets the handoff now`, debug: true })
         return
       }
       // 自家那种重置（排队中）或续接阶段里的任何重置：都是要拿交接的对话
-      fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action, j.tokens) })
+      fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
       j.ctxGiven = true
       if (j.orphan && resetQueued(r)) {
         // 热重载后旧模块的 resetDone 不一定会来：由这里完成；它要是晚到了，按「不是当前请求」忽略
@@ -1550,12 +1592,12 @@ export function formatStatus(r: Rec, cfg: Config, x: StatusExtra): string {
     )
   }
   const j = r.job
-  if (j) {
-    const size = j.tokens === undefined ? '' : `, about ${kTokens(j.tokens)}k tokens${isOversize(j.tokens, s) ? ` (over the ${kTokens(s.handoff_max_tokens)}k limit; the next conversation tidies it first)` : ''}`
-    lines.push(`Handoff: "${j.file}" (${j.stage}${size}).`)
-  }
+  if (j) lines.push(`Handoff: "${j.file}" (${j.stage}).`)
   else if (r.fallback) lines.push('Compaction at compact_at in progress.')
-  else lines.push(`Handoff: none registered.${r.levels.urge ? ' Second reminder sent.' : r.levels.remind ? ' First reminder sent.' : ''}`)
+  else {
+    const sent = r.levels.urge ? ' Second reminder sent.' : r.levels.remind ? ' First reminder sent.' : ''
+    lines.push(`Handoff: none registered.${sent}${r.note === null ? '' : ` Handoff file to write: "${r.note}".`}`)
+  }
   if (r.resumed) {
     lines.push(
       `Just continued from a handoff file: a new handoff is not accepted until context passes ${kTokens(s.remind_at)}k or you send a message (this stops a reset loop).`,

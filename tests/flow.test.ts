@@ -3,7 +3,7 @@
 // clear 的 promise 先 resolve、约 180 ms 后才到 SessionStart(clear)；子代理的事件带 agentId；工具被拒的回合没有 Stop。
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { COMMAND_NAME, QUEUED_TOAST, TOOL_FULL_NAME, defaultConfigText, storeKey } from '../hooks/core.js'
+import { COMMAND_NAME, QUEUED_TOAST, TOOL_FULL_NAME, defaultConfigText, localStamp, storeKey } from '../hooks/core.js'
 import { CC_DIR, CWD, HANDOVER, HOME, MIN, NOW, REPO, growingHandover } from './helpers.js'
 
 const OLD = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
@@ -46,6 +46,10 @@ interface WorldOptions {
   stopBlock?: string
   /** 为真时 $.fs.exists 一律 reject（d.ts：碰到网络位置时 reject；Windows 上用户目录重定向到网络共享就是这样） */
   existsRejects?: boolean
+  /** 启动目录（cwd 与 root 都是它）；缺省 CWD */
+  launch?: string
+  /** null：不在 git 仓库里 */
+  repo?: null
 }
 
 /** 规范化 POSIX 路径里的 `.` 与 `..`（stat 的 realPath 是折叠过的） */
@@ -130,9 +134,9 @@ function world(on: On, o: WorldOptions = {}) {
   mock.env(on, { HOME, ...o.env })
 
   on('session.id', () => ({ value: w.sid }))
-  on('session.cwd', () => ({ value: CWD }))
-  on('session.root', () => ({ value: CWD }))
-  on('session.repo', () => ({ value: { root: REPO, remote: null, internal: false, name: null } }))
+  on('session.cwd', () => ({ value: o.launch ?? CWD }))
+  on('session.root', () => ({ value: o.launch ?? CWD }))
+  on('session.repo', () => ({ value: o.repo === null ? null : { root: REPO, remote: null, internal: false, name: null } }))
   on('session.surfaces', () => ({ value: ['terminal'] }))
   on('session.version', () => ({ value: { version: o.version ?? '2.1.310', base: o.version ?? '2.1.310' } }))
   on('session.usage', () => ({
@@ -1068,19 +1072,39 @@ test('action compact and the user\'s /clear runs first: the new conversation get
   expect(stored(x, NEW).job).toBeNull()
 })
 
-// ───────── 交接文件超长（PLAN §0 第 30 条） ─────────
+// ───────── 本轮交接文件与超长退回（PLAN §0 第 30 条） ─────────
 
-/** 越过 remind、写好给定正文的交接文件并登记；回合结束、/clear 完成、新对话的 SessionStart(clear) 返回什么 */
-async function handoffWith($: any, x: W, text: string | null): Promise<{ reg: any; ss: any }> {
+/** 本轮交接文件：<启动目录>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<会话 ID 前 8 位>.md */
+function notePath(at: number, sid = OLD, dir = CWD): string {
+  return `${dir}/.claude/autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
+}
+
+/** 一份写给下个对话的交接文件（几节，远低于 15k） */
+const NOTE_TEXT = growingHandover(3)
+
+/** 越过 remind，拿到提醒（返回 PostToolUse 的结果）；之后由测试写文件、登记 */
+async function reminded($: any, x: W): Promise<any> {
   await start($)
   x.w.tokens = 36_500
   await say($, 'Finish the upload state machine and rerun the acceptance tests.')
   await turnStart($, T1)
   x.w.tokens = 41_200
-  await tool($)
-  if (text === null) x.writeHandoff()
-  else x.writeHandoffText(text)
-  const reg = await registerTool($, HANDOVER)
+  return tool($)
+}
+
+test('handoff file to write: the reminder names a new file under the launch folder; written there and registered, the next conversation gets it, and its own first reminder names a new file', async ($, on) => {
+  const x = world(on)
+  const ptu = await reminded($, x)
+  const P = notePath(x.clock.now())
+  expect(ptu.additionalContext![0]!.endsWith(`Handoff file to write: "${P}" (a new file for this handoff; register this path).`)).toBe(true)
+  // 下一条消息（同一轮）的短提醒还是它
+  x.w.tokens = 41_900
+  const later = await say($, 'Also check the Windows paths.', COMPOSER, T2)
+  expect(later.context.at(-1)).toContain(`Handoff file to write: "${P}"`)
+  x.writeHandoffText(NOTE_TEXT, P)
+  const reg = await registerTool($, P)
+  expect(reg.result).toStartWith(`Handoff registered: "${P}".`)
+  expect(x.w.reads).toEqual([P])
   await stop($)
   await complete($, T1)
   await x.clock.settle()
@@ -1090,55 +1114,67 @@ async function handoffWith($: any, x: W, text: string | null): Promise<{ reg: an
   x.w.commands[0]!.resolve()
   await x.clock.settle()
   const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
-  return { reg, ss }
-}
-
-test('oversize: a handoff file grown by a dated section per handoff is read once at registration; the new conversation is asked to tidy it before working', async ($, on) => {
-  const x = world(on)
-  const { reg, ss } = await handoffWith($, x, growingHandover(40))
-  expect(reg.result).toStartWith(`Handoff registered: "${HANDOVER}".`)
-  expect(x.w.reads).toEqual([HANDOVER])
-  expect(x.w.debug.some((l) => /^handoff file is about \d+k tokens, over handoff_max_tokens \(20k\)/.test(l))).toBe(true)
-  expect(ss.additionalContext?.length).toBe(1)
-  const text: string = ss.additionalContext![0]
-  expect(text).toContain(`Handoff file: "${HANDOVER}"`)
-  expect(text).toContain('[AutoHandoff: tidy the handoff file first]')
-  expect(text.indexOf('tidy the handoff file first')).toBeGreaterThan(text.indexOf('Handoff file: "'))
-  // 续接照常提交一次，正文里没有整理段
-  expect(x.w.submits.length).toBe(1)
-  expect(x.w.submits[0]!.text).not.toContain('tidy')
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${P}"`)
+  expect(x.w.submits[0]!.text).toContain(`Handoff file: "${P}"`)
+  x.w.submits[0]!.release()
+  await x.clock.settle()
+  // 新对话越过 remind：新时刻、新会话 ID
+  x.clock.advance(35 * MIN)
+  await turnStart($, T2)
+  x.w.tokens = 40_300
+  const next = await tool($)
+  const P2 = notePath(x.clock.now(), NEW)
+  expect(P2).not.toBe(P)
+  expect(next.additionalContext![0]!.endsWith(`Handoff file to write: "${P2}" (a new file for this handoff; register this path).`)).toBe(true)
 })
 
-test('oversize: a handoff file kept to the current state gets the plain start context', async ($, on) => {
+test('handoff file to write: started from the home folder (no usable project folder), the reminder asks for the file in the auto-memory folder instead', async ($, on) => {
+  const x = world(on, { launch: HOME, repo: null })
+  const ptu = await reminded($, x)
+  const text: string = ptu.additionalContext![0]!
+  expect(text).toContain(`Handoff file to write: a new file named "_AUTOHANDOFF_${localStamp(x.clock.now())}_6f1c2b8e.md" in the Claude Code auto-memory folder`)
+  // 写进记忆目录后照常登记
+  const mem = `${CC_DIR}/projects/-home-user/memory/_AUTOHANDOFF_${localStamp(x.clock.now())}_6f1c2b8e.md`
+  x.writeHandoffText(NOTE_TEXT, mem)
+  expect((await registerTool($, mem)).result).toStartWith(`Handoff registered: "${mem}".`)
+})
+
+test('oversize: a handoff file over handoff_max_tokens is read once and refused with the estimate; shortened, it is registered', async ($, on) => {
   const x = world(on)
-  const { ss } = await handoffWith($, x, growingHandover(4))
-  expect(x.w.reads).toEqual([HANDOVER])
-  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
+  await reminded($, x)
+  const P = notePath(x.clock.now())
+  x.writeHandoffText(growingHandover(40), P)
+  const big = await registerTool($, P)
+  expect(big.deny).toMatch(/^Not registered: the handoff file is about \d+k tokens by AutoHandoff's estimate, over the 20k limit \(handoff_max_tokens\)\. .* shorten it to about 15k tokens/)
+  expect(x.w.reads).toEqual([P])
+  expect(stored(x, OLD).job).toBeNull()
+  x.writeHandoffText(NOTE_TEXT, P)
+  expect((await registerTool($, P)).result).toStartWith(`Handoff registered: "${P}".`)
+  expect(stored(x, OLD).job.file).toBe(P)
+})
+
+test('oversize: the project\'s own HANDOVER.md (a user\'s custom prompts) is registered like any legal path when under the limit', async ($, on) => {
+  const x = world(on)
+  await reminded($, x)
+  x.writeHandoffText(growingHandover(4))
+  expect((await registerTool($, HANDOVER)).result).toStartWith(`Handoff registered: "${HANDOVER}".`)
 })
 
 test('oversize: the handoff file cannot be read at registration (another plugin denies it): still registered, no size check, logged', async ($, on) => {
   const x = world(on)
-  const { reg, ss } = await handoffWith($, x, null)
+  await reminded($, x)
+  x.writeHandoff()
+  const reg = await registerTool($, HANDOVER)
   expect(reg.result).toStartWith('Handoff registered:')
   expect(x.w.reads).toEqual([HANDOVER])
   // 测试 hook 抛错只会被跳过，落到底层「no implementation」：错误文字由不得测试定
   expect(x.w.debug.some((l) => l.startsWith('could not read the handoff file to estimate its size: '))).toBe(true)
-  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
-  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
 })
 
-test('oversize: handoff_max_tokens 0 never reads the handoff file', async ($, on) => {
+test('oversize: handoff_max_tokens 0 never reads the handoff file and registers any size', async ($, on) => {
   const x = world(on, { config: LOW_CONFIG.replace('handoff_max_tokens: 20000', 'handoff_max_tokens: 0') })
-  const { reg, ss } = await handoffWith($, x, growingHandover(40))
-  expect(reg.result).toStartWith('Handoff registered:')
+  await reminded($, x)
+  x.writeHandoffText(growingHandover(40))
+  expect((await registerTool($, HANDOVER)).result).toStartWith('Handoff registered:')
   expect(x.w.reads).toEqual([])
-  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
-})
-
-test('oversize: a configuration file written before 4.1 (no handoff_max_tokens, no oversize section) gets the check at the default limit; status names the missing key', async ($, on) => {
-  const x = world(on, { config: LOW_CONFIG.replace('handoff_max_tokens: 20000\n', '') })
-  const { ss } = await handoffWith($, x, growingHandover(40))
-  expect(ss.additionalContext![0]).toContain('over the 20k limit')
-  await slash($, 'status')
-  expect(x.w.logs).toContain('  - missing settings (built-in defaults used): handoff_max_tokens')
 })

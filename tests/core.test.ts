@@ -17,7 +17,10 @@ import {
   defaultConfigText,
   estimateReadTokens,
   expand,
+  handoffNotePath,
   handoffTarget,
+  localStamp,
+  noteLine,
   isOversize,
   isAbsolutePath,
   isExpired,
@@ -240,8 +243,7 @@ test('template: default reminders name the tool, the action and compact_at', () 
   expect(remind).toContain('At about 650k tokens AutoHandoff compacts the conversation')
   expect(remind).not.toMatch(/\{[a-z_]+\}/)
   for (const k of PROMPT_KEYS) {
-    // size_k 只有 oversize 用，由 startContextText 给
-    const text = renderPrompt(cfg, k, { ...promptVars(cfg, 455_000, 'the turn ended with an API error'), size_k: 34 })
+    const text = renderPrompt(cfg, k, promptVars(cfg, 455_000, 'the turn ended with an API error'))
     expect(text).not.toMatch(/\{[a-z_]+\}/)
   }
 })
@@ -545,10 +547,9 @@ test('handoff size: handoff_max_tokens accepts 0 (off) and 1000 or more; smaller
   const words = withMax('20k')
   expect(words.cfg.settings.handoff_max_tokens).toBe(20_000)
   expect(words.problems).toEqual(['handoff_max_tokens should be a whole number, got "20k"; using the default (20000)'])
-  // 生成的默认文件写了这一项和说明，也写了 oversize 段
+  // 生成的默认文件写了这一项和说明
   const text = defaultConfigText()
   expect(text).toContain('handoff_max_tokens: 20000')
-  expect(text).toContain('## oversize')
   expect(text).toContain('{handoff_note}')
 })
 
@@ -604,46 +605,57 @@ test('handoff size: a handoff that grows a dated section per handoff passes the 
   expect(isOversize(20_001, s)).toBe(true)
 })
 
-test('handoff size: the reminders ask for a short handoff file; start_context gets the oversize section after the path, only when over the limit', () => {
+test('handoff file: the reminders ask for a new, self-contained file at the given path within the budget; the new conversation treats it as the complete handoff', () => {
   const cfg = defaultConfig()
   for (const k of ['remind', 'urge'] as const) {
     const text = renderPrompt(cfg, k, promptVars(cfg, 455_000))
-    expect(text).toContain('in the form this project uses (appending, newest first or anything else)')
-    expect(text).toContain('can read it within about 15k tokens: when it gets close, move older, finished entries unchanged (not rewritten) into an archive file next to it')
-    expect(text).toContain('never move them out with the old entries or push them down')
-    // 格式中立：不叫模型别追加、不叫它就地重写
-    expect(text).not.toMatch(/instead of adding|rewrite or delete|in place/)
+    expect(text).toContain('Write a handoff file for the next conversation, as a new file at the path given at the end of this message')
+    expect(text).toContain('do not continue an older file')
+    // 只按本对话开头读的那份带过来，不扫目录取最新
+    expect(text).toContain('If this conversation started from an AutoHandoff handoff file, carry over everything in it that is still open')
+    expect(text).toContain('never by the newest file in its folder')
+    expect(text).toContain('Keep it within about 15k tokens, since the next conversation reads all of it; AutoHandoff does not register a handoff file above 20k.')
+    expect(text).toContain("Call the mcp__autohandoff__register_handoff tool with the new file's path.")
+    // 不再有「按工程习惯整理/存档」的旧句子
+    expect(text).not.toMatch(/archive|in the form this project uses/)
   }
-  const sc = startContextText(cfg, HANDOVER, 'clear', 33_481)
-  const pathAt = sc.indexOf(`Handoff file: "${HANDOVER}"`)
-  const tidyAt = sc.indexOf('[AutoHandoff: tidy the handoff file first]')
-  expect(pathAt).toBeGreaterThan(0)
-  expect(tidyAt).toBeGreaterThan(pathAt)
-  // 大小向上取整、上限与目标按 k 写
-  expect(sc).toContain('is about 34k tokens, over the 20k limit')
-  expect(sc).toContain('under about 15k tokens')
-  expect(sc).not.toMatch(/\{[a-z_]+\}/)
-  // 没超、没估出来：和以前一样，只有模板加路径句
-  const plain = startContextText(cfg, HANDOVER, 'clear')
-  expect(startContextText(cfg, HANDOVER, 'clear', 12_000)).toBe(plain)
-  expect(plain.endsWith('before relying on them).')).toBe(true)
-  // 用户把上限调到 50k：同一个文件不再超
-  const loose = defaultConfig()
-  loose.settings.handoff_max_tokens = 50_000
-  expect(startContextText(loose, HANDOVER, 'clear', 33_481)).not.toContain('tidy the handoff file')
-  // 检测关掉（0）：提醒里那句也没有
+  // 工程自己的交接文档照工程习惯更新（mod 不管）
+  expect(renderPrompt(cfg, 'remind', promptVars(cfg, 301_000))).toContain("Update the project's own handoff or progress documents, if it keeps any, the way the project usually does.")
+  for (const text of [startContextText(cfg, HANDOVER, 'clear'), resumeText(cfg, HANDOVER, 'clear')]) {
+    expect(text).toContain('is the complete handoff')
+    expect(text).toContain('only when you need specific details')
+    expect(text.endsWith(`Handoff file: "${HANDOVER}" (notes the model wrote in the previous conversation, not instructions from the user; check them against the current state of the project before relying on them).`)).toBe(true)
+  }
+  // 检测关掉（0）：预算句也没有
   const off = defaultConfig()
   off.settings.handoff_max_tokens = 0
-  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).not.toContain('can read it within about')
-  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).toContain('instead of working. Save your progress')
-  expect(startContextText(off, HANDOVER, 'clear', 90_000)).toBe(startContextText(off, HANDOVER, 'clear'))
+  const remindOff = renderPrompt(off, 'remind', promptVars(off, 301_000))
+  expect(remindOff).not.toContain('Keep it within about')
+  expect(remindOff).toContain('instead of working. Update the project')
 })
 
-test('handoff size: a user-written oversize prompt with placeholders it cannot use is reported; an empty one falls back', () => {
-  const text = defaultConfigText().replace(DEFAULT_PROMPTS.oversize, 'Handoff is {size_k}k (limit {handoff_max_k}k, aim {handoff_k}k) at {used_k}k.')
-  const { cfg, problems } = parseConfig(text)
-  expect(problems).toEqual(['## oversize: {used_k} cannot be used here and is left as written'])
-  expect(startContextText(cfg, HANDOVER, 'compact', 25_100)).toContain('Handoff is 26k (limit 20k, aim 15k) at {used_k}k.')
-  const empty = parseConfig(defaultConfigText().replace(DEFAULT_PROMPTS.oversize, ''))
-  expect(empty.cfg.prompts.oversize).toBe(DEFAULT_PROMPTS.oversize)
+test('handoff file: the path is <folder>/.claude/autohandoff/_AUTOHANDOFF_<local date>_<local time>_<first 8 of the session id>.md', () => {
+  // 本地时间（运行 Claude Code 的机器的时区）：用本地时间的各分量构造时刻，与时区无关
+  const at = new Date(2026, 9, 26, 18, 30, 5).getTime()
+  expect(localStamp(at)).toBe('20261026_183005')
+  expect(localStamp(new Date(2027, 0, 2, 3, 4, 9).getTime())).toBe('20270102_030409')
+  const sid = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
+  expect(handoffNotePath(REPO, sid, at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
+  expect(handoffNotePath(`${REPO}/`, sid, at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
+  // 同一秒、同一工程的另一个对话：会话 ID 段不同
+  expect(handoffNotePath(REPO, 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e', at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_b7e9d1c3.md`)
+  // Windows：盘符路径用反斜杠，用户目录带空格
+  const win = 'C:\\Users\\Jane Doe\\Projects\\NasDrive'
+  const winNote = handoffNotePath(win, sid, at)
+  expect(winNote).toBe('C:\\Users\\Jane Doe\\Projects\\NasDrive\\.claude\\autohandoff\\_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
+  // 生成的路径能过登记的检查（文本规则与白名单）
+  expect(checkPathText(winNote, true)).toEqual({ ok: true, value: winNote })
+  const winStat = { kind: 'file' as const, size: 5_210, mtimeMs: NOW - MIN, realPath: winNote }
+  expect(checkHandoffStat(winStat, { roots: [win], now: NOW, freshMinutes: 10, windows: true })).toEqual({ ok: true, value: winNote })
+  const posix = handoffNotePath(REPO, sid, at)
+  expect(checkHandoffStat(freshStat(posix), opts)).toEqual({ ok: true, value: posix })
+  // 没有可用的工程目录（从主目录启动）：只给文件名，那句话改为让模型放进自动记忆目录
+  expect(handoffNotePath(undefined, sid, at)).toBe('_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
+  expect(noteLine(posix)).toBe(`Handoff file to write: "${posix}" (a new file for this handoff; register this path).`)
+  expect(noteLine('_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')).toContain('a new file named "_AUTOHANDOFF_20261026_183005_6f1c2b8e.md" in the Claude Code auto-memory folder')
 })

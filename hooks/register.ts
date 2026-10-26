@@ -60,6 +60,11 @@ let lowVersionWarned = false
  * 只放模块变量：session.end(clear) 总在 SessionStart(clear) 和自家 clear 的 resolve 之前，热重载后新模块的 session.end 照样会记。
  */
 let clearingFrom: { sid: string; t: number } | null = null
+/**
+ * 本轮交接文件放在哪个工程根目录下（core.handoffNotePath 的 dir）；session.start 时清掉重算。
+ * value 为 undefined 表示没有可用的（从主目录或文件系统根启动）
+ */
+let noteBase: { value: string | undefined } | null = null
 /** AUTOHANDOFF_CONFIG 是相对路径的提示已记过 */
 let relativeConfigWarned = false
 /** 记录的读-改-写串行执行（`$.store` 的 get/set 不是原子的；同一进程里的事件会交错） */
@@ -76,8 +81,8 @@ const TOOL_DESCRIPTION =
   'hand off and the file is written; only the main conversation can register (subagents and forks are refused). ' +
   'Then end your turn at once. The file must be inside the project folder (the working directory, the folder Claude Code ' +
   'was started in, or the git repository root) or the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ' +
-  'non-empty and just modified; its path is absolute or relative to the working directory, with no quotes, tabs, ' +
-  'control characters, leading or trailing spaces, or "~".'
+  'non-empty, just modified and not over the size limit (handoff_max_tokens); its path is absolute or relative to the working ' +
+  'directory, with no quotes, tabs, control characters, leading or trailing spaces, or "~".'
 
 const TOOL_SCHEMA = {
   type: 'object',
@@ -357,7 +362,11 @@ async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: Dispatc
     const fresh = rec === null
     const base = rec ?? newRecord(now)
     const ev = await make(base)
-    const step = transition(base, ev, { cfg, now })
+    // 只有可能送提醒的事件才要本轮交接文件路径的材料
+    // （查不到工程目录时不给，提醒末尾就不加路径，免得指错地方）
+    const wants = ev.kind === 'submit' || ev.kind === 'postTool' || ev.kind === 'stop'
+    const note = wants ? await safely(async () => ({ dir: await noteDir($), sid })) : undefined
+    const step = transition(base, ev, { cfg, now, note })
     // 没有记录且转移后仍是空白记录（开关未动、没收到过人工输入……）就不写，免得每个会话都在 store 里留一份
     const blank = fresh && sameRec(step.rec, newRecord(now))
     const notReset = (why: string, what: string): void => {
@@ -487,6 +496,7 @@ function issueResume($: Api, sid: string, seq: number, text: string): void {
 async function onSessionStart($: Api, isInteractive: boolean): Promise<void> {
   interactive = isInteractive
   gate = null
+  noteBase = null
   if (!(await enabled($))) {
     debug($, `inactive: ${gateWhy()}`)
     return
@@ -531,7 +541,24 @@ async function checkHandoffPath($: Api, raw: unknown, now: number, freshMinutes:
 }
 
 /**
- * 登记时估算交接文件的大小（PLAN §0 第 30 条）：读一次正文，只用来数字符，不解析、不进任何文本。
+ * 本轮交接文件所在的工程根目录：启动目录（`$.session.root()`）优先，其次 cwd、git 根；都按登记时的白名单规则过
+ * usableRoots（主目录本身、文件系统根不算），所以生成的路径一定能登记。都不可用时为 undefined。按进程缓存。
+ */
+async function noteDir($: Api): Promise<string | undefined> {
+  if (noteBase) return noteBase.value
+  const cwd = await $.session.cwd()
+  const repo = await safely(() => $.session.repo())
+  const [value] = usableRoots(
+    [await realPathOf($, await safely(() => $.session.root())), await realPathOf($, cwd), await realPathOf($, repo?.root)],
+    await realPathOf($, homeDir(await envVars($))),
+    looksWindows(cwd),
+  )
+  noteBase = { value }
+  return value
+}
+
+/**
+ * 登记时估算交接文件的大小（PLAN §0 第 30 条）：读一次正文，只用来数字符，不解析、不进任何文本；超过上限就不受理。
  * 读失败（刚被删、别的插件的 fs hook 拒绝……）不影响登记，只是这次没有大小检测；文件真没了由回合结束时的复查处理。
  */
 async function handoffTokens($: Api, file: string): Promise<number | undefined> {
