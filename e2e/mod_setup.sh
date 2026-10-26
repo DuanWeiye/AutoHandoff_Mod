@@ -76,9 +76,10 @@ d = {
         "allow": ["Read", "Write", "Edit", "Bash(printf:*)", "Bash(mkdir:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)",
                   "Bash(wc:*)", "Bash(echo:*)", "Bash(sleep:*)", "Bash(python3 -c:*)", "Bash(python3 tools/wait_for.py:*)",
                   "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)",
-                  # 续接后模型核对现状常用的只读复合命令（如 `git status --short && ls notes && for f in notes/*.txt; do echo "$f: $(cat "$f")"; done`）：
-                  # 放行 for 循环与几样只读命令，不放行写文件、删文件的命令
-                  "Bash(for:*)", "Bash(test:*)", "Bash(find:*)", "Bash(grep:*)", "Bash(tail:*)", "Bash(sort:*)", "Bash(pwd:*)"],
+                  # 续接后模型核对现状常用的几样只读命令；不放行写文件、删文件的命令。
+                  # 含 shell 变量展开的命令（for 循环里的 $f 等）CC 不按前缀规则放行（「A variable in this command can't be checked」），
+                  # 放行清单管不到，limit 场景因此不等续接回合结束
+                  "Bash(test:*)", "Bash(find:*)", "Bash(grep:*)", "Bash(tail:*)", "Bash(sort:*)", "Bash(pwd:*)"],
         "ask": ["Bash(touch:*)"],
     },
     "hooks": {e: hook for e in ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"]},

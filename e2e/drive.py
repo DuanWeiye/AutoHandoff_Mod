@@ -1314,7 +1314,9 @@ def est_tokens(text):
 def scenario_limit(work):
     """超长退回（PLAN §0 第 30 条）：handoff_max_tokens 压到 2000，提醒要求在交接文件里抄 120 行参考表（autohandoff-limit.md），
     第一次登记必然超长。断言：登记被退回（审计行有估算与上限）→ 模型压短、同一路径重新登记被受理 → /clear 恰好一次、续接恰好一次、
-    新对话读的是这个文件；登记的文件估算不超过上限。"""
+    新对话读的是这个文件；登记的文件估算不超过上限。
+    不等续接回合结束：看到新对话读了交接文件就断言、按 Esc 收尾（续接后把工作做完由 clear 场景覆盖）。续接回合里模型常发含 shell 变量的
+    复合命令（for 循环），CC 对这类命令不按前缀规则放行，会卡在权限框上，与本场景要测的机制无关。"""
     reset_project(work)
     c = Check("limit: an oversize handoff file is refused; the model shortens it, registers again and the conversation is reset")
     s = Session(work, "limit", config=os.path.join(work, "autohandoff-limit.md"))
@@ -1325,11 +1327,14 @@ def scenario_limit(work):
         s.send(CLEAR_TASK)
         s.wait(lambda: s.has("urge sent at") or s.has("remind sent at"), 180, "the urge")
         s.wait(ok_note(lambda: s.has("handoff finished") or s.has("handoff cancelled")), 400, "the reset and resume")
-        s.wait(ok_note(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1])), 300, "the resumed turn to end")
-        s.wait_idle()
+        note, checks = note_of(s, old)
+        s.wait(ok_note(lambda: note is not None and len(s.sids()) >= 2 and read_handoff(s.entries(s.sids()[-1]), note)), 300, "the new conversation to read the handoff file")
+        # 收尾：打断续接回合（有权限框时先关掉框）
+        for _ in range(2):
+            s.keys("Escape")
+            time.sleep(1.5)
         a = s.audit()
         new = s.sids()[1] if len(s.sids()) > 1 else None
-        note, checks = note_of(s, old)
         for ok, what in checks:
             c.ok(ok, what)
         refused = [x for x in a if x.startswith("registration refused: the handoff file is about")]
