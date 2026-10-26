@@ -387,7 +387,6 @@ claude plugin test .         # unit and flow tests (tests/*.test.ts), no session
 | `commands/autohandoff.md` | `/autohandoff`; answered by the mod, and only reaches the model when mods are not running. |
 | `tests/` | `core.test.ts` (logic), `state.test.ts` (state machine), `flow.test.ts` (hooks against a stubbed host). |
 | `e2e/` | End-to-end driver for real sessions, plus an API fault-injection proxy. |
-| `docs/` | Design plan, verified Claude Code behaviour and implementation notes (Chinese). |
 
 **End-to-end tests** run real Claude Code sessions (they use your login and spend tokens):
 

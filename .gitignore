@@ -5,7 +5,7 @@ __pycache__/
 
 # Internal working files kept out of the public repository
 HANDOVER.md
-docs/DESIGN-v2.md
+docs/
 win/desk.sh
 private/
 

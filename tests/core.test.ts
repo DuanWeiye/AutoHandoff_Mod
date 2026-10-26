@@ -652,9 +652,9 @@ test('handoff file: the path is <folder>/.autohandoff/_AUTOHANDOFF_<local date>_
   // 同一秒、同一工程的另一个对话：会话 ID 段不同
   expect(handoffNotePath(REPO, 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e', at)).toBe(`${REPO}/.autohandoff/_AUTOHANDOFF_20261026_183005_b7e9d1c3.md`)
   // Windows：盘符路径用反斜杠，用户目录带空格
-  const win = 'C:\\Users\\Jane Doe\\Projects\\NasDrive'
+  const win = 'C:\\Users\\Jane Doe\\Projects\\myproject'
   const winNote = handoffNotePath(win, sid, at)
-  expect(winNote).toBe('C:\\Users\\Jane Doe\\Projects\\NasDrive\\.autohandoff\\_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
+  expect(winNote).toBe('C:\\Users\\Jane Doe\\Projects\\myproject\\.autohandoff\\_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
   // 生成的路径能过登记的检查（文本规则与白名单）
   expect(checkPathText(winNote, true)).toEqual({ ok: true, value: winNote })
   const winStat = { kind: 'file' as const, size: 5_210, mtimeMs: NOW - MIN, realPath: winNote }
@@ -713,7 +713,7 @@ test('handoff file: a project folder whose path the whitelist refuses is skipped
   // Windows UNC 工程目录（cwd 不像盘符路径，windows 为假）：混合分隔符、// 开头都过不了，退到记忆目录
   expect(pickHandoffNote(['\\\\server\\share\\proj'], sid, at, false)).toBe(name)
   // Windows：8.3 短名里的 ~ 放行，带空格的用户目录照常
-  const win = 'C:\\Users\\JANEDO~1\\Projects\\NasDrive'
+  const win = 'C:\\Users\\JANEDO~1\\Projects\\myproject'
   expect(pickHandoffNote([win], sid, at, true)).toBe(`${win}\\.autohandoff\\${name}`)
   // 没有候选（从主目录启动）
   expect(pickHandoffNote([], sid, at, false)).toBe(name)
