@@ -49,7 +49,7 @@
   `usableRoots`（与登记白名单同一规则），取第一个，按进程缓存（session.start 清掉）；都不可用时只给文件名，`noteLine` 改说放进自动记忆目录。
   只有 submit、postTool、stop 三种事件带 `Env.note`（查不到就不带，提醒不加路径）。`clearLevels` 把各层与 note 一起清掉（afterReset、finish、
   migrateRecord、sessionStart(clear/compact)、用量回落到 remind_at 以下、兜底压缩完成）；cancelTold 只退一层，不清 note，所以作废后重新登记仍用同一路径。
-  本地时间用 `new Date(now)` 的本地分量（mod 运行时的时区即 CC 进程的时区，e2e 核对过）。mod 不写这个文件，目录与文件由模型的 Write 工具建。
+  本地时间用 `new Date(now)` 的本地分量（mod 运行时的时区即 CC 进程的时区；e2e clear 里生成的时刻与本机 JST 相差 26 s）。mod 不写这个文件，目录与文件由模型的 Write 工具建。
 - **超长退回**（§0 第 30 条）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，超过 `handoff_max_tokens` 就 deny（说明估算值、上限、
   目标值），不动已有的 armed 登记（与其它 deny 一致）。读失败（估算缺省）照收。上限为 0 时不读文件。
   估算 = ASCII 字符数 / 3 + 非 ASCII 码点数 × 1.65 + 行数 × 3（行数 = 换行数 + 1，与 Read 显示的行数一致），向上取整。
@@ -122,7 +122,12 @@
     让 (b) 守卫真正被触发（断言至少拒绝一次）。
   - `clear` 断言交接文件写在 remind 审计行给的路径（`<测试工程>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md`，时间与本机本地时间相差
     15 分钟内）、登记的就是它、续接与 SessionStart 上下文都指向它、新对话读了它。
-  - `limit`（4.1.0）：上限压到 2000，remind/urge 要模型在交接文件里抄 120 行参考表，保证第一次登记超长；断言退回 → 同一路径压短重登记 → 重置、续接各一次。
+  - `limit`（4.1.0）：上限压到 2000（urge_at 也压到读一次 catalog 就越过，直接送 urge 并有 Stop block），remind/urge 要模型在交接文件里抄 120 行参考表，
+    争取第一次登记超长；断言退回 → 同一路径压短重登记 → 重置、续接各一次。haiku 有时不照抄（第一次就写短的，测不到退回），有时把提醒当成工具结果里的注入先不理。
+  - **`.claude/` 是受保护目录**（2.1.310 实测，default 权限模式）：即使 `Write`、`Edit` 已放行、另加 `Edit(.claude/autohandoff/**)` 之类显式规则，
+    往 `<工程>/.claude/autohandoff/` 写文件（Write）或 `mkdir -p` 它（Bash，「sensitive file」）照样弹框（选项含「allow Claude to edit files in this project's
+    .claude folder for this session」）；工程根下的 `.autohandoff/` 不弹。auto 模式（`claude -p` 下）不弹。驱动因此只批准框里是 `.claude/autohandoff`、
+    或底下问「Do you want to create _AUTOHANDOFF_…」的框（交接文件长时路径滚出屏幕），并在报告里记批了几次。
   - `fault_proxy.py`：本地反代注入 API 错误，`after:<工具名>:<mode>` 只在交回该工具结果的那个请求上注入一次，OAuth 照常。
 
 ## 5. 未验证 / 待上机

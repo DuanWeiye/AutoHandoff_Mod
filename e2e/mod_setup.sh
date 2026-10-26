@@ -131,8 +131,9 @@ case "$cmd" in
     # chain：内置 start_context 里「除非有新提醒，不要再交接」那句会劝住新对话，守卫就测不到；换成中性说明
     write_config "$S/autohandoff-chain.md" clear
     printf '\n## start_context\n\n[AutoHandoff e2e] This conversation was reset by AutoHandoff ({action}). Follow the handoff file.\n' >>"$S/autohandoff-chain.md"
-    # limit：上限压到 2000；提醒要求抄 120 行参考表（约 3.5k token），第一次登记必然超长被退回（路径照样由 mod 追加在末尾）
-    write_config "$S/autohandoff-limit.md" clear "${REMIND:-52000}" "${URGE:-200000}" "${COMPACT:-900000}" "" true 2000
+    # limit：上限压到 2000；提醒要求抄 120 行参考表（约 3.5k token），第一次登记必然超长被退回（路径照样由 mod 追加在末尾）。
+    # urge_at 也压到读一次 catalog 就越过：直接送 urge，并有 Stop block 兜底（haiku 对只有 remind 的自写提醒有时不理）
+    write_config "$S/autohandoff-limit.md" clear 52000 56000 "${COMPACT:-900000}" "" true 2000
     for k in remind urge; do
       printf '\n## %s\n\n[AutoHandoff: hand off] Context usage is about {used_k}k tokens. Finish the step in progress, then hand off before this turn ends: write a handoff file for the next conversation as a new file at the path given at the end of this message, with what is done, what is next and any open question, and for reference copy the first 120 SKU lines of data/catalog.md into it verbatim (write the whole file with the Write tool). Then call the {tool} tool with its path, and end your turn when it answers "Handoff registered".\n' "$k" >>"$S/autohandoff-limit.md"
     done
