@@ -634,20 +634,20 @@ test('handoff file: the reminders ask for a new, self-contained file at the give
   expect(remindOff).toContain('instead of working. Update the project')
 })
 
-test('handoff file: the path is <folder>/.claude/autohandoff/_AUTOHANDOFF_<local date>_<local time>_<first 8 of the session id>.md', () => {
+test('handoff file: the path is <folder>/.autohandoff/_AUTOHANDOFF_<local date>_<local time>_<first 8 of the session id>.md', () => {
   // 本地时间（运行 Claude Code 的机器的时区）：用本地时间的各分量构造时刻，与时区无关
   const at = new Date(2026, 9, 26, 18, 30, 5).getTime()
   expect(localStamp(at)).toBe('20261026_183005')
   expect(localStamp(new Date(2027, 0, 2, 3, 4, 9).getTime())).toBe('20270102_030409')
   const sid = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
-  expect(handoffNotePath(REPO, sid, at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
-  expect(handoffNotePath(`${REPO}/`, sid, at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
+  expect(handoffNotePath(REPO, sid, at)).toBe(`${REPO}/.autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
+  expect(handoffNotePath(`${REPO}/`, sid, at)).toBe(`${REPO}/.autohandoff/_AUTOHANDOFF_20261026_183005_6f1c2b8e.md`)
   // 同一秒、同一工程的另一个对话：会话 ID 段不同
-  expect(handoffNotePath(REPO, 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e', at)).toBe(`${REPO}/.claude/autohandoff/_AUTOHANDOFF_20261026_183005_b7e9d1c3.md`)
+  expect(handoffNotePath(REPO, 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e', at)).toBe(`${REPO}/.autohandoff/_AUTOHANDOFF_20261026_183005_b7e9d1c3.md`)
   // Windows：盘符路径用反斜杠，用户目录带空格
   const win = 'C:\\Users\\Jane Doe\\Projects\\NasDrive'
   const winNote = handoffNotePath(win, sid, at)
-  expect(winNote).toBe('C:\\Users\\Jane Doe\\Projects\\NasDrive\\.claude\\autohandoff\\_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
+  expect(winNote).toBe('C:\\Users\\Jane Doe\\Projects\\NasDrive\\.autohandoff\\_AUTOHANDOFF_20261026_183005_6f1c2b8e.md')
   // 生成的路径能过登记的检查（文本规则与白名单）
   expect(checkPathText(winNote, true)).toEqual({ ok: true, value: winNote })
   const winStat = { kind: 'file' as const, size: 5_210, mtimeMs: NOW - MIN, realPath: winNote }

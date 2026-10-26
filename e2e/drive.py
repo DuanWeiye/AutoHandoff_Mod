@@ -314,40 +314,39 @@ CLEAR_TASK = (
 
 
 def note_of(s, old):
-    """remind（或直接送的 urge）审计行里 mod 给的本轮交接文件路径；查它是不是 <测试工程>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md、
+    """remind（或直接送的 urge）审计行里 mod 给的本轮交接文件路径；查它是不是 <测试工程>/.autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md、
     时间是不是本机本地时间（与现在相差 15 分钟内；按 UTC 生成会差 9 小时）。返回 (路径或 None, 检查说明列表[(ok, 说明)])"""
     m = next((re.search(r"; handoff file to write: (.+)$", x) for x in s.audit() if x.startswith(("remind sent at", "urge sent at"))), None)
     note = m.group(1) if m else None
     base = os.path.realpath(proj(s.work))
-    pat = re.compile(re.escape(base) + r"/\.claude/autohandoff/_AUTOHANDOFF_(\d{8}_\d{6})_" + re.escape(old[:8]) + r"\.md$")
+    pat = re.compile(re.escape(base) + r"/\.autohandoff/_AUTOHANDOFF_(\d{8}_\d{6})_" + re.escape(old[:8]) + r"\.md$")
     mm = pat.match(note or "")
-    checks = [(mm is not None, f"the reminder names <project>/.claude/autohandoff/_AUTOHANDOFF_<date>_<time>_{old[:8]}.md ({note})")]
+    checks = [(mm is not None, f"the reminder names <project>/.autohandoff/_AUTOHANDOFF_<date>_<time>_{old[:8]}.md ({note})")]
     if mm:
         age = (datetime.now() - datetime.strptime(mm.group(1), "%Y%m%d_%H%M%S")).total_seconds()
         checks.append((0 <= age < 900, f"its time is this machine's local time ({mm.group(1)}, {age:.0f}s ago)"))
     return note, checks
 
 
-def approving_note(s, approved):
-    """Claude Code 把工程里 `.claude/` 目录当受保护目录：即使 Write/Edit 已放行，往 `.claude/autohandoff/` 写文件也弹框
-    （「allow Claude to edit files in this project's .claude folder」，显式 Edit(...) 规则也压不住，2.1.310 实测）。
-    驱动只批准写本轮交接文件、建它的目录的那种框（框里有 .claude/autohandoff、不含 rm），记下批了几次；别的框不碰。
-    返回一个包装 wait 条件的函数。"""
+def watching_prompts(s, boxes):
+    """等待期间记下出现过的权限框（不批准）。交接文件放在工程根的 `.autohandoff/`：Claude Code 把工程 `.claude/` 当受保护目录，
+    写那里每次弹框、放行规则也压不住（2.1.310 实测，PLAN §0 第 30 条），所以场景断言写交接文件时一个框都不弹。返回包装 wait 条件的函数。"""
     def wrap(cond):
         def f():
             pane = s.pane()
             if "Do you want to" in pane:
                 box = pane[pane.rfind("────"):] if "────" in pane else pane
-                # 写交接文件的 Write 框，或模型先用 `mkdir -p …/.claude/autohandoff` 建目录的 Bash 框（「sensitive file」）；含 rm 的不批
-                # 交接文件很长时框顶的路径滚出屏幕，只剩底下「Do you want to create _AUTOHANDOFF_….md?」
-                ours = ".claude/autohandoff" in box or re.search(r"Do you want to [^?\n]*_AUTOHANDOFF_", box)
-                if ours and not re.search(r"\brm\b", box):
-                    s.keys("1")
-                    approved.append(1)
-                    time.sleep(1.5)
+                key = " ".join(box.split())[:300]
+                if key not in boxes:
+                    boxes.append(key)
             return cond()
         return f
     return wrap
+
+
+def note_prompts(boxes):
+    """写交接文件（或建它的目录）时弹过的框"""
+    return [b for b in boxes if "autohandoff" in b or "_AUTOHANDOFF_" in b]
 
 
 def scenario_clear(work, tag="clear", draft=None):
@@ -355,8 +354,8 @@ def scenario_clear(work, tag="clear", draft=None):
     reset_project(work)
     c = Check(f"{tag}: remind → handoff → /clear → resume" + (" (draft kept)" if draft else ""))
     s = Session(work, tag)
-    approved = []
-    ok_note = approving_note(s, approved)
+    boxes = []
+    ok_note = watching_prompts(s, boxes)
     try:
         old = s.sids()[0]
         s.send(CLEAR_TASK)
@@ -404,8 +403,8 @@ def scenario_clear(work, tag="clear", draft=None):
         # 软观察：交接文件多大、工程自己的 docs/HANDOVER.md 有没有照工程习惯也更新
         size = est_tokens(open(handover).read()) if handover and os.path.exists(handover) else None
         changed = subprocess.run(["git", "status", "--porcelain", "docs/HANDOVER.md"], cwd=proj(work), capture_output=True, text=True).stdout.strip()
-        c.note(f"handoff file about {size} tokens; docs/HANDOVER.md {'changed' if changed else 'unchanged'}; "
-               f".claude folder permission prompts approved by the driver: {len(approved)}")
+        c.ok(not note_prompts(boxes), f"no permission prompt while writing the handoff file ({note_prompts(boxes)[:1]})")
+        c.note(f"handoff file about {size} tokens; docs/HANDOVER.md {'changed' if changed else 'unchanged'}; permission prompts seen: {boxes}")
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])
         c.note("\n".join(str(e).splitlines()[1:40]))
@@ -1319,8 +1318,8 @@ def scenario_limit(work):
     reset_project(work)
     c = Check("limit: an oversize handoff file is refused; the model shortens it, registers again and the conversation is reset")
     s = Session(work, "limit", config=os.path.join(work, "autohandoff-limit.md"))
-    approved = []
-    ok_note = approving_note(s, approved)
+    boxes = []
+    ok_note = watching_prompts(s, boxes)
     try:
         old = s.sids()[0]
         s.send(CLEAR_TASK)
@@ -1347,7 +1346,8 @@ def scenario_limit(work):
         r = resume_entry(ent)
         c.ok(len(resume_entries(ent)) == 1 and r is not None and f'Handoff file: "{note}"' in text_of(r), "one resume message, naming that file")
         c.ok(note is not None and read_handoff(ent, note), "the new conversation read that handoff file")
-        c.note(f"refusals: {len(refused)}; .claude folder permission prompts approved by the driver: {len(approved)}; " + " | ".join(x for x in a if x.startswith(("remind sent", "registration", "handoff", "turn ended", "record moved"))))
+        c.ok(not note_prompts(boxes), f"no permission prompt while writing the handoff file ({note_prompts(boxes)[:1]})")
+        c.note(f"refusals: {len(refused)}; permission prompts seen: {boxes}; " + " | ".join(x for x in a if x.startswith(("remind sent", "registration", "handoff", "turn ended", "record moved"))))
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])
         c.note("\n".join(str(e).splitlines()[1:40]))

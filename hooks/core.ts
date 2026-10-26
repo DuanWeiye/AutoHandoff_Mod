@@ -301,7 +301,7 @@ export function defaultConfigText(): string {
   out.push('  {reason}   why a registered handoff was cancelled (cancelled only)')
   out.push('The handoff file\'s path is never a placeholder: AutoHandoff appends it, in quotes, to start_context')
   out.push('and resume itself, and appends the path of the handoff file to write to remind, remind_short, urge')
-  out.push('and urge_block (<project folder>/.claude/autohandoff/_AUTOHANDOFF_<date>_<time>_<session>.md).')
+  out.push('and urge_block (<project folder>/.autohandoff/_AUTOHANDOFF_<date>_<time>_<session>.md).')
   out.push('-->')
   out.push('')
   out.push('## settings')
@@ -437,7 +437,7 @@ export function startContextText(cfg: Config, file: string, action: Action): str
 }
 
 /**
- * 本轮交接要写的交接文件（PLAN §0 第 30 条）：`<dir>/.claude/autohandoff/_AUTOHANDOFF_<本地日期>_<本地时间>_<会话 ID 前 8 位>.md`。
+ * 本轮交接要写的交接文件（PLAN §0 第 30 条）：`<dir>/.autohandoff/_AUTOHANDOFF_<本地日期>_<本地时间>_<会话 ID 前 8 位>.md`。
  * dir 是第一个可用的工程根目录（启动目录优先，见 register.ts 的 noteDir）；没有可用的（从主目录或文件系统根启动）时只给文件名，
  * 由提醒里的那句话让模型放进自动记忆目录。会话 ID 段让同一工程同时开着的几个对话不撞名。
  */
@@ -445,7 +445,7 @@ export function handoffNotePath(dir: string | undefined, sid: string, now: numbe
   const name = `_AUTOHANDOFF_${localStamp(now)}_${sid.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'session'}.md`
   if (dir === undefined) return name
   const sep = looksWindows(dir) ? '\\' : '/'
-  return `${trimSep(dir)}${sep}.claude${sep}autohandoff${sep}${name}`
+  return `${trimSep(dir)}${sep}.autohandoff${sep}${name}`
 }
 
 /** 运行 Claude Code 的机器的本地时间，YYYYMMDD_HHMMSS */

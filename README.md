@@ -134,7 +134,7 @@ When a reminder arrives, the model writes a **handoff file for the next conversa
 at the end of the reminder, then calls the **`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`)
 with that path, and ends its turn. The reminder text tells it all of this; it does not need to know the tool in advance.
 
-The path is `<project folder>/.claude/autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
+The path is `<project folder>/.autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
 was started in (or, if that is the home folder, the working directory or the git root), the local time of the first
 reminder, and the first 8 characters of the session id, so that several conversations open in one project never
 share a file. The path stays the same for the whole handoff (later reminders, registering again after a cancel); the
@@ -146,7 +146,8 @@ only it, as the complete handoff. The model carries over what is still open from
 conversation started from (questions waiting for you, running subagents, standing agreements), never from whatever
 file in the folder is newest. A project's own handoff or progress documents (a `HANDOVER.md` that grows a dated
 section per handoff, say) are updated the way the project does it; AutoHandoff neither reads nor limits them. You may
-want to add `.claude/autohandoff/` to the project's `.gitignore`. The tool answers immediately
+want to add `.autohandoff/` to the project's `.gitignore`. (The folder is not under `.claude/`: Claude Code
+asks for permission before every write there, whatever the permission rules say.) The tool answers immediately
 and never asks for permission. Only the main conversation can register; subagents and forks are refused.
 Registering again before the turn ends replaces the earlier registration.
 

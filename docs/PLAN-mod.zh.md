@@ -129,12 +129,15 @@
 30. **交接文件超长：每次交接另写一份只给下个对话的交接文件，路径由 mod 指定；登记时估大小，超限退回。** 起因：有的工程每次交接都在自己的交接文档
     （如 HANDOVER.md）顶上加一个日期小节、从不移走，文件长到新对话 Read 一次读不完（Read 工具单次上限 25000 token），重要的长期约定被挤到截断点之后。
     用户定：不改用户的交接习惯与 CLAUDE.md；**每次交接让模型另写一份独立的交接文件，下个对话只读这一份**。
-    - **路径由 mod 生成**：本会话第一次送提醒（remind，或直接 urge）时生成 `<工程根>/.claude/autohandoff/_AUTOHANDOFF_<YYYYMMDD_HHMMSS>_<会话 ID 前 8 位>.md`
+    - **路径由 mod 生成**：本会话第一次送提醒（remind，或直接 urge）时生成 `<工程根>/.autohandoff/_AUTOHANDOFF_<YYYYMMDD_HHMMSS>_<会话 ID 前 8 位>.md`
       （本机本地时间；会话 ID 段防同一工程同时开着的几个对话撞名）。工程根取启动目录（`$.session.root()`），不可用时依次 cwd、git 根，规则与登记白名单相同
       （主目录本身、文件系统根不算），所以生成的路径一定能登记；都不可用（从主目录启动且不在工程里）时只给文件名，让模型放进自动记忆目录。
       同一轮交接里路径固定：短提醒、urge、Stop block、作废后重新登记都用同一个；各层清零（重置完成、/clear 搬迁、用量回落到 remind_at 以下）时作废，
       下一轮生成新的。路径**由代码追加在 remind、remind_short、urge、urge_block 末尾**（不进模板占位符，与 start_context/resume 追加路径的做法一致）。
-      mod 不写这个文件（目录和文件由模型的 Write 工具建），不需要新的 `$.fs.write` 例外。README 提示用户可把 `.claude/autohandoff/` 加进 .gitignore。
+      mod 不写这个文件（目录和文件由模型的 Write 工具建），不需要新的 `$.fs.write` 例外。README 提示用户可把 `.autohandoff/` 加进 .gitignore。
+      **目录不用 `.claude/autohandoff/`**（起初按它实现，e2e 后主人改定）：Claude Code 把工程里的 `.claude/` 当受保护目录，default 权限模式下
+      往里写文件（Write）或建目录（Bash mkdir，「sensitive file」）每次都弹权限框，即使 `Write`、`Edit` 已放行、另加 `Edit(.claude/autohandoff/**)` 等显式规则
+      也压不住（2.1.310 实测）；没人在场时交接就卡在框上。工程根下的 `.autohandoff/` 不弹。
     - **提示词**：remind/urge 要模型在给定路径**新写**一份给下个对话的交接文件（不续写旧文件、不只写「见 HANDOVER.md」，要能独立看懂）；把本对话开头读的
       那一份交接文件里仍未解决的事项（等用户定的问题、在跑的代理、长期约定）带过来，只看那一份，不扫目录取最新；工程自己的交接文档照工程习惯更新（mod 不管）。
       `{handoff_note}` 改为一句大小预算（约 `{handoff_k}`k，超过 `{handoff_max_k}`k 不受理；上限为 0 时为空）。start_context / resume 说明这份文件就是完整交接，

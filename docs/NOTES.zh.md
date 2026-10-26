@@ -120,14 +120,15 @@
   - 测试会话会加载真实的 `~/.claude/CLAUDE.md`，靠模型服从度的场景（chain、urge、interject）会受影响。
   - 模拟「不理提醒的模型」用把 remind/urge 换成「不必动作」的配置（fallback、urge 场景），测的是插件机制不是服从度；chain 场景把 start_context 换成中性说明，
     让 (b) 守卫真正被触发（断言至少拒绝一次）。
-  - `clear` 断言交接文件写在 remind 审计行给的路径（`<测试工程>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md`，时间与本机本地时间相差
+  - `clear` 断言交接文件写在 remind 审计行给的路径（`<测试工程>/.autohandoff/_AUTOHANDOFF_<本地时间>_<sid 前 8 位>.md`，时间与本机本地时间相差
     15 分钟内）、登记的就是它、续接与 SessionStart 上下文都指向它、新对话读了它。
   - `limit`（4.1.0）：上限压到 2000（urge_at 也压到读一次 catalog 就越过，直接送 urge 并有 Stop block），remind/urge 要模型在交接文件里抄 120 行参考表，
     争取第一次登记超长；断言退回 → 同一路径压短重登记 → 重置、续接各一次。haiku 有时不照抄（第一次就写短的，测不到退回），有时把提醒当成工具结果里的注入先不理。
   - **`.claude/` 是受保护目录**（2.1.310 实测，default 权限模式）：即使 `Write`、`Edit` 已放行、另加 `Edit(.claude/autohandoff/**)` 之类显式规则，
-    往 `<工程>/.claude/autohandoff/` 写文件（Write）或 `mkdir -p` 它（Bash，「sensitive file」）照样弹框（选项含「allow Claude to edit files in this project's
-    .claude folder for this session」）；工程根下的 `.autohandoff/` 不弹。auto 模式（`claude -p` 下）不弹。驱动因此只批准框里是 `.claude/autohandoff`、
-    或底下问「Do you want to create _AUTOHANDOFF_…」的框（交接文件长时路径滚出屏幕），并在报告里记批了几次。
+    往 `<工程>/.claude/…` 写文件（Write）或 `mkdir -p` 它（Bash，「sensitive file」）照样弹框；工程根下的 `.autohandoff/` 不弹。交接文件目录因此定为
+    `.autohandoff/`（PLAN §0 第 30 条）。驱动在等待期间记下出现过的权限框（不批准），clear、limit 断言写交接文件时一个框都没有。
+  - 测试 settings 的 Bash 放行清单另加 `for`、`test`、`find`、`grep`、`tail`、`sort`、`pwd`：续接后模型核对现状常发
+    `git status --short && ls notes && for f in notes/*.txt; do echo "$f: $(cat "$f")"; done` 这类只读复合命令，原清单下会弹框卡住场景。
   - `fault_proxy.py`：本地反代注入 API 错误，`after:<工具名>:<mode>` 只在交回该工具结果的那个请求上注入一次，OAuth 照常。
 
 ## 5. 未验证 / 待上机

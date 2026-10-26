@@ -1158,7 +1158,7 @@ test('after the reset (resuming), a further /clear or /compact by the user gets 
 const SID_A = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
 const SID_B = 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e'
 const NOTE_ENV = { dir: REPO, sid: SID_A }
-const noteAt = (at: number, sid = SID_A, dir = REPO) => `${dir}/.claude/autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
+const noteAt = (at: number, sid = SID_A, dir = REPO) => `${dir}/.autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
 const lineFor = (path: string) => `Handoff file to write: "${path}" (a new file for this handoff; register this path).`
 const regAt = (path: string, fileTokens?: number): Ev => ({ kind: 'register', verdict: { ok: true, value: path }, ...(fileTokens === undefined ? {} : { fileTokens }) })
 

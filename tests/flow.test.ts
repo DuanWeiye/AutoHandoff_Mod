@@ -1074,9 +1074,9 @@ test('action compact and the user\'s /clear runs first: the new conversation get
 
 // ───────── 本轮交接文件与超长退回（PLAN §0 第 30 条） ─────────
 
-/** 本轮交接文件：<启动目录>/.claude/autohandoff/_AUTOHANDOFF_<本地时间>_<会话 ID 前 8 位>.md */
+/** 本轮交接文件：<启动目录>/.autohandoff/_AUTOHANDOFF_<本地时间>_<会话 ID 前 8 位>.md */
 function notePath(at: number, sid = OLD, dir = CWD): string {
-  return `${dir}/.claude/autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
+  return `${dir}/.autohandoff/_AUTOHANDOFF_${localStamp(at)}_${sid.slice(0, 8)}.md`
 }
 
 /** 一份写给下个对话的交接文件（几节，远低于 15k） */
