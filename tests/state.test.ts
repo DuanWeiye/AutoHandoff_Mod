@@ -1151,3 +1151,66 @@ test('after the reset (resuming), a further /clear or /compact by the user gets 
   expect(ofType(a.all, 'log').map((l) => l.text).some((t) => t.includes('while /compact is queued'))).toBe(false)
   expect(a.rec.job?.stage).toBe('resuming')
 })
+
+// ───────── 交接文件超长（PLAN §0 第 30 条） ─────────
+
+test('oversize: an oversize handoff file is still registered; its size travels with the job across /clear and the new conversation is asked to tidy it first', () => {
+  const big: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 39_373 }
+  const a = run(onRecord(), [{ kind: 'submit', origin: COMPOSER, tokens: 296_000 }, { kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, big])
+  const reg = a.steps[3]!
+  expect(reg.accepted).toBe(true)
+  // 回给模型的话和以前一样（这时不宜逼它大改），只在 debug 里记一笔
+  expect(reg.reply).toBe(
+    `Handoff registered: "${HANDOVER}". End your turn now: no more tool calls, no questions, no summary. When the turn ends, the conversation is reset with /clear and continued from this file.`,
+  )
+  expect(ofType(reg.fx, 'log').map((l) => l.text)).toContain(
+    'handoff file is about 39k tokens, over handoff_max_tokens (20k); the next conversation will be asked to tidy it',
+  )
+  expect(a.rec.job?.tokens).toBe(39_373)
+  // /autohandoff status 显示大小
+  const st = run(a.rec, [{ kind: 'toggle', args: 'status', tokens: 309_000 }])
+  expect(ofType(st.all, 'log')[0]!.text).toContain(`Handoff: "${HANDOVER}" (armed, about 39k tokens (over the 20k limit; the next conversation tidies it first)).`)
+
+  const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE])
+  const moved = migrateRecord(b.rec, NOW)
+  expect(moved.job?.tokens).toBe(39_373)
+  const c = run(moved, [{ kind: 'resetDone', seq: lastSeq(b.all) }, { kind: 'sessionStart', source: 'clear' }])
+  const sc = contexts(c.steps[1]!.fx)
+  expect(sc.length).toBe(1)
+  expect(sc[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(sc[0]).toContain('[AutoHandoff: tidy the handoff file first] The handoff file named above is about 40k tokens, over the 20k limit')
+  // 续接正文不带整理段（只在 start_context 里说一次）
+  expect(ofType(c.steps[0]!.fx, 'resume')[0]!.text).not.toContain('tidy')
+})
+
+test('oversize: under the limit, size unknown (the file could not be read) or the check off: start_context as before', () => {
+  const plain = (fileTokens: number | undefined, cfg = defaultConfig()) => {
+    const reg: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, ...(fileTokens === undefined ? {} : { fileTokens }) }
+    const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, reg], cfg)
+    expect(a.steps[2]!.accepted).toBe(true)
+    const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE], cfg)
+    const c = run(migrateRecord(b.rec, NOW), [{ kind: 'resetDone', seq: lastSeq(b.all) }, { kind: 'sessionStart', source: 'clear' }], cfg)
+    return contexts(c.steps[1]!.fx)[0]!
+  }
+  for (const text of [plain(11_200), plain(undefined), plain(64_000, cfgWith({ handoff_max_tokens: 0 })), plain(64_000, cfgWith({ handoff_max_tokens: 80_000 }))]) {
+    expect(text).toContain(`Handoff file: "${HANDOVER}"`)
+    expect(text).not.toContain('tidy the handoff file')
+  }
+})
+
+test('oversize: action compact gives the tidy section at SessionStart(compact); re-registering a trimmed file drops it', () => {
+  const cfg = cfgWith({ action: 'compact' })
+  const big: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 52_000 }
+  const trimmed: Ev = { kind: 'register', verdict: { ok: true, value: HANDOVER }, fileTokens: 9_800 }
+  const a = run(onRecord(), [{ kind: 'turnStart', turnId: T1 }, { kind: 'postTool', tokens: 301_900 }, big], cfg)
+  expect(a.rec.job?.tokens).toBe(52_000)
+  // 模型在同一回合里精简后重新登记：以新的大小为准
+  const a2 = run(a.rec, [trimmed], cfg)
+  expect(a2.rec.job?.tokens).toBe(9_800)
+  const b = run(a.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE], cfg)
+  expect(b.rec.job?.stage).toBe('compacting')
+  const c = run(b.rec, [{ kind: 'sessionStart', source: 'compact' }], cfg)
+  expect(contexts(c.all)[0]).toContain('is about 52k tokens, over the 20k limit')
+  const b2 = run(a2.rec, [{ kind: 'stop', active: false, tokens: 318_400 }, DONE, { kind: 'sessionStart', source: 'compact' }], cfg)
+  expect(contexts(b2.all)[0]).not.toContain('tidy the handoff file')
+})

@@ -15,7 +15,10 @@ import {
   decideLevel,
   defaultConfig,
   defaultConfigText,
+  estimateReadTokens,
   expand,
+  handoffTarget,
+  isOversize,
   isAbsolutePath,
   isExpired,
   isUnder,
@@ -36,7 +39,22 @@ import {
   versionAtLeast,
   type Settings,
 } from '../hooks/core.js'
-import { CC_DIR, CWD, HANDOVER, HOME, MEMORY_NOTE, MIN, NOW, PROJECT_DIR_KEY, REPO, ROOTS, USER_CONFIG, freshStat } from './helpers.js'
+import {
+  CC_DIR,
+  CWD,
+  HANDOVER,
+  HOME,
+  MEMORY_NOTE,
+  MIN,
+  NOW,
+  PROJECT_DIR_KEY,
+  REPO,
+  ROOTS,
+  USER_CONFIG,
+  freshStat,
+  growingHandover,
+  textWithCounts,
+} from './helpers.js'
 
 const S: Settings = { ...DEFAULT_SETTINGS }
 const opts = { roots: ROOTS, configDir: CC_DIR, now: NOW, freshMinutes: 10, windows: false }
@@ -70,6 +88,7 @@ test('config: a user-edited file with separators, overrides and partial prompts'
     wait_minutes: 45,
     urge_block: false,
     remind_every_turn: true,
+    handoff_max_tokens: 30_000,
   })
   expect(cfg.prompts.remind).toBe(
     '[AutoHandoff] Context is at {used_k}k (first line {remind_k}k).\nFinish the current edit, update docs/work/HANDOVER.md, then call {tool}.\nReset happens with {action}.',
@@ -116,7 +135,7 @@ test('config: missing settings keys and unknown keys are reported', () => {
   expect(problems).toEqual([
     'unknown setting "remind_every_turns" (line 4) ignored',
     'settings line 5 is not "key: value"; ignored: this line is prose',
-    'missing settings (built-in defaults used): default_on, urge_at, compact_at, action, fresh_minutes, wait_minutes, urge_block, remind_every_turn',
+    'missing settings (built-in defaults used): default_on, urge_at, compact_at, action, fresh_minutes, wait_minutes, urge_block, remind_every_turn, handoff_max_tokens',
   ])
 })
 
@@ -221,7 +240,8 @@ test('template: default reminders name the tool, the action and compact_at', () 
   expect(remind).toContain('At about 650k tokens AutoHandoff compacts the conversation')
   expect(remind).not.toMatch(/\{[a-z_]+\}/)
   for (const k of PROMPT_KEYS) {
-    const text = renderPrompt(cfg, k, promptVars(cfg, 455_000, 'the turn ended with an API error'))
+    // size_k 只有 oversize 用，由 startContextText 给
+    const text = renderPrompt(cfg, k, { ...promptVars(cfg, 455_000, 'the turn ended with an API error'), size_k: 34 })
     expect(text).not.toMatch(/\{[a-z_]+\}/)
   }
 })
@@ -510,4 +530,117 @@ test('version: minimum 2.1.304', () => {
   expect(versionAtLeast('3.0.0')).toBe(true)
   expect(versionAtLeast(undefined)).toBe(false)
   expect(versionAtLeast('nightly')).toBe(false)
+})
+
+// ───────── 交接文件大小 ─────────
+
+test('handoff size: handoff_max_tokens accepts 0 (off) and 1000 or more; smaller or malformed values fall back', () => {
+  const withMax = (v: string) => parseConfig(defaultConfigText().replace('handoff_max_tokens: 20000', `handoff_max_tokens: ${v}`))
+  expect(withMax('0').cfg.settings.handoff_max_tokens).toBe(0)
+  expect(withMax('0').problems).toEqual([])
+  expect(withMax('25_000').cfg.settings.handoff_max_tokens).toBe(25_000)
+  const small = withMax('500')
+  expect(small.cfg.settings.handoff_max_tokens).toBe(20_000)
+  expect(small.problems).toEqual(['handoff_max_tokens should be 0 (off) or at least 1000, got 500; using the default (20000)'])
+  const words = withMax('20k')
+  expect(words.cfg.settings.handoff_max_tokens).toBe(20_000)
+  expect(words.problems).toEqual(['handoff_max_tokens should be a whole number, got "20k"; using the default (20000)'])
+  // 生成的默认文件写了这一项和说明，也写了 oversize 段
+  const text = defaultConfigText()
+  expect(text).toContain('handoff_max_tokens: 20000')
+  expect(text).toContain('## oversize')
+  expect(text).toContain('{handoff_note}')
+})
+
+test('handoff size: the estimate counts ASCII, other characters and the line-number prefix of the Read tool', () => {
+  expect(estimateReadTokens('')).toBe(0)
+  // 一行 300 个 ASCII：100 + 行号 3
+  expect(estimateReadTokens('a'.repeat(300))).toBe(103)
+  // 一行 100 个汉字：165 + 3
+  expect(estimateReadTokens('交'.repeat(100))).toBe(168)
+  // 空行也有行号前缀；末尾换行多出一行（Read 也会显示它）
+  expect(estimateReadTokens('\n\n\n')).toBe(Math.ceil(3 / 3 + 4 * 3))
+  // emoji 是一个码点（代理对不算两个）
+  expect(estimateReadTokens('✅🚀')).toBe(Math.ceil(2 * 1.65 + 3))
+  // 中文段落比同样「意思」的英文贵：同一份交接的中英两版
+  const zh = growingHandover(10)
+  const en = growingHandover(10, false)
+  expect(estimateReadTokens(zh) / zh.length).toBeGreaterThan(estimateReadTokens(en) / en.length)
+})
+
+test('handoff size: calibration points (character make-up of files whose Read token count was measured): never below, at most 30% above', () => {
+  // [ASCII 字符数（含换行）, 非 ASCII 字符数, 行数, Read 工具报告的 token 数]；内容不入库，只留构成
+  const measured: [string, number, number, number, number][] = [
+    ['Chinese handoff, 464 lines', 27_655, 14_363, 464, 33_481],
+    ['Chinese handoff, 536 lines', 33_347, 16_506, 536, 39_373],
+    ['English README x7', 172_123, 35, 2_703, 61_621],
+    ['Chinese plan x3', 65_325, 35_823, 1_615, 73_531],
+    ['TypeScript with Chinese comments x3', 172_656, 13_200, 4_498, 90_568],
+    ['Chinese notes x2', 47_352, 16_934, 1_445, 43_413],
+    ['9001 very short lines', 71_635, 0, 9_001, 39_280],
+  ]
+  for (const [name, ascii, other, lines, real] of measured) {
+    const est = estimateReadTokens(textWithCounts(ascii, other, lines))
+    expect({ name, ok: est >= real }).toEqual({ name, ok: true })
+    expect({ name, ok: est <= real * 1.3 }).toEqual({ name, ok: true })
+  }
+})
+
+test('handoff size: a handoff that grows a dated section per handoff passes the limit; one kept to the current state stays under the target', () => {
+  const s = { ...DEFAULT_SETTINGS }
+  expect(handoffTarget(s)).toBe(15_000)
+  // 只留当前状态（几节）的交接：远低于 15k
+  const lean = estimateReadTokens(growingHandover(4))
+  expect(lean).toBeLessThan(handoffTarget(s))
+  expect(isOversize(lean, s)).toBe(false)
+  // 每次在顶上加一节、攒了几十节：超过 20k
+  const grown = estimateReadTokens(growingHandover(40))
+  expect(isOversize(grown, s)).toBe(true)
+  // 检测关着、或没估出来：都不算超长
+  expect(isOversize(grown, { ...s, handoff_max_tokens: 0 })).toBe(false)
+  expect(isOversize(undefined, s)).toBe(false)
+  // 正好等于上限不算超
+  expect(isOversize(20_000, s)).toBe(false)
+  expect(isOversize(20_001, s)).toBe(true)
+})
+
+test('handoff size: the reminders ask for a short handoff file; start_context gets the oversize section after the path, only when over the limit', () => {
+  const cfg = defaultConfig()
+  for (const k of ['remind', 'urge'] as const) {
+    const text = renderPrompt(cfg, k, promptVars(cfg, 455_000))
+    expect(text).toContain('within about 15k tokens: rewrite or delete outdated parts in place instead of adding a new dated section on top')
+    expect(text).toContain('archive file next to it')
+  }
+  const sc = startContextText(cfg, HANDOVER, 'clear', 33_481)
+  const pathAt = sc.indexOf(`Handoff file: "${HANDOVER}"`)
+  const tidyAt = sc.indexOf('[AutoHandoff: tidy the handoff file first]')
+  expect(pathAt).toBeGreaterThan(0)
+  expect(tidyAt).toBeGreaterThan(pathAt)
+  // 大小向上取整、上限与目标按 k 写
+  expect(sc).toContain('is about 34k tokens, over the 20k limit')
+  expect(sc).toContain('under about 15k tokens')
+  expect(sc).not.toMatch(/\{[a-z_]+\}/)
+  // 没超、没估出来：和以前一样，只有模板加路径句
+  const plain = startContextText(cfg, HANDOVER, 'clear')
+  expect(startContextText(cfg, HANDOVER, 'clear', 12_000)).toBe(plain)
+  expect(plain.endsWith('before relying on them).')).toBe(true)
+  // 用户把上限调到 50k：同一个文件不再超
+  const loose = defaultConfig()
+  loose.settings.handoff_max_tokens = 50_000
+  expect(startContextText(loose, HANDOVER, 'clear', 33_481)).not.toContain('tidy the handoff file')
+  // 检测关掉（0）：提醒里那句也没有
+  const off = defaultConfig()
+  off.settings.handoff_max_tokens = 0
+  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).not.toContain('within about')
+  expect(renderPrompt(off, 'remind', promptVars(off, 301_000))).toContain('instead of working. Save your progress')
+  expect(startContextText(off, HANDOVER, 'clear', 90_000)).toBe(startContextText(off, HANDOVER, 'clear'))
+})
+
+test('handoff size: a user-written oversize prompt with placeholders it cannot use is reported; an empty one falls back', () => {
+  const text = defaultConfigText().replace(DEFAULT_PROMPTS.oversize, 'Handoff is {size_k}k (limit {handoff_max_k}k, aim {handoff_k}k) at {used_k}k.')
+  const { cfg, problems } = parseConfig(text)
+  expect(problems).toEqual(['## oversize: {used_k} cannot be used here and is left as written'])
+  expect(startContextText(cfg, HANDOVER, 'compact', 25_100)).toContain('Handoff is 26k (limit 20k, aim 15k) at {used_k}k.')
+  const empty = parseConfig(defaultConfigText().replace(DEFAULT_PROMPTS.oversize, ''))
+  expect(empty.cfg.prompts.oversize).toBe(DEFAULT_PROMPTS.oversize)
 })

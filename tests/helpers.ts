@@ -51,6 +51,7 @@ fresh_minutes: 15
 wait_minutes: 45
 urge_block: false
 remind_every_turn: true
+handoff_max_tokens: 30_000
 
 ## remind
 
@@ -109,4 +110,72 @@ export function lastSeq(fx: readonly Effect[]): number {
     if (f.type === 'clear' || f.type === 'compact' || f.type === 'resume') return f.seq
   }
   throw new Error('no reset or resume effect in the list')
+}
+
+// ───────── 交接文件大小（token 估算）用的合成文本 ─────────
+
+/**
+ * 一份按「每次交接在顶上加一个日期小节、从不移走」习惯长出来的交接文档（合成内容，中英混排）。
+ * sections：日期小节数；每节约 18 行。zh=false 时全英文。
+ */
+export function growingHandover(sections: number, zh = true): string {
+  const out: string[] = [zh ? '# 交接文档（最新在最前）' : '# Handover (newest first)', '']
+  for (let i = 0; i < sections; i++) {
+    const day = 26 - Math.floor(i / 8)
+    const hh = String(23 - (i % 8) * 2).padStart(2, '0')
+    const hash = (0x5a3c19f + i * 7919).toString(16).slice(0, 7)
+    if (zh) {
+      out.push(
+        `## 2026-10-${day} ${hh}:15 JST — 第 ${sections - i} 批：上传状态机重构`,
+        '',
+        `- 已完成：\`src/Core/Upload/CommitLanded.cs\` 改成显式状态机，单测 ${40 + i}/${40 + i} 通过（commit ${hash}）。`,
+        '- 进行中：Windows 验收脚本 `tests/accept/run-b2.ps1` 第 3 段（断网复制）还在跑，日志写到 `logs/accept-b2.log`。',
+        `- 后台代理：Opus 审查员 agent-a${hash}f 在审 \`git diff ${hash}..HEAD\`，回来后按 Major/Minor 处理。`,
+        '- 待主人定：原子上传默认开还是关？大文件（> 4 GiB）是否分块续传？',
+        '- 下一步：补复现用例 → 重跑验收 → 发回同一审查员二审。',
+        '',
+        '说明：落地判定原来散在三个调用点，各自重传整份文件；现在统一走 CommitLandedAsync，改动方只提交差异块，服务端按版本号核对后才覆盖，避免两个客户端同时改同一文件时后写覆盖先写。断网时暂存到本地队列，恢复后按顺序重放，重放前先重列目标目录确认没有被别处删掉。',
+        '',
+        '| 场景 | 结果 | 备注 |',
+        '|---|---|---|',
+        `| 断网复制 | 通过 | 重试 ${i % 5} 次后成功 |`,
+        '| 改名覆盖 | 失败 | MOVE 未带 Overwrite:T，已修 |',
+        '',
+        '```',
+        `dotnet test tests/Core.Tests --filter Upload  # ${40 + i} passed`,
+        '```',
+        '',
+      )
+    } else {
+      out.push(
+        `## 2026-10-${day} ${hh}:15 JST - batch ${sections - i}: upload state machine rewrite`,
+        '',
+        `- Done: \`src/Core/Upload/CommitLanded.cs\` is now an explicit state machine; unit tests ${40 + i}/${40 + i} pass (commit ${hash}).`,
+        '- In progress: the Windows acceptance script `tests/accept/run-b2.ps1` part 3 (copy while offline) is running; log in `logs/accept-b2.log`.',
+        `- Background agent: reviewer agent-a${hash}f is reviewing \`git diff ${hash}..HEAD\`; handle its Major/Minor findings when it reports.`,
+        '- Waiting for the user: atomic upload on or off by default? Resume chunked uploads for files over 4 GiB?',
+        '- Next: add the repro test, rerun acceptance, send the fixes back to the same reviewer.',
+        '',
+        'Why: the landing check used to live in three call sites, each re-uploading the whole file; it now goes through CommitLandedAsync, the client sends only the changed blocks, and the server checks the version before overwriting, so two clients editing the same file no longer lose an update. Offline writes wait in a local queue and are replayed in order once the share is back, after listing the target folder again to make sure nothing deleted it meanwhile.',
+        '',
+        '| Case | Result | Note |',
+        '|---|---|---|',
+        `| copy while offline | pass | succeeded after ${i % 5} retries |`,
+        '| rename over existing | fail | MOVE lacked Overwrite:T; fixed |',
+        '',
+        '```',
+        `dotnet test tests/Core.Tests --filter Upload  # ${40 + i} passed`,
+        '```',
+        '',
+      )
+    }
+  }
+  return out.join('\n')
+}
+
+/** 字符构成与给定统计相同的文本：lines 行、ASCII 字符 ascii 个（含换行）、非 ASCII 字符 nonAscii 个。只用来对估算做回归。 */
+export function textWithCounts(ascii: number, nonAscii: number, lines: number): string {
+  const letters = ascii - (lines - 1)
+  const body = 'a'.repeat(letters) + '中'.repeat(nonAscii)
+  return body + '\n'.repeat(lines - 1)
 }

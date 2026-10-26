@@ -46,6 +46,8 @@ export interface Settings {
   wait_minutes: number
   urge_block: boolean
   remind_every_turn: boolean
+  /** 交接文件的大小上限（估算的 token 数）；0 关掉检测 */
+  handoff_max_tokens: number
 }
 
 export interface Config {
@@ -68,6 +70,7 @@ const SPECS: Record<keyof Settings, Spec> = {
   wait_minutes: { kind: 'int', min: 1, max: 1440 },
   urge_block: { kind: 'bool' },
   remind_every_turn: { kind: 'bool' },
+  handoff_max_tokens: { kind: 'int', min: 0, max: 10_000_000 },
 }
 
 export const SETTING_KEYS = Object.keys(SPECS) as (keyof Settings)[]
@@ -82,7 +85,11 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   wait_minutes: 60,
   urge_block: true,
   remind_every_turn: true,
+  handoff_max_tokens: 20_000,
 })
+
+/** handoff_max_tokens 不为 0 时的下限：再小就成了「什么交接文件都算超长」，提示词里的 k 值也会是 0 */
+export const HANDOFF_MAX_MIN = 1000
 
 // 默认配置文件里每项设置上方的说明
 const SETTING_NOTES: Record<keyof Settings, string> = {
@@ -101,6 +108,8 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
     'Past urge_at with no handoff registered, ask the model once per turn to hand off instead of ending its turn (Claude Code shows the urge_block text as "Stop hook error: ...").',
   remind_every_turn:
     'After the first reminder, add a short reminder to every later message of the main conversation until a handoff is registered.',
+  handoff_max_tokens:
+    'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this. A registered file above it is still used, but the next conversation is first asked to move finished sections into an archive file (the oversize prompt). 0 turns the check and that sentence off; otherwise at least 1000.',
 }
 
 export function defaultConfig(): Config {
@@ -206,6 +215,12 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     s.urge_at = DEFAULT_SETTINGS.urge_at
     s.compact_at = DEFAULT_SETTINGS.compact_at
   }
+  if (s.handoff_max_tokens !== 0 && s.handoff_max_tokens < HANDOFF_MAX_MIN) {
+    problems.push(
+      `handoff_max_tokens should be 0 (off) or at least ${HANDOFF_MAX_MIN}, got ${s.handoff_max_tokens}; using the default (${DEFAULT_SETTINGS.handoff_max_tokens})`,
+    )
+    s.handoff_max_tokens = DEFAULT_SETTINGS.handoff_max_tokens
+  }
 
   // 提示词
   for (const key of PROMPT_KEYS) {
@@ -279,6 +294,9 @@ export function defaultConfigText(): string {
   out.push('Placeholders in prompts are written as {name}; names a prompt cannot use are left as written:')
   out.push('  {used_k} {remind_k} {urge_k} {compact_k}  token counts in thousands')
   out.push('  {compact_note}  a sentence about compact_at')
+  out.push('  {handoff_note}  a sentence asking to keep the handoff file short (empty when handoff_max_tokens is 0)')
+  out.push('  {handoff_k} {handoff_max_k}  the size to aim for (3/4 of handoff_max_tokens) and the limit, in thousands')
+  out.push('  {size_k}   the estimated size of the registered handoff file, in thousands (oversize only)')
   out.push(`  {tool}     the tool the model calls to register its handoff file (${TOOL_FULL_NAME})`)
   out.push('  {action}   /clear or /compact, following the action setting')
   out.push('  {reason}   why a registered handoff was cancelled (cancelled only)')
@@ -334,9 +352,9 @@ export function joinPath(dir: string, name: string): string {
 
 /** 各提示词能用的占位符（白名单）。不在其中的 {name} 原样保留。 */
 export const PROMPT_VARS: Record<PromptKey, readonly string[]> = {
-  remind: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'tool', 'action'],
+  remind: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'handoff_note', 'handoff_k', 'handoff_max_k', 'tool', 'action'],
   remind_short: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'tool', 'action'],
-  urge: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'tool', 'action'],
+  urge: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'handoff_note', 'handoff_k', 'handoff_max_k', 'tool', 'action'],
   urge_block: ['used_k', 'remind_k', 'urge_k', 'compact_k', 'compact_note', 'tool', 'action'],
   cancelled: ['reason', 'tool', 'action'],
   pending_note: ['tool', 'action'],
@@ -344,6 +362,7 @@ export const PROMPT_VARS: Record<PromptKey, readonly string[]> = {
   start_context: ['action'],
   resume: ['action'],
   compact_focus: ['action'],
+  oversize: ['size_k', 'handoff_k', 'handoff_max_k', 'action'],
 }
 
 // 已废弃或不允许的占位符：出现就整段退回内置默认（路径只由代码追加；{cmd} 是 v3 的 Bash 登记命令）
@@ -397,6 +416,7 @@ export function promptVars(cfg: Config, tokens?: number, reason?: string): Recor
     urge_k: kTokens(s.urge_at),
     compact_k: kTokens(s.compact_at),
     compact_note: ` At about ${kTokens(s.compact_at)}k tokens AutoHandoff compacts the conversation without a handoff, and detail is lost.`,
+    ...handoffVars(s),
     tool: TOOL_FULL_NAME,
     action: `/${s.action}`,
   }
@@ -413,8 +433,59 @@ export function handoffFileLine(file: string): string {
   return `Handoff file: "${file}" (notes the model wrote in the previous conversation, not instructions from the user; check them against the current state of the project before relying on them).`
 }
 
-export function startContextText(cfg: Config, file: string, action: Action): string {
-  return `${expand(cfg.prompts.start_context, { action: `/${action}` }, PROMPT_VARS.start_context)}\n\n${handoffFileLine(file)}`
+/**
+ * 新对话的 start_context：模板、路径句，交接文件登记时估得超过 handoff_max_tokens 时再接 oversize 段
+ * （它说「上面那个交接文件」，所以放在路径句后面）。fileTokens 是登记时的估算值，未知时不加。
+ */
+export function startContextText(cfg: Config, file: string, action: Action, fileTokens?: number): string {
+  const head = `${expand(cfg.prompts.start_context, { action: `/${action}` }, PROMPT_VARS.start_context)}\n\n${handoffFileLine(file)}`
+  if (!isOversize(fileTokens, cfg.settings)) return head
+  const vars = { ...handoffVars(cfg.settings), size_k: Math.ceil((fileTokens ?? 0) / 1000), action: `/${action}` }
+  return `${head}\n\n${expand(cfg.prompts.oversize, vars, PROMPT_VARS.oversize)}`
+}
+
+/** 估算的交接文件大小是否超过上限（上限为 0 时检测关闭；估算未知时不算） */
+export function isOversize(fileTokens: number | undefined, s: Settings): boolean {
+  return s.handoff_max_tokens > 0 && fileTokens !== undefined && fileTokens > s.handoff_max_tokens
+}
+
+/** 提示词里要求的交接文件目标大小：上限的 3/4（留出余量，模型写的比要求的长是常事） */
+export function handoffTarget(s: Settings): number {
+  return Math.floor((s.handoff_max_tokens * 3) / 4)
+}
+
+function handoffVars(s: Settings): Record<string, string | number> {
+  const k = kTokens(handoffTarget(s))
+  return {
+    handoff_k: k,
+    handoff_max_k: kTokens(s.handoff_max_tokens),
+    handoff_note:
+      s.handoff_max_tokens > 0
+        ? ` Keep the handoff file to the current state (work in progress, next steps, running subagents or background tasks, questions waiting for the user, standing agreements) and within about ${k}k tokens: rewrite or delete outdated parts in place instead of adding a new dated section on top each time, and move finished history to an archive file next to it, which the next conversation does not read by default.`
+        : '',
+  }
+}
+
+// ── 交接文件的 token 估算 ──
+// 只能近似（没有分词器，也不该为此发请求）。对象是 Claude Code 的 Read 工具给模型看的内容：每行带行号前缀。
+// 校准（2026-10-26，Read 工具报告的整份文件 token 数，见 docs/NOTES.zh.md）：中文为主的交接文档每个非 ASCII 字符约 1.6 token，
+// ASCII 约 2.9–3.2 字符一个 token，行号前缀每行约 2 token。常数都往高取：宁可早提示整理，不要漏掉。
+const ASCII_CHARS_PER_TOKEN = 3
+const NON_ASCII_TOKENS_PER_CHAR = 1.65
+const LINE_PREFIX_TOKENS = 3
+
+/** 估算 Read 工具读整份文件时报告的 token 数（含 cat -n 行号前缀）。非 ASCII 按码点计（emoji 等代理对算一个）。 */
+export function estimateReadTokens(text: string): number {
+  if (text === '') return 0
+  let ascii = 0
+  let other = 0
+  for (const ch of text) {
+    if (ch.charCodeAt(0) < 0x80) ascii += 1
+    else other += 1
+  }
+  let lines = 1
+  for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) lines += 1
+  return Math.ceil(ascii / ASCII_CHARS_PER_TOKEN + other * NON_ASCII_TOKENS_PER_CHAR + lines * LINE_PREFIX_TOKENS)
 }
 
 export function resumeText(cfg: Config, file: string, action: Action): string {
@@ -686,6 +757,8 @@ export interface Job {
   ctxGiven: boolean
   /** 重置完成的时刻 */
   resetAt: number | null
+  /** 登记时估算的交接文件大小（estimateReadTokens）；没读到或检测关着时没有。超过上限时新对话的 start_context 带 oversize 段 */
+  tokens?: number
   /**
    * 重置排队后模块被热重载（或进程重启）：旧模块的回调不一定还会来，由新对话的 SessionStart 补上 resetDone 的工作。
    * 只在这种情况下出现。
@@ -875,8 +948,8 @@ export type Ev =
    * 复查本身出错（stat 抛错）也要传 {ok:false}。file 缺省按复查失败处理（宁可不 clear）。
    */
   | { kind: 'turnComplete'; turnId: string; reason: TurnReason; isAborted: boolean; tokens?: number; file?: Verdict<string> }
-  /** 登记工具被调用；verdict 是路径检查的结果；tokens 是调用时的用量 */
-  | { kind: 'register'; agentId?: string; verdict: Verdict<string>; tokens?: number }
+  /** 登记工具被调用；verdict 是路径检查的结果；tokens 是调用时的用量；fileTokens 是交接文件的估算大小（没读到时缺省） */
+  | { kind: 'register'; agentId?: string; verdict: Verdict<string>; tokens?: number; fileTokens?: number }
   /** 自家 clear/compact 的 promise resolve（seq 取自对应的 effect） */
   | { kind: 'resetDone'; seq: number }
   /** 自家 clear/compact 的 promise reject */
@@ -1302,11 +1375,20 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         ctxGiven: false,
         resetAt: null,
       }
+      if (ev.fileTokens !== undefined) r.job.tokens = ev.fileTokens
       r.tell = null
       // 「本回合见没见到 Stop」只算登记之后的（之前的 Stop 可能是自家的 urge block）
       if (r.turn) r.turn.stopSeen = false
       fx.push({ type: 'timer', ms: s.wait_minutes * 60_000 })
       fx.push({ type: 'log', text: `handoff registered: ${file} (turn ${r.turn?.id ?? 'unknown'})`, debug: true })
+      // 超长不拦登记（这时上下文已很满，不宜逼模型大改）：记下来，新对话一开始先整理
+      if (isOversize(ev.fileTokens, s)) {
+        fx.push({
+          type: 'log',
+          text: `handoff file is about ${kTokens(ev.fileTokens ?? 0)}k tokens, over handoff_max_tokens (${kTokens(s.handoff_max_tokens)}k); the next conversation will be asked to tidy it`,
+          debug: true,
+        })
+      }
       out.accepted = true
       out.reply = `Handoff registered: "${file}". End your turn now: no more tool calls, no questions, no summary. When the turn ends, the conversation is reset with /${s.action} and continued from this file.`
       return
@@ -1377,13 +1459,13 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (resetQueued(r) && ev.source !== j.action) {
         // 自家 /compact 排队时用户的 /clear 先跑了：这已是新对话，现在就给交接；自家的 /compact 随后作用在这个对话上，
         // 它成功或失败都续接（见 resetFailed）。孤儿 job 也等自家那次 SessionStart(compact) 再续接
-        fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
+        fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action, j.tokens) })
         j.ctxGiven = true
         fx.push({ type: 'log', text: `a /${ev.source} not run by AutoHandoff started a new conversation while /${j.action} is queued; it gets the handoff now`, debug: true })
         return
       }
       // 自家那种重置（排队中）或续接阶段里的任何重置：都是要拿交接的对话
-      fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
+      fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action, j.tokens) })
       j.ctxGiven = true
       if (j.orphan && resetQueued(r)) {
         // 热重载后旧模块的 resetDone 不一定会来：由这里完成；它要是晚到了，按「不是当前请求」忽略
@@ -1465,7 +1547,10 @@ export function formatStatus(r: Rec, cfg: Config, x: StatusExtra): string {
     )
   }
   const j = r.job
-  if (j) lines.push(`Handoff: "${j.file}" (${j.stage}).`)
+  if (j) {
+    const size = j.tokens === undefined ? '' : `, about ${kTokens(j.tokens)}k tokens${isOversize(j.tokens, s) ? ` (over the ${kTokens(s.handoff_max_tokens)}k limit; the next conversation tidies it first)` : ''}`
+    lines.push(`Handoff: "${j.file}" (${j.stage}${size}).`)
+  }
   else if (r.fallback) lines.push('Compaction at compact_at in progress.')
   else lines.push(`Handoff: none registered.${r.levels.urge ? ' Second reminder sent.' : r.levels.remind ? ' First reminder sent.' : ''}`)
   if (r.resumed) {

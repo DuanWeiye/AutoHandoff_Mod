@@ -9,7 +9,8 @@
   drive.py <工作目录> [场景…] [--repeat N] [--keep]
   drive.py <工作目录> --cleanup-only        （--keep 跑过之后清理）
 场景：clear draft dialog deny interject notify cmp slash print
-      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain（缺省全跑；--repeat N 每个场景跑 N 次并统计）
+      compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain oversize
+      （缺省全跑；--repeat N 每个场景跑 N 次并统计）
 同一个仓库（worktree）同时只跑一组 drive.py：store 文件被同一插件目录的所有 --plugin-dir 会话共用，清理时要改它。
 清理时发现别的 --plugin-dir 会话还在跑、或这次运行期间有别的会话写过记录，就跳过 store 这一步并打印出来。
 工作目录要先 `mod_setup.sh init <工作目录>`，且测试工程已接受过 workspace trust（首次 start 时本脚本会自动选 Yes）。
@@ -1257,6 +1258,87 @@ def scenario_chain(work):
     return c
 
 
+def handover_history(sections):
+    """一份「每次交接在顶上加一个日期小节、从不移走」长出来的交接文件（合成内容，英文）：最上面一节是当前状态，其余都已完结"""
+    out = ["# Handover", "", "## 2026-10-26 09:40 - current state", "",
+           "- Inventory service: stock_level() in src/stock.py still returns 0; the catalog import is the open item.",
+           "- Standing agreement: keep functions small, one docstring each (see CLAUDE.md).",
+           "- Open question for the user: should reorder thresholds come from data/catalog.md or a new config file?", ""]
+    for i in range(sections):
+        day, hh = 25 - i // 6, 22 - (i % 6) * 2
+        out += [f"## 2026-10-{day:02d} {hh:02d}:10 - batch {sections - i} (finished)", "",
+                f"- Done: refactored the carrier lookup in src/carrier_{i:02d}.py and added tests (12 passed); merged as commit {0x3f2a91c + i * 7919:x}.",
+                f"- Reviewed by the reviewer agent; two Minor findings fixed (naming in zone_{i:02d}, a missing docstring).",
+                "- Measured: reorder report for 800 SKUs takes 1.4 s; the slow part was the supplier join, now cached per batch.",
+                "- Decided with the user: barcodes stay as strings; expiry dates are stored in UTC and shown in JST.",
+                "- Next (done since): wire the cache into the nightly audit count and re-run the variance check.",
+                "", "| check | result |", "|---|---|", f"| audit count, zone {i % 9} | pass |", "| variance report | pass |", ""]
+    return "\n".join(out)
+
+
+def est_tokens(text):
+    """与 hooks/core.ts 的 estimateReadTokens 同一公式（只用来在报告里看整理前后的大小）"""
+    if not text:
+        return 0
+    ascii_n = sum(1 for ch in text if ord(ch) < 128)
+    return int(-(-(ascii_n / 3 + (len(text) - ascii_n) * 1.65 + (text.count("\n") + 1) * 3) // 1))
+
+
+def scenario_oversize(work):
+    """交接文件超长（PLAN §0 第 30 条）：工程里的交接文件按「顶上加日期小节、不移走」攒到了几十节，配置把 handoff_max_tokens 压到 4000。
+    越过 remind → 模型更新交接文件、登记（超长不拦）→ /clear → 新对话的 start_context 带整理段。
+    硬断言：登记被受理、审计行记下超长、新 transcript 里的 SessionStart 附加上下文含整理段（在路径句之后）、续接恰好一次。
+    软观察（只记 note）：模型有没有把旧小节剪到旁边的存档文件、交接文件整理后多大、原任务有没有接着做完。"""
+    reset_project(work)
+    c = Check("oversize: an oversize handoff file is registered, and the next conversation is asked to tidy it")
+    handover = os.path.realpath(os.path.join(proj(work), "docs", "HANDOVER.md"))
+    history = handover_history(30)
+    with open(handover, "w") as f:
+        f.write(history)
+    s = Session(work, "oversize", config=os.path.join(work, "autohandoff-oversize.md"))
+    try:
+        s.send(CLEAR_TASK)
+        s.wait(lambda: s.has("remind sent at"), 180, "the remind")
+        s.wait(lambda: s.has("handoff finished") or s.has("handoff cancelled"), 300, "the reset and resume")
+        s.wait(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1]), 400, "the resumed turn to end")
+        s.wait_idle()
+        a = s.audit()
+        sids = s.sids()
+        new = sids[1] if len(sids) > 1 else None
+        c.ok(f"handoff registered: {handover}" in "\n".join(a), "the oversize handoff file was registered (not refused)")
+        over = [x for x in a if x.startswith("handoff file is about") and "over handoff_max_tokens (4k)" in x]
+        c.ok(len(over) >= 1, f"the size check logged the file as over the limit ({over[:1]})")
+        c.ok(s.count("turn ended; running /clear") == 1, "reset exactly once")
+        ent = s.entries(new) if new else []
+        tidy = attachments(ent, "[AutoHandoff: tidy the handoff file first]")
+        c.ok(len(tidy) >= 1, "the new conversation's SessionStart context carries the tidy section")
+        blob = json.dumps(tidy[0], ensure_ascii=False) if tidy else ""
+        c.ok(-1 < blob.find("Handoff file:") < blob.find("tidy the handoff file first"), "the tidy section comes after the path line")
+        c.ok(len(resume_entries(ent)) == 1, f"resumed exactly once ({len(resume_entries(ent))})")
+        c.ok(s.count("handoff registered") == 1, "no second handoff in the new conversation")
+        # 软观察
+        docs = os.path.join(proj(work), "docs")
+        archives = sorted(f for f in os.listdir(docs) if f != "HANDOVER.md")
+        after = open(handover).read() if os.path.exists(handover) else ""
+        done = [os.path.exists(os.path.join(proj(work), "notes", f)) for f in ("a.txt", "b.txt", "c.txt")]
+        sizes = []
+        for f in archives:
+            try:
+                sizes.append(est_tokens(open(os.path.join(docs, f)).read()))
+            except (OSError, UnicodeDecodeError):
+                sizes.append(None)
+        c.note(f"history before the session: about {est_tokens(history)} tokens; registered: {over[0] if over else '-'}; "
+               f"after the new conversation: about {est_tokens(after)} tokens ({after.count(chr(10)) + 1} lines); "
+               f"other files in docs/: {archives or 'none'} {sizes}; work finished (notes a/b/c): {done}")
+        c.note(" | ".join(x for x in a if x.startswith(("remind sent", "handoff", "turn ended", "record moved", "registration", "could not"))))
+    except TimeoutError as e:
+        c.ok(False, str(e).splitlines()[0])
+        c.note("\n".join(str(e).splitlines()[1:40]))
+    finally:
+        s.close()
+    return c
+
+
 SCENARIOS = {
     "clear": scenario_clear,
     "draft": lambda w: scenario_clear(w, tag="draft", draft="DRAFT-KEEP-ME 0425"),
@@ -1279,6 +1361,7 @@ SCENARIOS = {
     "urge": scenario_urge,
     "userclear": scenario_userclear,
     "chain": scenario_chain,
+    "oversize": scenario_oversize,
 }
 
 

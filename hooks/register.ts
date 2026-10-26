@@ -17,6 +17,7 @@ import {
   configDir,
   configFilePath,
   defaultConfigText,
+  estimateReadTokens,
   homeDir,
   isAbsolutePath,
   jobKey,
@@ -529,6 +530,19 @@ async function checkHandoffPath($: Api, raw: unknown, now: number, freshMinutes:
   return checkHandoffStat(stat, { roots, configDir: await realPathOf($, cc), now, freshMinutes, windows })
 }
 
+/**
+ * 登记时估算交接文件的大小（PLAN §0 第 30 条）：读一次正文，只用来数字符，不解析、不进任何文本。
+ * 读失败（刚被删、别的插件的 fs hook 拒绝……）不影响登记，只是这次没有大小检测；文件真没了由回合结束时的复查处理。
+ */
+async function handoffTokens($: Api, file: string): Promise<number | undefined> {
+  try {
+    return estimateReadTokens(String(await $.fs.read(file)))
+  } catch (err) {
+    debug($, `could not read the handoff file to estimate its size: ${errText(err)}`)
+    return undefined
+  }
+}
+
 /** 重置前复查交接文件；stat 抛错（文件没了）也是复查失败 */
 async function recheck($: Api, file: string): Promise<Verdict<string>> {
   const stat = await safely(() => $.fs.stat(file, { resolve: true }))
@@ -540,9 +554,12 @@ async function onRegister($: Api, e: { agentId?: string; file?: unknown }): Prom
   const config = await readConfig($)
   let verdict: Verdict<string> = { ok: false, why: 'not checked' }
   // 子代理和 fork 的调用不看路径，core 直接拒绝
-  if (e.agentId === undefined) verdict = await checkHandoffPath($, e.file, await $.clock.now(), config.parsed.cfg.settings.fresh_minutes)
+  const s = config.parsed.cfg.settings
+  if (e.agentId === undefined) verdict = await checkHandoffPath($, e.file, await $.clock.now(), s.fresh_minutes)
+  // 路径通过了才读（realPath 已过白名单、≤ 1 MiB）；检测关着（0）就不读
+  const fileTokens = verdict.ok && s.handoff_max_tokens > 0 ? await handoffTokens($, verdict.value) : undefined
   const { tokens } = await usageNow($)
-  const step = await dispatch($, () => ({ kind: 'register', agentId: e.agentId, verdict, tokens }), { config })
+  const step = await dispatch($, () => ({ kind: 'register', agentId: e.agentId, verdict, tokens, fileTokens }), { config })
   const reply = step.reply ?? 'Not registered.'
   return step.accepted === true ? { result: reply } : { deny: reply }
 }

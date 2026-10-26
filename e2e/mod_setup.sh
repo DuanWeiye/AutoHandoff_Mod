@@ -7,7 +7,8 @@
 #     （init 写五份：autohandoff.md 用 ACTION，autohandoff-compact.md 固定 action: compact，
 #      autohandoff-fallback.md 测 compact_at、autohandoff-urge.md 测 Stop block：这两份把阈值压到一次读大文件就越过，
 #      并把 remind/urge 提示词换成「不必动作」的说明，模拟不理提醒的模型；
-#      autohandoff-chain.md 把 start_context 换成不劝阻再交接的中性说明，让连环交接守卫真正被触发；start 时 AH_CONFIG 可指定用哪份）
+#      autohandoff-chain.md 把 start_context 换成不劝阻再交接的中性说明，让连环交接守卫真正被触发；
+#      autohandoff-oversize.md 把 handoff_max_tokens 压到 4000，交接文件超长检测用；start 时 AH_CONFIG 可指定用哪份）
 #   - AUTOHANDOFF_DISABLE=1：万一全局 v3 仍被加载，也让它静默（v4 不读这个变量）
 #
 # 用法：
@@ -28,9 +29,9 @@ SOCK=${SOCK:-ahmod}
 # 工作目录的标记：drive.py 只在有它的目录里 git clean、删工作目录
 MARKER=.ah-e2e-work
 
-# write_config <输出> <action> [remind urge compact [neutral [urge_block]]]：neutral 非空时 remind/urge/remind_short 换成不必动作的说明
+# write_config <输出> <action> [remind urge compact [neutral [urge_block [handoff_max]]]]：neutral 非空时 remind/urge/remind_short 换成不必动作的说明
 write_config() {
-  local out=$1 action=$2 remind=${3:-${REMIND:-52000}} urge=${4:-${URGE:-200000}} compact=${5:-${COMPACT:-900000}} neutral=${6:-} block=${7:-true}
+  local out=$1 action=$2 remind=${3:-${REMIND:-52000}} urge=${4:-${URGE:-200000}} compact=${5:-${COMPACT:-900000}} neutral=${6:-} block=${7:-true} hmax=${8:-20000}
   cat >"$out" <<EOF
 # AutoHandoff configuration (e2e)
 
@@ -45,6 +46,7 @@ fresh_minutes: 10
 wait_minutes: 30
 urge_block: $block
 remind_every_turn: true
+handoff_max_tokens: $hmax
 EOF
   if [ -n "$neutral" ]; then
     for k in remind urge remind_short; do
@@ -128,6 +130,8 @@ case "$cmd" in
     # chain：内置 start_context 里「除非有新提醒，不要再交接」那句会劝住新对话，守卫就测不到；换成中性说明
     write_config "$S/autohandoff-chain.md" clear
     printf '\n## start_context\n\n[AutoHandoff e2e] This conversation was reset by AutoHandoff ({action}). Follow the handoff file.\n' >>"$S/autohandoff-chain.md"
+    # oversize：上限压到 4000（目标 3k），一份攒了几十节的交接文件必然超长
+    write_config "$S/autohandoff-oversize.md" clear "${REMIND:-52000}" "${URGE:-200000}" "${COMPACT:-900000}" "" true 4000
     write_settings
     echo "initialized $S (config $S/autohandoff.md, settings $S/settings.json)"
     ;;

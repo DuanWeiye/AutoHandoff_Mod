@@ -4,7 +4,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { COMMAND_NAME, QUEUED_TOAST, TOOL_FULL_NAME, defaultConfigText, storeKey } from '../hooks/core.js'
-import { CC_DIR, CWD, HANDOVER, HOME, MIN, NOW, REPO } from './helpers.js'
+import { CC_DIR, CWD, HANDOVER, HOME, MIN, NOW, REPO, growingHandover } from './helpers.js'
 
 const OLD = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
 const NEW = 'b7e9d1c3-5f2a-4b6c-8d0e-2f4a6b8c0d1e'
@@ -25,6 +25,7 @@ fresh_minutes: 10
 wait_minutes: 60
 urge_block: true
 remind_every_turn: true
+handoff_max_tokens: 20000
 `
 
 interface PendingCommand {
@@ -65,6 +66,10 @@ function world(on: On, o: WorldOptions = {}) {
     tokens: undefined as number | undefined,
     window: 1_000_000,
     files: new Map<string, { size: number; mtimeMs: number }>(),
+    /** 有正文的文件（fs.read 读得到）；交接文件没放正文时 fs.read 失败，像被别的插件的 fs hook 拒绝 */
+    texts: new Map<string, string>(),
+    /** fs.read 读过的路径（配置文件除外） */
+    reads: [] as string[],
     dirs: new Set<string>([HOME, CC_DIR, REPO, CWD, `${REPO}/docs`, `${REPO}/docs/work`]),
     config: o.config === undefined ? LOW_CONFIG : o.config,
     store: new Map<string, string>(),
@@ -139,6 +144,9 @@ function world(on: On, o: WorldOptions = {}) {
   })
   on('fs.read', (_, e) => {
     if (normalize(e.path) === CONFIG && w.config !== null) return { value: w.config }
+    w.reads.push(e.path)
+    const text = w.texts.get(normalize(e.path))
+    if (text !== undefined) return { value: text }
     throw new Error(`$.fs.read(${e.path}) failed: ENOENT`)
   })
   on('fs.write', (_, e) => {
@@ -220,7 +228,12 @@ function world(on: On, o: WorldOptions = {}) {
   function writeHandoff(path = HANDOVER, size = 6_842): void {
     w.files.set(path, { size, mtimeMs: clock.now() - 2 * MIN })
   }
-  return { w, clock, writeHandoff }
+  /** 刚写好、带正文的交接文件 */
+  function writeHandoffText(text: string, path = HANDOVER): void {
+    w.files.set(path, { size: text.length, mtimeMs: clock.now() - 2 * MIN })
+    w.texts.set(path, text)
+  }
+  return { w, clock, writeHandoff, writeHandoffText }
 }
 
 type W = ReturnType<typeof world>
@@ -1053,4 +1066,79 @@ test('action compact and the user\'s /clear runs first: the new conversation get
   w.submits[0]!.release()
   await clock.settle()
   expect(stored(x, NEW).job).toBeNull()
+})
+
+// ───────── 交接文件超长（PLAN §0 第 30 条） ─────────
+
+/** 越过 remind、写好给定正文的交接文件并登记；回合结束、/clear 完成、新对话的 SessionStart(clear) 返回什么 */
+async function handoffWith($: any, x: W, text: string | null): Promise<{ reg: any; ss: any }> {
+  await start($)
+  x.w.tokens = 36_500
+  await say($, 'Finish the upload state machine and rerun the acceptance tests.')
+  await turnStart($, T1)
+  x.w.tokens = 41_200
+  await tool($)
+  if (text === null) x.writeHandoff()
+  else x.writeHandoffText(text)
+  const reg = await registerTool($, HANDOVER)
+  await stop($)
+  await complete($, T1)
+  await x.clock.settle()
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  x.w.sid = NEW
+  x.w.tokens = undefined
+  x.w.commands[0]!.resolve()
+  await x.clock.settle()
+  const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  return { reg, ss }
+}
+
+test('oversize: a handoff file grown by a dated section per handoff is read once at registration; the new conversation is asked to tidy it before working', async ($, on) => {
+  const x = world(on)
+  const { reg, ss } = await handoffWith($, x, growingHandover(40))
+  expect(reg.result).toStartWith(`Handoff registered: "${HANDOVER}".`)
+  expect(x.w.reads).toEqual([HANDOVER])
+  expect(x.w.debug.some((l) => /^handoff file is about \d+k tokens, over handoff_max_tokens \(20k\)/.test(l))).toBe(true)
+  expect(ss.additionalContext?.length).toBe(1)
+  const text: string = ss.additionalContext![0]
+  expect(text).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(text).toContain('[AutoHandoff: tidy the handoff file first]')
+  expect(text.indexOf('tidy the handoff file first')).toBeGreaterThan(text.indexOf('Handoff file: "'))
+  // 续接照常提交一次，正文里没有整理段
+  expect(x.w.submits.length).toBe(1)
+  expect(x.w.submits[0]!.text).not.toContain('tidy')
+})
+
+test('oversize: a handoff file kept to the current state gets the plain start context', async ($, on) => {
+  const x = world(on)
+  const { ss } = await handoffWith($, x, growingHandover(4))
+  expect(x.w.reads).toEqual([HANDOVER])
+  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
+})
+
+test('oversize: the handoff file cannot be read at registration (another plugin denies it): still registered, no size check, logged', async ($, on) => {
+  const x = world(on)
+  const { reg, ss } = await handoffWith($, x, null)
+  expect(reg.result).toStartWith('Handoff registered:')
+  expect(x.w.reads).toEqual([HANDOVER])
+  // 测试 hook 抛错只会被跳过，落到底层「no implementation」：错误文字由不得测试定
+  expect(x.w.debug.some((l) => l.startsWith('could not read the handoff file to estimate its size: '))).toBe(true)
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
+})
+
+test('oversize: handoff_max_tokens 0 never reads the handoff file', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('handoff_max_tokens: 20000', 'handoff_max_tokens: 0') })
+  const { reg, ss } = await handoffWith($, x, growingHandover(40))
+  expect(reg.result).toStartWith('Handoff registered:')
+  expect(x.w.reads).toEqual([])
+  expect(ss.additionalContext![0]).not.toContain('tidy the handoff file')
+})
+
+test('oversize: a configuration file written before 4.1 (no handoff_max_tokens, no oversize section) gets the check at the default limit; status names the missing key', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('handoff_max_tokens: 20000\n', '') })
+  const { ss } = await handoffWith($, x, growingHandover(40))
+  expect(ss.additionalContext![0]).toContain('over the 20k limit')
+  await slash($, 'status')
+  expect(x.w.logs).toContain('  - missing settings (built-in defaults used): handoff_max_tokens')
 })
