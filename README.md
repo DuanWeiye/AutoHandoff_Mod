@@ -139,7 +139,9 @@ was started in (or, if that is the home folder, the working directory or the git
 reminder, and the first 8 characters of the session id, so that several conversations open in one project never
 share a file. The path stays the same for the whole handoff (later reminders, registering again after a cancel); the
 next conversation gets a new one when it hands off in turn. Started from the home folder with no project folder at
-all, the model is asked to put the file in the auto-memory folder instead.
+all, or when no project folder gives a path that passes the path rules below (a folder name with an apostrophe,
+parentheses, `#` or `~`, or a path over 512 characters), the model is asked to put the file in the auto-memory folder
+instead.
 
 The file is written from scratch every time and has to make sense on its own: the next conversation reads it, and
 only it, as the complete handoff. The model carries over what is still open from the handoff file its own
@@ -149,7 +151,8 @@ section per handoff, say) are updated the way the project does it; AutoHandoff n
 want to add `.autohandoff/` to the project's `.gitignore`. (The folder is not under `.claude/`: Claude Code
 asks for permission before every write there, whatever the permission rules say.) The tool answers immediately
 and never asks for permission. Only the main conversation can register; subagents and forks are refused.
-Registering again before the turn ends replaces the earlier registration.
+Registering again before the turn ends replaces the earlier registration; a refused attempt leaves the earlier one in
+effect, and the reply says so.
 
 The handoff file must be:
 
@@ -179,9 +182,11 @@ transcripts) is accepted.
 **Handoff file size.** The next conversation reads the whole handoff file, and Claude Code's Read tool stops at
 25,000 tokens per read. The reminders ask for about three quarters of `handoff_max_tokens` (15k by default). At
 registration AutoHandoff reads the file once and estimates its size the way the Read tool counts it (line-number
-prefix included; the estimate errs on the high side). A file above `handoff_max_tokens` is not registered: the
-model is told the estimate and the limit, shortens the file and registers again. This applies to any file the
-model registers, including a project's own `HANDOVER.md` if your custom prompts ask for that.
+prefix included; the estimate errs on the high side). A file above `handoff_max_tokens` is not registered. If it is
+the file AutoHandoff named, the model is told the estimate and the limit, shortens the file and registers again. Any
+other file (a project's own `HANDOVER.md`, say, if your custom prompts ask for that) is left alone: the model is told
+not to cut it and to write the handoff to the file AutoHandoff named instead. The estimate counts tokens, not lines;
+the Read tool also stops at 2,000 lines per read, which matters only for a file of very short lines.
 
 Subagents, background shells and monitors that are still running are not waited for: they keep running across the
 reset, and their reports arrive in the new conversation. The reminders ask the model to list them in the handoff file
@@ -295,7 +300,7 @@ handoff_max_tokens: 20000
 | `wait_minutes` | `60` | Give up if the turn has not ended this long after registering (1–1440). |
 | `urge_block` | `true` | Past `urge_at`, block the first attempt to end a turn without a handoff, once per turn. |
 | `remind_every_turn` | `true` | After the first reminder, add a short reminder to every later message until a handoff is registered. |
-| `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered, and the model is asked to shorten it. `0` turns the check off; otherwise at least 1000. |
+| `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered (see *Handoff file size*). `0` turns the check off; otherwise at least 2000. |
 
 Token values accept `300000`, `300_000` or `300,000`, from 1 to 10,000,000. If `remind_at < urge_at < compact_at` does
 not hold, all three use their defaults.

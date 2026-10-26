@@ -9,7 +9,7 @@
 | 文件 | 职责 |
 |---|---|
 | `hooks/core.ts` | 纯逻辑，不碰 `$`：配置解析与默认文件、模板展开、阈值、来源分类、路径规则、记录与状态转移 `transition(rec, ev, env) → {rec, fx}`、`/autohandoff` 输出 |
-| `hooks/prompts.ts` | 11 段内置提示词（英文）与它们在默认配置文件里的说明 |
+| `hooks/prompts.ts` | 10 段内置提示词（英文）与它们在默认配置文件里的说明 |
 | `hooks/register.ts` | 接线薄层：只把主对话事件（无 agentId/agent_id）送进 core；按 sid 读写记录；执行副作用；一切错误 catch 后放行 |
 | `types/autohandoff.d.ts` | `$.state` 的类型契约（plugin.json 的 `types`），只有 `autohandoff.queued` |
 | `commands/autohandoff.md` | 降级说明：mod 没跑时才会走到模型 |
@@ -45,13 +45,19 @@
 - **配置**：每次要用时重读（`readConfig`）；不存在时写一次默认文件（唯一的 `$.fs.write`）。`AUTOHANDOFF_CONFIG` 只认绝对路径，因为 `$.fs` 会把相对路径解析到工程目录下。
   配置目录：`CLAUDE_CONFIG_DIR` 优先；主目录取盘符形式的 USERPROFILE 优先（Git Bash 会把 HOME 设成 `/c/Users/x`，而 CC 用 `os.homedir()`），否则 HOME。
 - **本轮交接文件**（§0 第 30 条，4.1.0）：`Rec.note` 存本轮要写的路径，`withNote` 在第一次要用时（remind、urge、短提醒、Stop block）用
-  `handoffNotePath(dir, sid, now)` 生成并追加 `noteLine` 一句到这四种提醒末尾。dir 来自 register.ts 的 `noteDir`：root、cwd、repo 根的 realPath 依次过
-  `usableRoots`（与登记白名单同一规则），取第一个，按进程缓存（session.start 清掉）；都不可用时只给文件名，`noteLine` 改说放进自动记忆目录。
-  只有 submit、postTool、stop 三种事件带 `Env.note`（查不到就不带，提醒不加路径）。`clearLevels` 把各层与 note 一起清掉（afterReset、finish、
+  `pickHandoffNote(dirs, sid, now, windows)` 生成并追加 `noteLine` 一句到这四种提醒末尾。dirs 来自 register.ts 的 `noteDirs`：root、cwd、repo 根的 realPath
+  依次过 `usableRoots`（与登记白名单同一规则），按 cwd 缓存（cwd 变了重算；session.start 清掉）；`pickHandoffNote` 取第一个生成的完整路径能过
+  `checkPathText` 的（路径会原样进模型上下文，过不了的登记时也必然被拒），都不行就只给文件名，`noteLine` 改说放进自动记忆目录。
+  只有 submit、postTool、stop 三种事件带 `Env.note`；读工程目录出错时不带，提醒末尾改为泛指一句（`noteLine(undefined)`），这次不定路径。
+  /clear 搬迁时旧对话的记录 `note` 也清掉：那份文件是新对话续接用的，--resume 回旧对话再被提醒时不能覆盖它。`clearLevels` 把各层与 note 一起清掉（afterReset、finish、
   migrateRecord、sessionStart(clear/compact)、用量回落到 remind_at 以下、兜底压缩完成）；cancelTold 只退一层，不清 note，所以作废后重新登记仍用同一路径。
   本地时间用 `new Date(now)` 的本地分量（mod 运行时的时区即 CC 进程的时区；e2e clear 里生成的时刻与本机 JST 相差 26 s）。mod 不写这个文件，目录与文件由模型的 Write 工具建。
-- **超长退回**（§0 第 30 条）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，超过 `handoff_max_tokens` 就 deny（说明估算值、上限、
-  目标值），不动已有的 armed 登记（与其它 deny 一致）。读失败（估算缺省）照收。上限为 0 时不读文件。
+- **超长退回**（§0 第 30 条）：登记时路径通过后 `$.fs.read` 一次、`estimateReadTokens` 估大小，超过 `handoff_max_tokens` 就 deny（`oversizeText`：估算值、上限、
+  目标值；登记的是本轮路径时要求压短，否则要求别动该文件、另写到本轮路径），不动已有的 armed 登记（与其它 deny 一致），
+  但 deny 文案末尾说明「earlier registration … is still in effect」。读失败（估算缺省）照收。上限为 0 时不读文件。
+  只在登记时估一次；登记后再改大不复查（turnComplete 复查只看文件还在不在）。估算不数行：Read 默认一次读 2000 行，只有平均每行不到约 7 token 的文件
+  会在 token 上限之内先碰到行数上限，默认 20k 下极难碰到，写进了设置说明和 README。emoji、ZWJ 序列每个码点按 1.65 算，可能略低估，交接文件里很少见。
+  登记时 stat 与 read 之间有 TOCTOU（文件被换成指向工程外的链接或 FIFO）：能这么做的只有模型自己，后果只是泄露一个粗略大小或工具调用挂住，不加固。
   估算 = ASCII 字符数 / 3 + 非 ASCII 码点数 × 1.65 + 行数 × 3（行数 = 换行数 + 1，与 Read 显示的行数一致），向上取整。
   校准（2026-10-26，CC 2.1.310 的 Read 工具对整份文件报告的 token 数；单测 `calibration points` 只存字符构成）：
 
