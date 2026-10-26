@@ -1116,6 +1116,9 @@ test('handoff file to write: the reminder names a new file under the launch fold
   const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
   expect(ss.additionalContext![0]).toContain(`Handoff file: "${P}"`)
   expect(x.w.submits[0]!.text).toContain(`Handoff file: "${P}"`)
+  // 旧对话的记录不再留着这条路径：--resume 回去再被提醒时不会让它覆盖新对话续接用的那份
+  expect(stored(x, OLD).note).toBeNull()
+  expect(stored(x, NEW).note).toBeNull()
   x.w.submits[0]!.release()
   await x.clock.settle()
   // 新对话越过 remind：新时刻、新会话 ID
@@ -1139,13 +1142,40 @@ test('handoff file to write: started from the home folder (no usable project fol
   expect((await registerTool($, mem)).result).toStartWith(`Handoff registered: "${mem}".`)
 })
 
+test('handoff file to write: a launch folder whose path has characters the whitelist refuses is not put in the reminder; the memory folder is used', async ($, on) => {
+  const launch = '/home/user/Dropbox (Personal)/proj'
+  const x = world(on, { launch, repo: null })
+  x.w.dirs.add(launch)
+  const ptu = await reminded($, x)
+  const text: string = ptu.additionalContext![0]!
+  expect(text).not.toContain(launch)
+  const name = `_AUTOHANDOFF_${localStamp(x.clock.now())}_6f1c2b8e.md`
+  expect(text.endsWith(`a new file named "${name}" in the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), because AutoHandoff has no usable project folder path for it (Claude Code was started in the home folder or at the root of the file system, or the project folder's path has characters AutoHandoff does not accept). Register its full path.`)).toBe(true)
+  const mem = `${CC_DIR}/projects/-home-user-Dropbox--Personal--proj/memory/${name}`
+  x.writeHandoffText(NOTE_TEXT, mem)
+  expect((await registerTool($, mem)).result).toStartWith(`Handoff registered: "${mem}".`)
+})
+
+test('oversize: the project\'s own HANDOVER.md over the limit is not to be cut; the reply points to this round\'s handoff file', async ($, on) => {
+  const x = world(on)
+  await reminded($, x)
+  const P = notePath(x.clock.now())
+  x.writeHandoffText(growingHandover(40))
+  const big = await registerTool($, HANDOVER)
+  expect(big.deny).toContain(`Do not delete from or shorten "${HANDOVER}" for this`)
+  expect(big.deny).toContain(`Instead write the handoff as a new file of about 15k tokens that makes sense on its own, at "${P}".`)
+  expect(stored(x, OLD).job).toBeNull()
+  x.writeHandoffText(NOTE_TEXT, P)
+  expect((await registerTool($, P)).result).toStartWith(`Handoff registered: "${P}".`)
+})
+
 test('oversize: a handoff file over handoff_max_tokens is read once and refused with the estimate; shortened, it is registered', async ($, on) => {
   const x = world(on)
   await reminded($, x)
   const P = notePath(x.clock.now())
   x.writeHandoffText(growingHandover(40), P)
   const big = await registerTool($, P)
-  expect(big.deny).toMatch(/^Not registered: the handoff file is about \d+k tokens by AutoHandoff's estimate, over the 20k limit \(handoff_max_tokens\)\. .* shorten it to about 15k tokens/)
+  expect(big.deny).toMatch(/^Not registered: the handoff file is about \d+k tokens by AutoHandoff's estimate, over the 20k limit \(handoff_max_tokens\), .* Shorten it to about 15k tokens\./)
   expect(x.w.reads).toEqual([P])
   expect(stored(x, OLD).job).toBeNull()
   x.writeHandoffText(NOTE_TEXT, P)

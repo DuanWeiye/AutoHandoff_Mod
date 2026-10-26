@@ -61,10 +61,10 @@ let lowVersionWarned = false
  */
 let clearingFrom: { sid: string; t: number } | null = null
 /**
- * 本轮交接文件放在哪个工程根目录下（core.handoffNotePath 的 dir）；session.start 时清掉重算。
- * value 为 undefined 表示没有可用的（从主目录或文件系统根启动）
+ * 本轮交接文件的候选工程根目录（core.pickHandoffNote 的 dirs），按算的时候的 cwd 缓存：cwd 变了就重算；
+ * session.start 时清掉。dirs 为空表示没有可用的（从主目录或文件系统根启动）
  */
-let noteBase: { value: string | undefined } | null = null
+let noteBase: { cwd: string; dirs: string[]; windows: boolean } | null = null
 /** AUTOHANDOFF_CONFIG 是相对路径的提示已记过 */
 let relativeConfigWarned = false
 /** 记录的读-改-写串行执行（`$.store` 的 get/set 不是原子的；同一进程里的事件会交错） */
@@ -276,7 +276,8 @@ async function adopt($: Api, sid: string, now: number, hint: string | undefined)
     try {
       await $.store.set(storeKey(sid), moved)
       // 旧对话的记录只留开关（--resume 回去时恢复）；job、回合、作废说明都随对话搬走或作废
-      await $.store.set(storeKey(old), { ...rec, job: null, fallback: null, turn: null, tell: null, t: now })
+      // note 也清掉：那份文件正是新对话续接用的，--resume 回旧对话再被提醒时不能让它覆盖（会生成新路径）
+      await $.store.set(storeKey(old), { ...rec, job: null, fallback: null, turn: null, tell: null, note: null, t: now })
       if (clearingFrom?.sid === old) clearingFrom = null
     } catch (err) {
       // 没存下：旧记录原样留着，模块变量也留着，下一个事件（SessionStart(clear) 等）再搬一次
@@ -363,9 +364,9 @@ async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: Dispatc
     const base = rec ?? newRecord(now)
     const ev = await make(base)
     // 只有可能送提醒的事件才要本轮交接文件路径的材料
-    // （查不到工程目录时不给，提醒末尾就不加路径，免得指错地方）
+    // （读工程目录出错时不给，提醒末尾只泛指放在哪类地方，免得指错）
     const wants = ev.kind === 'submit' || ev.kind === 'postTool' || ev.kind === 'stop'
-    const note = wants ? await safely(async () => ({ dir: await noteDir($), sid })) : undefined
+    const note = wants ? await safely(async () => ({ ...(await noteDirs($)), sid })) : undefined
     const step = transition(base, ev, { cfg, now, note })
     // 没有记录且转移后仍是空白记录（开关未动、没收到过人工输入……）就不写，免得每个会话都在 store 里留一份
     const blank = fresh && sameRec(step.rec, newRecord(now))
@@ -541,20 +542,23 @@ async function checkHandoffPath($: Api, raw: unknown, now: number, freshMinutes:
 }
 
 /**
- * 本轮交接文件所在的工程根目录：启动目录（`$.session.root()`）优先，其次 cwd、git 根；都按登记时的白名单规则过
- * usableRoots（主目录本身、文件系统根不算），所以生成的路径一定能登记。都不可用时为 undefined。按进程缓存。
+ * 本轮交接文件的候选工程根目录：启动目录（`$.session.root()`）优先，其次 cwd、git 根；都按登记时的白名单规则过
+ * usableRoots（主目录本身、文件系统根不算）。完整路径还要过文本白名单，由 core.pickHandoffNote 逐个试，都不行就退到记忆目录。
+ * 按 cwd 缓存（postTool 很频繁）：模型 cd 到别处后，下一轮按新的 cwd 重算。已经给出的本轮路径（Rec.note）不跟着变：
+ * 只有启动目录不可用、路径落在旧 cwd 下时，cd 走后登记会被判在工程外，模型换个允许的地方再登记即可。
  */
-async function noteDir($: Api): Promise<string | undefined> {
-  if (noteBase) return noteBase.value
+async function noteDirs($: Api): Promise<{ dirs: string[]; windows: boolean }> {
   const cwd = await $.session.cwd()
+  if (noteBase?.cwd === cwd) return noteBase
+  const windows = looksWindows(cwd)
   const repo = await safely(() => $.session.repo())
-  const [value] = usableRoots(
+  const dirs = usableRoots(
     [await realPathOf($, await safely(() => $.session.root())), await realPathOf($, cwd), await realPathOf($, repo?.root)],
     await realPathOf($, homeDir(await envVars($))),
-    looksWindows(cwd),
+    windows,
   )
-  noteBase = { value }
-  return value
+  noteBase = { cwd, dirs, windows }
+  return noteBase
 }
 
 /**

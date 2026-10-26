@@ -88,8 +88,11 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   handoff_max_tokens: 20_000,
 })
 
-/** handoff_max_tokens 不为 0 时的下限：再小就成了「什么交接文件都算超长」，提示词里的 k 值也会是 0 */
-export const HANDOFF_MAX_MIN = 1000
+/**
+ * handoff_max_tokens 不为 0 时的下限：再小就成了「什么交接文件都算超长」；
+ * 提示词里的预算是上限的 3/4、按千向下取整，下限 2000 时最少也是「about 1k」，不会出现 0k
+ */
+export const HANDOFF_MAX_MIN = 2000
 
 // 默认配置文件里每项设置上方的说明
 const SETTING_NOTES: Record<keyof Settings, string> = {
@@ -109,7 +112,7 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
   remind_every_turn:
     'After the first reminder, add a short reminder to every later message of the main conversation until a handoff is registered.',
   handoff_max_tokens:
-    'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 1000.',
+    'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 2000. The estimate counts tokens, not lines; the Read tool also stops at 2000 lines per read, which matters only for a file of very short lines.',
 }
 
 export function defaultConfig(): Config {
@@ -438,14 +441,27 @@ export function startContextText(cfg: Config, file: string, action: Action): str
 
 /**
  * 本轮交接要写的交接文件（PLAN §0 第 30 条）：`<dir>/.autohandoff/_AUTOHANDOFF_<本地日期>_<本地时间>_<会话 ID 前 8 位>.md`。
- * dir 是第一个可用的工程根目录（启动目录优先，见 register.ts 的 noteDir）；没有可用的（从主目录或文件系统根启动）时只给文件名，
- * 由提醒里的那句话让模型放进自动记忆目录。会话 ID 段让同一工程同时开着的几个对话不撞名。
+ * dir 缺省时只给文件名（放进自动记忆目录）。会话 ID 段让同一工程同时开着的几个对话不撞名。选哪个 dir 见 pickHandoffNote。
  */
 export function handoffNotePath(dir: string | undefined, sid: string, now: number): string {
   const name = `_AUTOHANDOFF_${localStamp(now)}_${sid.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'session'}.md`
   if (dir === undefined) return name
   const sep = looksWindows(dir) ? '\\' : '/'
   return `${trimSep(dir)}${sep}.autohandoff${sep}${name}`
+}
+
+/**
+ * 从候选工程根目录（启动目录、cwd、git 根的 realPath，已过 usableRoots）里挑第一个能用的，生成本轮交接文件路径。
+ * 生成的完整路径要过登记时的同一套文本白名单（checkPathText）：路径会原样写进模型上下文，
+ * 而且过不了的路径登记时必然被拒（目录名带 ' ( # ~、超过 MAX_PATH_LENGTH、UNC 路径、含引号或换行……）。
+ * 都过不了（或没有候选）时只给文件名，让模型放进自动记忆目录。windows 与登记时一样按 cwd 判断。
+ */
+export function pickHandoffNote(dirs: readonly string[], sid: string, now: number, windows: boolean): string {
+  for (const dir of dirs) {
+    const path = handoffNotePath(dir, sid, now)
+    if (isAbsolutePath(path) && checkPathText(path, windows).ok) return path
+  }
+  return handoffNotePath(undefined, sid, now)
 }
 
 /** 运行 Claude Code 的机器的本地时间，YYYYMMDD_HHMMSS */
@@ -455,12 +471,22 @@ export function localStamp(now: number): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 
-/** remind、remind_short、urge、urge_block 末尾由代码追加的一句：本轮要写的交接文件（同 handoffFileLine，路径不进模板） */
-export function noteLine(note: string): string {
+/**
+ * remind、remind_short、urge、urge_block 末尾由代码追加的一句：本轮要写的交接文件（同 handoffFileLine，路径不进模板）。
+ * note 为 undefined：这次没拿到生成路径的材料（读工程目录出错），只说放在哪类地方，提示词里「末尾给的路径」不至于落空。
+ */
+export function noteLine(note: string | undefined): string {
+  if (note === undefined) {
+    return (
+      'Handoff file to write: a new file in the project folder or the Claude Code auto-memory folder ' +
+      '(<config dir>/projects/<project>/memory/); AutoHandoff could not work out a path this time. Register its full path.'
+    )
+  }
   if (isAbsolutePath(note)) return `Handoff file to write: "${note}" (a new file for this handoff; register this path).`
   return (
     `Handoff file to write: a new file named "${note}" in the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ` +
-    'because Claude Code was started in the home folder or at the root of the file system, where AutoHandoff accepts no handoff file. Register its full path.'
+    'because AutoHandoff has no usable project folder path for it (Claude Code was started in the home folder or at the root ' +
+    'of the file system, or the project folder\'s path has characters AutoHandoff does not accept). Register its full path.'
   )
 }
 
@@ -486,10 +512,36 @@ function handoffVars(s: Settings): Record<string, string | number> {
   }
 }
 
+/**
+ * 超长退回的说明（接在「Not registered: 」后面）。按登记的是不是本轮 mod 给的路径分开说：
+ * 是 → 压短再登记；不是（多半是工程自己的 HANDOVER.md 之类）→ 不许为此删改它，另写到本轮的路径再登记，
+ * 免得模型去截断用户自己的文档、丢内容。note 为 null（这轮还没给过路径）时只说另写一份新文件。
+ */
+export function oversizeText(file: string, fileTokens: number, note: string | null, s: Settings): string {
+  const size =
+    `the handoff file is about ${Math.ceil(fileTokens / 1000)}k tokens by AutoHandoff's estimate, over the ${kTokens(s.handoff_max_tokens)}k limit ` +
+    '(handoff_max_tokens), and the next conversation reads all of it.'
+  const keep =
+    'Keep what is needed to continue (work in progress, next steps, questions waiting for the user, running subagents or background tasks, ' +
+    "standing agreements) and leave details to the project's own documents"
+  const target = `about ${kTokens(handoffTarget(s))}k tokens`
+  const windows = looksWindows(file)
+  // 只给了文件名（放进记忆目录）时按文件名比
+  const ours =
+    note !== null &&
+    (isAbsolutePath(note) ? forCompare(note, windows) === forCompare(file, windows) : forCompare(file, windows).endsWith(forCompare(`/${note}`, windows)))
+  if (ours) return `${size} Shorten it to ${target}. ${keep}, without cutting those documents for this. Then call the tool again.`
+  const where = note === null ? 'in the project folder' : isAbsolutePath(note) ? `at "${note}"` : `named "${note}" in the Claude Code auto-memory folder`
+  return (
+    `${size} Do not delete from or shorten "${file}" for this; it may be one of the project's own documents. ` +
+    `Instead write the handoff as a new file of ${target} that makes sense on its own, ${where}. ${keep}. Then call the tool with that file's path.`
+  )
+}
+
 // ── 交接文件的 token 估算 ──
 // 只能近似（没有分词器，也不该为此发请求）。对象是 Claude Code 的 Read 工具给模型看的内容：每行带行号前缀。
 // 校准（2026-10-26，Read 工具报告的整份文件 token 数，见 docs/NOTES.zh.md）：中文为主的交接文档每个非 ASCII 字符约 1.6 token，
-// ASCII 约 2.9–3.2 字符一个 token，行号前缀每行约 2 token。常数都往高取：宁可早提示整理，不要漏掉。
+// ASCII 约 2.9–3.2 字符一个 token，行号前缀每行约 2 token。常数都往高取：宁可早退回，不要漏掉。
 const ASCII_CHARS_PER_TOKEN = 3
 const NON_ASCII_TOKENS_PER_CHAR = 1.65
 const LINE_PREFIX_TOKENS = 3
@@ -992,10 +1044,11 @@ export interface Env {
   cfg: Config
   now: number
   /**
-   * 生成本轮交接文件路径的材料（handoffNotePath）：dir 是可用的工程根目录（没有时缺省），sid 是当前会话 ID。
-   * 只有可能送提醒的事件（submit、postTool、stop）带；没有时提醒末尾不加路径
+   * 生成本轮交接文件路径的材料（pickHandoffNote）：dirs 是候选工程根目录（按优先顺序，已过 usableRoots，可以为空），
+   * sid 是当前会话 ID，windows 按 cwd 判断（与登记时相同）。
+   * 只有可能送提醒的事件（submit、postTool、stop）带；没带时提醒末尾只说放在哪类地方（noteLine(undefined)）
    */
-  note?: { dir?: string; sid: string }
+  note?: { dirs: readonly string[]; sid: string; windows: boolean }
 }
 
 export interface Step {
@@ -1155,10 +1208,10 @@ function clearLevels(r: Rec): void {
   r.note = null
 }
 
-/** 提醒正文末尾追加本轮要写的交接文件；路径第一次用到时生成（env 没带材料时不加） */
+/** 提醒正文末尾追加本轮要写的交接文件；路径第一次用到时生成（env 没带材料时这次不生成，只给一句泛指的） */
 function withNote(r: Rec, env: Env, text: string): string {
-  if (r.note === null && env.note) r.note = handoffNotePath(env.note.dir, env.note.sid, env.now)
-  return r.note === null ? text : `${text}\n\n${noteLine(r.note)}`
+  if (r.note === null && env.note) r.note = pickHandoffNote(env.note.dirs, env.note.sid, env.now, env.note.windows)
+  return `${text}\n\n${noteLine(r.note ?? undefined)}`
 }
 
 /** 送提醒：先送挂着的作废说明（这次就不再送提醒）；否则按阈值送完整提醒；allowShort 时补每回合短提醒。 */
@@ -1392,7 +1445,9 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     }
     case 'register': {
       const deny = (why: string): void => {
-        out.reply = `Not registered: ${why}`
+        // 已有的登记不因这次被拒而作废（总比没有交接好），要说清楚，免得模型以为什么都没登记
+        const kept = r.job?.stage === 'armed' && ev.agentId === undefined ? ` Your earlier registration of "${r.job.file}" is still in effect.` : ''
+        out.reply = `Not registered: ${why}${kept}`
         out.accepted = false
         fx.push({ type: 'log', text: `registration refused: ${why}`, debug: true })
       }
@@ -1409,14 +1464,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       }
       if (!ev.verdict.ok) return deny(`${ev.verdict.why}.`)
       // 超长退回（PLAN §0 第 30 条）：新对话要整份读完，Read 一次只读 25000 token；估算读不到（undefined）时照收
-      if (isOversize(ev.fileTokens, s)) {
-        return deny(
-          `the handoff file is about ${Math.ceil((ev.fileTokens ?? 0) / 1000)}k tokens by AutoHandoff's estimate, over the ${kTokens(s.handoff_max_tokens)}k limit ` +
-            `(handoff_max_tokens). The next conversation reads all of it, so shorten it to about ${kTokens(handoffTarget(s))}k tokens: keep what is needed ` +
-            'to continue (work in progress, next steps, questions waiting for the user, running subagents or background tasks, standing agreements) ' +
-            "and leave details to the project's own documents; then call the tool again.",
-        )
-      }
+      if (isOversize(ev.fileTokens, s)) return deny(oversizeText(ev.verdict.value, ev.fileTokens ?? 0, r.note, s))
       const file = ev.verdict.value
       r.job = {
         file,
