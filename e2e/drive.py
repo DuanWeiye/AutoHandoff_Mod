@@ -1299,6 +1299,19 @@ def scenario_budget(work):
     return oversize_run(work, "budget", False)
 
 
+def approve_tidy(s, approved):
+    """整理交接文件时模型常用复合命令（`{ printf …; sed …; } > docs/…`），不在测试 settings 的放行清单里，会弹权限框。
+    只批准跟交接文件有关的命令（框里出现 HANDOVER、没有 rm），别的框不碰（场景会因超时失败，看得出来）。"""
+    pane = s.pane()
+    if "Do you want to proceed?" not in pane:
+        return
+    box = pane[pane.rfind("Bash command"):] if "Bash command" in pane else pane
+    if "HANDOVER" in box and not re.search(r"\brm\b", box):
+        s.keys("1")
+        approved.append(1)
+        time.sleep(1.5)
+
+
 def oversize_run(work, name, strict):
     reset_project(work)
     c = Check(f"{name}: " + ("an oversize handoff file is registered, and the next conversation is asked to tidy it" if strict
@@ -1308,12 +1321,24 @@ def oversize_run(work, name, strict):
     with open(handover, "w") as f:
         f.write(history)
     s = Session(work, name, config=os.path.join(work, f"autohandoff-{name}.md"))
+    approved = []
+
+    def until(cond):
+        def f():
+            approve_tidy(s, approved)
+            return cond()
+        return f
     try:
         s.send(CLEAR_TASK)
         s.wait(lambda: s.has("remind sent at"), 180, "the remind")
-        s.wait(lambda: s.has("handoff finished") or s.has("handoff cancelled"), 300, "the reset and resume")
-        s.wait(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1]), 400, "the resumed turn to end")
-        s.wait_idle()
+        s.wait(until(lambda: s.has("handoff finished") or s.has("handoff cancelled")), 300, "the reset and resume")
+        s.wait(until(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1])), 400, "the resumed turn to end")
+        # 整理可能跨几个回合：等到空闲且没有待批的框
+        for _ in range(20):
+            s.wait_idle()
+            approve_tidy(s, approved)
+            if "Do you want to proceed?" not in s.pane():
+                break
         a = s.audit()
         sids = s.sids()
         new = sids[1] if len(sids) > 1 else None
@@ -1345,7 +1370,8 @@ def oversize_run(work, name, strict):
                 sizes.append(None)
         c.note(f"history before the session: about {est_tokens(history)} tokens; registered: {over[0] if over else '-'}; "
                f"after the new conversation: about {est_tokens(after)} tokens ({after.count(chr(10)) + 1} lines); "
-               f"other files in docs/: {archives or 'none'} {sizes}; work finished (notes a/b/c): {done}")
+               f"other files in docs/: {archives or 'none'} {sizes}; work finished (notes a/b/c): {done}; "
+               f"permission prompts approved by the driver: {len(approved)}")
         c.note(" | ".join(x for x in a if x.startswith(("remind sent", "handoff", "turn ended", "record moved", "registration", "could not"))))
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])

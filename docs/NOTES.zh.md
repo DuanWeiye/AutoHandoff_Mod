@@ -114,6 +114,9 @@
   - 测试会话会加载真实的 `~/.claude/CLAUDE.md`，靠模型服从度的场景（chain、urge、interject）会受影响。
   - 模拟「不理提醒的模型」用把 remind/urge 换成「不必动作」的配置（fallback、urge 场景），测的是插件机制不是服从度；chain 场景把 start_context 换成中性说明，
     让 (b) 守卫真正被触发（断言至少拒绝一次）。
+  - `oversize`/`budget`（4.1.0）：交接文件预先攒了 30 节已完结的历史（约 7.9k token），上限压到 4000。`oversize` 的 remind/urge 用 4.1 之前那种不提大小、
+    按习惯在顶上加一节的写法（模拟没合并新提示词的旧配置），保证登记时超长，断言新对话收到整理段；`budget` 用内置提示词，只观察模型守不守预算。
+    模型整理时常用复合命令（`{ printf …; sed …; } > docs/…`、`cd docs && … && git -C ..`），放行清单管不到，驱动只批准框里出现 HANDOVER、不含 rm 的那些。
   - `fault_proxy.py`：本地反代注入 API 错误，`after:<工具名>:<mode>` 只在交回该工具结果的那个请求上注入一次，OAuth 照常。
 
 ## 5. 未验证 / 待上机

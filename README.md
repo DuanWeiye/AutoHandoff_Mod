@@ -383,7 +383,7 @@ python3 e2e/drive.py <work dir> --cleanup-only       # after --keep
 ```
 
 Scenarios: `clear draft dialog deny interject notify cmp slash print compact fallback ctype agentdialog reload restart
-esc apierr subreg urge userclear chain` (all by default). Each session runs in a separate tmux server (`SOCK`, default
+esc apierr subreg urge userclear chain oversize budget` (all by default). Each session runs in a separate tmux server (`SOCK`, default
 `ahmod`) with `--plugin-dir` pointing at this checkout and `--settings` that disables an installed
 `autohandoff@autohandoff`; the configuration comes from the work directory through `AUTOHANDOFF_CONFIG`. Afterwards
 the driver kills the tmux server and removes exactly what the test sessions left under `~/.claude` (their project
