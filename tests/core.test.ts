@@ -34,6 +34,7 @@ import {
   promptVars,
   reachedCompactAt,
   renderPrompt,
+  resumeGuardText,
   resumeText,
   startContextText,
   storeKey,
@@ -93,6 +94,7 @@ test('config: a user-edited file with separators, overrides and partial prompts'
     urge_block: false,
     remind_every_turn: true,
     handoff_max_tokens: 30_000,
+    resume_guard_tokens: 80_000,
   })
   expect(cfg.prompts.remind).toBe(
     '[AutoHandoff] Context is at {used_k}k (first line {remind_k}k).\nFinish the current edit, update docs/work/HANDOVER.md, then call {tool}.\nReset happens with {action}.',
@@ -139,7 +141,7 @@ test('config: missing settings keys and unknown keys are reported', () => {
   expect(problems).toEqual([
     'unknown setting "remind_every_turns" (line 4) ignored',
     'settings line 5 is not "key: value"; ignored: this line is prose',
-    'missing settings (built-in defaults used): default_on, urge_at, compact_at, action, fresh_minutes, wait_minutes, urge_block, remind_every_turn, handoff_max_tokens',
+    'missing settings (built-in defaults used): default_on, urge_at, compact_at, action, fresh_minutes, wait_minutes, urge_block, remind_every_turn, handoff_max_tokens, resume_guard_tokens',
   ])
 })
 
@@ -524,6 +526,65 @@ test('records: store key, expiry, loading and migration across /clear', () => {
   expect(moved).toEqual({ ...rec, levels: { remind: false, urge: false }, tell: null, fallbackFails: 0, fallbackHeld: false, turn: null, t: NOW + 1000 })
 })
 
+test('records: a record stored by 4.1.0 (no resume time or growth base) loads with both unknown; /clear clears the guard with its base', () => {
+  // 4.1.0 存下的、刚续接的对话的记录（JSON 原样，没有 resumedAt / resumedTokens 两项）
+  const stored41 = {
+    v: 1,
+    on: true,
+    human: true,
+    teammate: false,
+    levels: { remind: false, urge: false },
+    note: null,
+    job: null,
+    fallback: null,
+    fallbackFails: 0,
+    fallbackHeld: false,
+    windowWarned: false,
+    resumed: true,
+    seq: 7,
+    tell: null,
+    turn: { id: 'f0b6c7a2-6d1e-4c2a-9a51-1f3e0c9b7d10', stopSeen: false, blocked: false },
+    t: NOW - 20 * MIN,
+  }
+  const rec = loadRecord(JSON.parse(JSON.stringify(stored41)))!
+  expect(rec.resumed).toBe(true)
+  expect(rec.resumedAt).toBe(null)
+  expect(rec.resumedTokens).toBe(null)
+  // 字段齐全的新记录原样读回（store 比较用 JSON，字段顺序也要一致）
+  const fresh = { ...newRecord(NOW), on: true, human: true, resumed: true, resumedAt: NOW - 3 * MIN, resumedTokens: 38_400 }
+  expect(JSON.stringify(loadRecord(JSON.parse(JSON.stringify(fresh))))).toBe(JSON.stringify(fresh))
+  // 用户自己 /clear：守卫连同续接时刻、基准一起清掉
+  const moved = migrateRecord(fresh, NOW)
+  expect([moved.resumed, moved.resumedAt, moved.resumedTokens]).toEqual([false, null, null])
+})
+
+test('chain guard reply: how long ago, how much the context grew, and when registering works again', () => {
+  const s = { ...DEFAULT_SETTINGS, remind_at: 400_000, urge_at: 450_000 }
+  const r = { resumedAt: NOW - 47 * MIN, resumedTokens: 38_400 }
+  expect(resumeGuardText(r, 121_300, s, NOW)).toBe(
+    'this conversation was continued from a handoff file 47 minutes ago and its context has grown only 82k since (121k now). ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+  )
+  // 几小时之前续接、读不到用量
+  expect(resumeGuardText(r, undefined, s, NOW + 3 * 60 * MIN)).toBe(
+    'this conversation was continued from a handoff file about 4 hours ago, and its context usage cannot be read right now. ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+  )
+  // 刚续接、基准就是这次的用量
+  expect(resumeGuardText({ resumedAt: NOW - 20_000, resumedTokens: 41_000 }, 41_000, s, NOW)).toStartWith(
+    'this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (41k now).',
+  )
+  // resume_guard_tokens 为 0：不提增量
+  expect(resumeGuardText(r, 250_000, { ...s, resume_guard_tokens: 0 }, NOW - 46 * MIN)).toBe(
+    'this conversation was continued from a handoff file 1 minute ago and its context (250k) is below 400k. ' +
+      'Carry on with the work the handoff file describes; registering works again once the context passes 400k or the user sends a message.',
+  )
+  // 续接时刻不知道（4.1.0 存下的记录）：不说多久以前
+  expect(resumeGuardText({ resumedAt: null, resumedTokens: null }, undefined, s, NOW)).toStartWith(
+    'this conversation was continued from a handoff file, and its context usage cannot be read right now.',
+  )
+})
+
 test('version: minimum 2.1.304', () => {
   expect(versionAtLeast('2.1.310')).toBe(true)
   expect(versionAtLeast('2.1.304')).toBe(true)
@@ -556,6 +617,24 @@ test('handoff size: handoff_max_tokens accepts 0 (off) and 2000 or more; smaller
   const text = defaultConfigText()
   expect(text).toContain('handoff_max_tokens: 20000')
   expect(text).toContain('{handoff_note}')
+})
+
+test('config: resume_guard_tokens accepts 0 (growth condition off); a file written by 4.1.0 without it gets the default and a note', () => {
+  const withGuard = (v: string) => parseConfig(defaultConfigText().replace('resume_guard_tokens: 100000', `resume_guard_tokens: ${v}`))
+  expect(withGuard('0').cfg.settings.resume_guard_tokens).toBe(0)
+  expect(withGuard('0').problems).toEqual([])
+  expect(withGuard('60,000').cfg.settings.resume_guard_tokens).toBe(60_000)
+  const words = withGuard('100k')
+  expect(words.cfg.settings.resume_guard_tokens).toBe(100_000)
+  expect(words.problems).toEqual(['resume_guard_tokens should be a whole number, got "100k"; using the default (100000)'])
+  // 生成的默认文件写了这一项和说明
+  const text = defaultConfigText()
+  expect(text).toContain('\nresume_guard_tokens: 100000\n')
+  expect(text).toContain('does not accept a new handoff until its context has grown by this many tokens since the resume')
+  // 4.1.0 生成的配置文件（没有这一行）：用默认值，status 里列出来
+  const old = parseConfig(text.replace(/<!-- A conversation that AutoHandoff has just continued[^]*?-->\nresume_guard_tokens: 100000\n/, ''))
+  expect(old.cfg.settings.resume_guard_tokens).toBe(100_000)
+  expect(old.problems).toEqual(['missing settings (built-in defaults used): resume_guard_tokens'])
 })
 
 test('handoff size: the estimate counts ASCII, other characters and the line-number prefix of the Read tool', () => {

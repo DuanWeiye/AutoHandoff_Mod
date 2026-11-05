@@ -930,35 +930,44 @@ function resumed(cfg = defaultConfig()) {
   return run(migrateRecord(rec, NOW), [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: cfg.settings.action }, { kind: 'resumeDone', seq }], cfg).rec
 }
 
-test('chain guard: a conversation just continued from a handoff refuses to register until it passes remind_at or the user writes', () => {
+test('chain guard: a conversation just continued from a handoff refuses to register until its context grows by resume_guard_tokens, passes remind_at, or the user writes', () => {
   const r = resumed()
-  expect(r.resumed).toBe(true)
+  expect([r.resumed, r.resumedAt, r.resumedTokens]).toEqual([true, NOW, null])
   expect(r.job).toBe(null)
-  const REASON =
-    'Not registered: this conversation has just been continued from a handoff file and its context is below the first threshold (300k). ' +
-    'Carry on with the work the handoff file describes instead of handing off again; registering works again once context usage passes 300k or the user sends a message.'
-  // 续接回合里模型照着交接文件里的「继续交接」又去登记：拒绝
-  const a = run(r, [{ kind: 'turnStart', turnId: T2 }, { kind: 'postTool', tokens: 61_000 }, { kind: 'register', verdict: FILE_OK, tokens: 63_000 }])
-  expect(a.steps[2]!.reply).toBe(REASON)
+  // 续接回合：第一次响应之后的 PostToolUse 给出基准；模型照着交接文件里的「继续交接」又去登记：拒绝
+  const a = run(r, [
+    [{ kind: 'turnStart', turnId: T2 }, NOW + 1_000],
+    [{ kind: 'postTool', tokens: 61_000 }, NOW + 20_000],
+    [{ kind: 'register', verdict: FILE_OK, tokens: 63_000 }, NOW + 40_000],
+  ])
+  expect(a.steps[1]!.rec.resumedTokens).toBe(61_000)
+  expect(a.steps[2]!.reply).toBe(
+    'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 2k since (63k now). ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 300k, or the user sends a message.',
+  )
   expect(a.steps[2]!.accepted).toBe(false)
   expect(a.rec.job).toBe(null)
   // 读不到用量时也拒绝（宁可不交接）
-  expect(run(r, [{ kind: 'register', verdict: FILE_OK }]).steps[0]!.reply).toBe(REASON)
-  // 任务通知、引擎 meta 消息不解除
-  const notes = run(r, [
+  expect(run(a.rec, [{ kind: 'register', verdict: FILE_OK }]).steps[0]!.reply).toStartWith(
+    'Not registered: this conversation was continued from a handoff file less than a minute ago, and its context usage cannot be read right now.',
+  )
+  // 任务通知、会话间消息、引擎 meta 消息不解除
+  const notes = run(a.rec, [
     { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 64_000 },
+    { kind: 'submit', origin: { kind: 'peer-send-message' }, tokens: 64_000 },
     { kind: 'submit', origin: { kind: 'unclassified' }, isMeta: true, tokens: 64_000 },
     { kind: 'register', verdict: FILE_OK, tokens: 64_000 },
   ])
-  expect(notes.steps[2]!.accepted).toBe(false)
-  // 人工消息解除
-  const human = run(r, [{ kind: 'submit', origin: COMPOSER, tokens: 64_000 }, { kind: 'register', verdict: FILE_OK, tokens: 64_000 }])
-  expect(human.rec.resumed).toBe(false)
+  expect(notes.steps[3]!.accepted).toBe(false)
+  expect(notes.rec.resumedTokens).toBe(61_000)
+  // 人工消息解除，续接时刻与基准一起清掉
+  const human = run(a.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 64_000 }, { kind: 'register', verdict: FILE_OK, tokens: 64_000 }])
+  expect([human.steps[0]!.rec.resumed, human.steps[0]!.rec.resumedAt, human.steps[0]!.rec.resumedTokens]).toEqual([false, null, null])
   expect(human.steps[1]!.accepted).toBe(true)
-  // 越过 remind_at 解除：送了 remind 之后登记照常受理
+  // 越过 remind_at 解除（这里第一个带用量的事件就在 remind_at 之上，增量是 0）：送了 remind 之后登记照常受理
   const big = run(r, [{ kind: 'turnStart', turnId: T2 }, { kind: 'postTool', tokens: 305_000 }, { kind: 'register', verdict: FILE_OK, tokens: 306_000 }])
   expect(contexts(big.steps[1]!.fx)[0]).toContain('[AutoHandoff: reminder]')
-  expect(big.rec.resumed).toBe(false)
+  expect([big.rec.resumed, big.rec.resumedTokens]).toEqual([false, null])
   expect(big.steps[2]!.accepted).toBe(true)
   // 登记时用量已过 remind_at（提醒还没来得及送）也受理
   expect(run(r, [{ kind: 'register', verdict: FILE_OK, tokens: 301_000 }]).steps[0]!.accepted).toBe(true)
@@ -967,9 +976,130 @@ test('chain guard: a conversation just continued from a handoff refuses to regis
   // 用户在重置期间发过消息（接手了）：不挡
   const { rec, seq } = clearing()
   const took = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_400 }, { kind: 'resetDone', seq }])
-  expect(took.rec.resumed).toBe(false)
-  // 用户自己 /clear 出来的新对话不带这个标记
-  expect(migrateRecord({ ...r, resumed: true }, NOW).resumed).toBe(false)
+  expect([took.rec.resumed, took.rec.resumedAt, took.rec.resumedTokens]).toEqual([false, null, null])
+  // 用户自己 /clear 出来的新对话不带这个标记，基准也不带过去
+  expect(migrateRecord({ ...a.rec }, NOW).resumed).toBe(false)
+  expect(migrateRecord({ ...a.rec }, NOW).resumedTokens).toBe(null)
+})
+
+test('chain guard: the first registration after the resume, before any other usage reading, becomes the growth base and is refused', () => {
+  const r = resumed()
+  // 续接回合里模型第一件事就是登记（登记工具由 hook 直接作答，不触发 PostToolUse，之前没有带用量的事件）
+  const first = run(r, [[{ kind: 'register', verdict: FILE_OK, tokens: 41_000 }, NOW + 30_000]])
+  expect(first.steps[0]!.accepted).toBe(false)
+  expect(first.steps[0]!.reply).toStartWith(
+    'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (41k now).',
+  )
+  expect(first.rec.resumedTokens).toBe(41_000)
+  // 基准不因之后的登记而前移：从 41k 涨够 100k 才受理
+  const later = run(first.rec, [
+    [{ kind: 'register', verdict: FILE_OK, tokens: 140_999 }, NOW + 40 * MIN],
+    [{ kind: 'register', verdict: FILE_OK, tokens: 141_000 }, NOW + 41 * MIN],
+  ])
+  expect(later.steps[0]!.reply).toContain('grown only 99k since (140k now)')
+  expect(later.steps[1]!.accepted).toBe(true)
+})
+
+test('chain guard: a conversation driven by another session (agent messages only, nobody typing for hours) hands off on its own once its context has grown enough', () => {
+  // 主人的实际设置：remind_at 400k；全局规则是约 300k 主动交接。编排会话用会话间消息派活，这个对话里几个小时没人打字
+  const cfg = cfgWith({ remind_at: 400_000, urge_at: 450_000, compact_at: 650_000 })
+  const PEER = { kind: 'peer-send-message' }
+  const T3 = '8c2f4e61-9b0d-4a3c-b5e7-0d1f2a3b4c5d'
+  const T4 = 'e1d2c3b4-a596-4877-8a9b-0c1d2e3f4a5b'
+  const H = 60 * MIN
+  const r = resumed(cfg)
+  const t = run(
+    r,
+    [
+      // 续接回合：读交接文件，回报现状
+      [{ kind: 'turnStart', turnId: T2 }, NOW + 1_000],
+      [{ kind: 'postTool', tokens: 38_400 }, NOW + 9_000],
+      [{ kind: 'stop', active: false, tokens: 44_100 }, NOW + 60_000],
+      [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 44_100 }, NOW + 61_000],
+      // 一小时后编排会话派来第一批活
+      [{ kind: 'submit', origin: PEER, tokens: 44_100 }, NOW + H],
+      [{ kind: 'turnStart', turnId: T3 }, NOW + H],
+      [{ kind: 'postTool', tokens: 97_500 }, NOW + H + 20 * MIN],
+      // 做完一批，模型想在自然停顿处交接：从 38k 只涨了 82k，不受理
+      [{ kind: 'register', verdict: FILE_OK, tokens: 121_300 }, NOW + H + 47 * MIN],
+      [{ kind: 'stop', active: false, tokens: 122_000 }, NOW + H + 48 * MIN],
+      [{ kind: 'turnComplete', turnId: T3, reason: 'answer', isAborted: false, tokens: 122_000 }, NOW + H + 48 * MIN],
+    ],
+    cfg,
+  )
+  expect(t.steps[1]!.rec.resumedTokens).toBe(38_400)
+  expect(t.steps[7]!.reply).toBe(
+    'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+  )
+  // 主人这时看 /autohandoff status：守卫那一行给出基准与目前的增量（查看状态不算发话，不解除）
+  const st = run(t.rec, [[{ kind: 'toggle', args: 'status', tokens: 122_000, window: 1_000_000 }, NOW + 2 * H]], cfg)
+  expect(ofType(st.all, 'log')[0]!.text.split('\n')).toContain(
+    'Just continued from a handoff file about 2 hours ago: a new handoff is not accepted until context has grown by 100k since the resume (from 38k, 83k so far), passes 400k, or you send a message (this stops a reset loop).',
+  )
+  expect(st.rec.resumed).toBe(true)
+  // 第二批：增量差一个 token 时仍挡着，到 100k 解除；之后在 296k 的自然停顿处交接，受理
+  const u = run(
+    st.rec,
+    [
+      [{ kind: 'submit', origin: PEER, tokens: 122_000 }, NOW + 3 * H],
+      [{ kind: 'turnStart', turnId: T4 }, NOW + 3 * H],
+      [{ kind: 'postTool', tokens: 138_399 }, NOW + 3 * H + 5 * MIN],
+      [{ kind: 'postTool', tokens: 138_400 }, NOW + 3 * H + 6 * MIN],
+      [{ kind: 'postTool', tokens: 296_000 }, NOW + 4 * H],
+      [{ kind: 'register', verdict: FILE_OK, tokens: 296_800 }, NOW + 4 * H],
+    ],
+    cfg,
+  )
+  expect(u.steps[2]!.rec.resumed).toBe(true)
+  expect([u.steps[3]!.rec.resumed, u.steps[3]!.rec.resumedAt, u.steps[3]!.rec.resumedTokens]).toEqual([false, null, null])
+  expect(contexts(u.all)).toEqual([])
+  expect(u.steps[5]!.accepted).toBe(true)
+  expect(u.rec.job?.stage).toBe('armed')
+  // 这次交接重置、续接之后，新对话重新挡上：续接时刻是这次的，基准等第一个带用量的事件
+  const v = run(u.rec, [[{ kind: 'stop', active: false, tokens: 297_000 }, NOW + 4 * H], [{ ...DONE, turnId: T4, tokens: 297_000 }, NOW + 4 * H]], cfg)
+  const w = run(migrateRecord(v.rec, NOW + 4 * H + 5_000), [[{ kind: 'resetDone', seq: lastSeq(v.all) }, NOW + 4 * H + 5_000]], cfg)
+  expect([w.rec.resumed, w.rec.resumedAt, w.rec.resumedTokens]).toEqual([true, NOW + 4 * H + 5_000, null])
+})
+
+test('chain guard: resume_guard_tokens 0 leaves only remind_at and the user\'s message', () => {
+  const cfg = cfgWith({ remind_at: 400_000, urge_at: 450_000, compact_at: 650_000, resume_guard_tokens: 0 })
+  const r = resumed(cfg)
+  const t = run(
+    r,
+    [
+      [{ kind: 'postTool', tokens: 38_400 }, NOW + 9_000],
+      [{ kind: 'submit', origin: { kind: 'peer-send-message' }, tokens: 250_000 }, NOW + 3 * 60 * MIN],
+      [{ kind: 'register', verdict: FILE_OK, tokens: 251_000 }, NOW + 3 * 60 * MIN],
+    ],
+    cfg,
+  )
+  expect(t.steps[2]!.accepted).toBe(false)
+  expect(t.steps[2]!.reply).toBe(
+    'Not registered: this conversation was continued from a handoff file about 3 hours ago and its context (251k) is below 400k. ' +
+      'Carry on with the work the handoff file describes; registering works again once the context passes 400k or the user sends a message.',
+  )
+  const st = run(t.rec, [[{ kind: 'toggle', args: 'status', tokens: 251_000 }, NOW + 3 * 60 * MIN]], cfg)
+  expect(ofType(st.all, 'log')[0]!.text).toContain(
+    'Just continued from a handoff file about 3 hours ago: a new handoff is not accepted until context passes 400k or you send a message (this stops a reset loop).',
+  )
+  // 越过 remind_at：解除，提醒照常
+  const big = run(t.rec, [{ kind: 'postTool', tokens: 401_000 }, { kind: 'register', verdict: FILE_OK, tokens: 402_000 }], cfg)
+  expect(contexts(big.steps[0]!.fx)[0]).toContain('[AutoHandoff: reminder]')
+  expect(big.steps[1]!.accepted).toBe(true)
+  // 人工消息：解除
+  expect(run(t.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 251_000 }, { kind: 'register', verdict: FILE_OK, tokens: 251_000 }], cfg).steps[1]!.accepted).toBe(true)
+})
+
+test('chain guard in /autohandoff status: before the first usage reading after the resume, and when the status check itself is that reading', () => {
+  const r = resumed()
+  const unread = ofType(run(r, [[{ kind: 'toggle', args: 'status' }, NOW + 4 * MIN]]).all, 'log')[0]!.text
+  expect(unread).toContain(
+    'Just continued from a handoff file 4 minutes ago: a new handoff is not accepted until context has grown by 100k since the resume (usage after the resume not read yet), passes 300k, or you send a message (this stops a reset loop).',
+  )
+  const first = run(r, [[{ kind: 'toggle', args: 'status', tokens: 52_300 }, NOW + 4 * MIN]])
+  expect(first.rec.resumedTokens).toBe(52_300)
+  expect(ofType(first.all, 'log')[0]!.text).toContain('(from 52k, 0k so far), passes 300k, or you send a message')
 })
 
 test('chain guard prompts: the handoff instructions say next steps are the work itself, never "hand off again"', () => {
@@ -977,7 +1107,9 @@ test('chain guard prompts: the handoff instructions say next steps are the work 
   expect(p.remind).toContain('Under next steps write the work itself; never write "hand off", "write a handoff" or "continue the handoff" there')
   expect(p.urge).toContain('Under next steps write the work itself, not "hand off" or "continue the handoff".')
   expect(p.cancelled).toContain('(next steps are the work itself, never "hand off again")')
-  expect(p.start_context).toContain('do not hand off again unless a new AutoHandoff reminder asks for it')
+  expect(p.start_context).toContain(
+    'Do not hand off again right away: hand off again when a new AutoHandoff reminder asks for it, or when you decide to at a natural stopping point after substantial new work in this conversation.',
+  )
 })
 
 test('compact window (action compact): a human message, an agent message, /autohandoff off and an engine notice while /compact runs', () => {

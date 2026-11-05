@@ -26,6 +26,7 @@ wait_minutes: 60
 urge_block: true
 remind_every_turn: true
 handoff_max_tokens: 20000
+resume_guard_tokens: 20000
 `
 
 interface PendingCommand {
@@ -1031,25 +1032,104 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   await turnStart($, T2)
   w.submits[0]!.release()
   await clock.settle()
-  // 续接回合：交接文件里写着「继续交接」，模型又去登记
+  // 续接回合：交接文件里写着「继续交接」，模型一上来就去登记（这次登记的用量就是增量的基准）
   w.tokens = 31_800
   x.writeHandoff()
   const r = await registerTool($, HANDOVER)
-  expect(r.deny).toStartWith('Not registered: this conversation has just been continued from a handoff file and its context is below the first threshold (40k).')
+  expect(r.deny).toBe(
+    'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (31k now). ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
+  )
   expect(stored(x, NEW).job).toBeNull()
+  expect(stored(x, NEW).resumedTokens).toBe(31_800)
   await stop($)
   await complete($, T2)
   await clock.settle()
   expect(w.commands.length).toBe(1)
-  // 用户能在 /autohandoff status 里看到登记暂不受理（查看状态不算发话，不解除）
+  // 用户能在 /autohandoff status 里看到登记暂不受理和增量（查看状态不算发话，不解除）
   await slash($, 'status')
   expect(w.logs).toContain(
-    'Just continued from a handoff file: a new handoff is not accepted until context passes 40k or you send a message (this stops a reset loop).',
+    'Just continued from a handoff file less than a minute ago: a new handoff is not accepted until context has grown by 20k since the resume (from 31k, 0k so far), passes 40k, or you send a message (this stops a reset loop).',
   )
-  expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation has just been continued')
+  expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
   // 用户发话之后（比如要求交接）照常受理
   await say($, 'please hand off now, I need to restart the machine')
   expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+})
+
+test('chain guard, driven by another session: the resumed conversation gets only agent messages for hours and hands off on its own once its context has grown by resume_guard_tokens', async ($, on) => {
+  // 主人的设置：remind_at 400k、默认的 resume_guard_tokens（100k）；全局规则是约 300k 主动交接
+  const config = LOW_CONFIG.replace('remind_at: 40000', 'remind_at: 400000')
+    .replace('urge_at: 90000', 'urge_at: 450000')
+    .replace('compact_at: 300000', 'compact_at: 650000')
+    .replace('resume_guard_tokens: 20000', 'resume_guard_tokens: 100000')
+  const x = world(on, { config })
+  const { w, clock } = x
+  const PEER = { kind: 'peer-send-message' }
+  const T3 = '8c2f4e61-9b0d-4a3c-b5e7-0d1f2a3b4c5d'
+  const T4 = 'e1d2c3b4-a596-4877-8a9b-0c1d2e3f4a5b'
+  // 上一段对话：没等提醒，约 300k 时在自然停顿处自己交接
+  await start($)
+  w.tokens = 288_000
+  await say($, 'Batch 4 is merged. Hand off now, the context is getting long.')
+  await turnStart($, T1)
+  w.tokens = 301_500
+  expect((await tool($)).additionalContext).toBeUndefined()
+  x.writeHandoff()
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+  await stop($)
+  await complete($, T1)
+  await clock.settle()
+  // 重置、续接
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  w.commands[0]!.resolve()
+  await clock.settle()
+  await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).resumedTokens).toBeNull()
+  // 续接回合读交接文件：第一次响应之后的 PostToolUse 给出基准
+  w.tokens = 38_400
+  await tool($)
+  expect(stored(x, NEW).resumedTokens).toBe(38_400)
+  await stop($)
+  await complete($, T2)
+  // 编排会话派来的活（会话间消息），这个对话里没人打字
+  await clock.advance(60 * MIN)
+  await say($, 'Batch 5: port the cache tests to the new fixture layout.', PEER)
+  await turnStart($, T3)
+  w.tokens = 97_500
+  await tool($)
+  await clock.advance(47 * MIN)
+  w.tokens = 121_300
+  x.writeHandoff()
+  const early = await registerTool($, HANDOVER)
+  expect(early.deny).toBe(
+    'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
+      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+  )
+  await stop($)
+  await complete($, T3)
+  await clock.advance(2 * 60 * MIN)
+  await say($, 'Batch 6: wire the new fixtures into CI.', PEER)
+  await turnStart($, T4)
+  w.tokens = 138_400
+  await tool($)
+  expect(stored(x, NEW).resumed).toBe(false)
+  expect(stored(x, NEW).resumedTokens).toBeNull()
+  // 约 300k 的自然停顿处交接：受理，回合结束后重置
+  w.tokens = 296_000
+  await tool($)
+  x.writeHandoff()
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+  await stop($)
+  await complete($, T4)
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['clear', 'clear'])
+  expect(w.toasts).toEqual([])
 })
 
 test('action compact and the user\'s /clear runs first: the new conversation gets the handoff at SessionStart(clear); the queued /compact then fails on the empty conversation and the resume still comes', async ($, on) => {

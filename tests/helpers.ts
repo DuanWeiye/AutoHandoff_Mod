@@ -53,6 +53,7 @@ wait_minutes: 45
 urge_block: false
 remind_every_turn: true
 handoff_max_tokens: 30_000
+resume_guard_tokens: 80_000
 
 ## remind
 

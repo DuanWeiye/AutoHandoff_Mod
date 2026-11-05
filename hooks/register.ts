@@ -77,8 +77,9 @@ const TOAST_MS = 12_000
 // 登记工具的说明（模型读）。路径规则与 core.checkPathText / checkHandoffStat 一致。
 const TOOL_DESCRIPTION =
   'AutoHandoff: register the handoff file you have just written, so that when this turn ends the conversation is reset ' +
-  '(/clear or /compact, as configured) and continued from that file. Call it only after an AutoHandoff reminder asked you to ' +
-  'hand off and the file is written; only the main conversation can register (subagents and forks are refused). ' +
+  '(/clear or /compact, as configured) and continued from that file. Call it once the file is written, after an AutoHandoff ' +
+  'reminder or when you decide on your own to hand off at a natural stopping point; only the main conversation can register ' +
+  '(subagents and forks are refused). ' +
   'Then end your turn at once. The file must be inside the project folder (the working directory, the folder Claude Code ' +
   'was started in, or the git repository root) or the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ' +
   'non-empty, just modified and not over the size limit (handoff_max_tokens); its path is absolute or relative to the working ' +

@@ -48,6 +48,8 @@ export interface Settings {
   remind_every_turn: boolean
   /** 交接文件的大小上限（估算的 token 数）；0 关掉检测 */
   handoff_max_tokens: number
+  /** 续接出来的对话，上下文比续接时多出这么多 token 之后才受理登记（连环交接守卫的解除条件之一）；0 关掉这条 */
+  resume_guard_tokens: number
 }
 
 export interface Config {
@@ -71,6 +73,7 @@ const SPECS: Record<keyof Settings, Spec> = {
   urge_block: { kind: 'bool' },
   remind_every_turn: { kind: 'bool' },
   handoff_max_tokens: { kind: 'int', min: 0, max: 10_000_000 },
+  resume_guard_tokens: { kind: 'int', min: 0, max: 10_000_000 },
 }
 
 export const SETTING_KEYS = Object.keys(SPECS) as (keyof Settings)[]
@@ -86,6 +89,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   urge_block: true,
   remind_every_turn: true,
   handoff_max_tokens: 20_000,
+  resume_guard_tokens: 100_000,
 })
 
 /**
@@ -113,6 +117,8 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
     'After the first reminder, add a short reminder to every later message of the main conversation until a handoff is registered.',
   handoff_max_tokens:
     'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 2000. The estimate counts tokens, not lines; the Read tool also stops at 2000 lines per read, which matters only for a file of very short lines.',
+  resume_guard_tokens:
+    'A conversation that AutoHandoff has just continued from a handoff file does not accept a new handoff until its context has grown by this many tokens since the resume, its context passes remind_at, or you send a message. This stops a reset loop in which the new conversation hands off again as soon as it has read the handoff file. 0 turns the growth condition off, leaving only remind_at and your message.',
 }
 
 export function defaultConfig(): Config {
@@ -881,9 +887,17 @@ export interface Rec {
   /** 已提示过「模型窗口小于 remind_at」 */
   windowWarned: boolean
   /**
-   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、也没收到人工消息：不受理登记（挡连环交接，PLAN §0 第 22 条）
+   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、上下文比续接时多出的还不到 resume_guard_tokens、也没收到人工消息：
+   * 不受理登记（挡连环交接，PLAN §0 第 22、31 条）
    */
   resumed: boolean
+  /** 续接完成（afterReset）的时刻，拒绝登记时告诉模型续接了多久；resumed 为假时为 null */
+  resumedAt: number | null
+  /**
+   * 增量的基准：续接后第一个带用量的事件给的用量（/clear、/compact 之后到第一次响应之前读不到用量，afterReset 时通常没有）。
+   * null：还没拿到，或 resumed 为假
+   */
+  resumedTokens: number | null
   /** 请求序号计数器 */
   seq: number
   tell: TellReason | null
@@ -906,6 +920,8 @@ export function newRecord(now: number): Rec {
     fallbackHeld: false,
     windowWarned: false,
     resumed: false,
+    resumedAt: null,
+    resumedTokens: null,
     seq: 0,
     tell: null,
     turn: null,
@@ -943,6 +959,9 @@ function cloneRec(r: Rec): Rec {
     fallbackHeld: r.fallbackHeld === true,
     windowWarned: r.windowWarned === true,
     resumed: r.resumed === true,
+    // 4.2.0 之前存下的记录没有这两项：读成 null
+    resumedAt: typeof r.resumedAt === 'number' ? r.resumedAt : null,
+    resumedTokens: typeof r.resumedTokens === 'number' ? r.resumedTokens : null,
     seq: typeof r.seq === 'number' ? r.seq : 0,
     tell: r.tell ?? null,
     turn: r.turn ? { ...r.turn } : null,
@@ -962,7 +981,7 @@ export function migrateRecord(old: Rec, now: number): Rec {
   r.fallback = null
   r.fallbackFails = 0
   r.fallbackHeld = false
-  r.resumed = false
+  clearResumed(r)
   // 新对话还没拿到 start_context（用户的 /clear 排在自家 /clear 前面时，中间那个对话拿到的不算）
   if (r.job) r.job.ctxGiven = false
   r.t = now
@@ -1103,9 +1122,9 @@ export function transition(rec: Rec, ev: Ev, env: Env): Step {
   const fx: Effect[] = []
   const out: Step = { rec: r, fx }
   const before = statusOf(rec)
+  // 连环交接守卫的用量部分先算（越过 remind_at 的那个事件送提醒之前守卫就已解除）；人工消息在 reduce 里解除
+  trackResume(r, tokensOf(ev), env.cfg.settings)
   reduce(r, ev, env, out)
-  // 越过 remind_at（第一层已提示）就不再算「刚续接」：之后的登记照常受理
-  if (r.levels.remind) r.resumed = false
   r.t = env.now
   const after = statusOf(r)
   if (after !== before) fx.push({ type: 'status', text: after })
@@ -1165,18 +1184,86 @@ export function jobKey(j: Pick<Job, 'registeredAt' | 'seq'>): string {
   return `${j.registeredAt}:${j.seq ?? 0}`
 }
 
+/** 事件带的上下文用量（事件没有这一项、或读不到用量时为 undefined） */
+function tokensOf(ev: Ev): number | undefined {
+  return 'tokens' in ev ? ev.tokens : undefined
+}
+
+/** 连环交接守卫解除（或不该有）：标记、续接时刻、增量基准一起清掉 */
+function clearResumed(r: Rec): void {
+  r.resumed = false
+  r.resumedAt = null
+  r.resumedTokens = null
+}
+
+/**
+ * 连环交接守卫的用量部分（PLAN §0 第 22、31 条）。每个事件进 reduce 之前先过这里：
+ * 续接后第一个带用量的事件把它的用量记为基准（续接回合的 PostToolUse、Stop、回合结束、/autohandoff status，或登记本身）；
+ * 用量越过 remind_at，或比基准多出 resume_guard_tokens（不为 0 时），就解除。
+ */
+function trackResume(r: Rec, tokens: number | undefined, s: Settings): void {
+  if (!r.resumed || tokens === undefined) return
+  if (r.resumedTokens === null) r.resumedTokens = tokens
+  const grown = s.resume_guard_tokens > 0 && tokens - r.resumedTokens >= s.resume_guard_tokens
+  if (tokens >= s.remind_at || grown) clearResumed(r)
+}
+
+/** 多久以前（给模型和用户看的粗略说法） */
+function agoText(ms: number): string {
+  const m = Math.floor(ms / 60_000)
+  if (m < 1) return 'less than a minute ago'
+  if (m === 1) return '1 minute ago'
+  if (m < 120) return `${m} minutes ago`
+  return `about ${Math.round(m / 60)} hours ago`
+}
+
+/**
+ * 连环交接守卫拒绝登记的说明（接在「Not registered: 」后面）：续接了多久、上下文从基准涨了多少、什么时候能再登记。
+ * resume_guard_tokens 为 0 时不提增量；读不到用量时只说读不到。
+ */
+export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tokens: number | undefined, s: Settings, now: number): string {
+  const growth = s.resume_guard_tokens > 0
+  const when = r.resumedAt === null ? '' : ` ${agoText(now - r.resumedAt)}`
+  let state: string
+  if (tokens === undefined) state = ', and its context usage cannot be read right now'
+  else if (growth && r.resumedTokens !== null) {
+    state = ` and its context has grown only ${kTokens(Math.max(0, tokens - r.resumedTokens))}k since (${kTokens(tokens)}k now)`
+  } else state = ` and its context (${kTokens(tokens)}k) is below ${kTokens(s.remind_at)}k`
+  const until = growth
+    ? `once the context has grown by about ${kTokens(s.resume_guard_tokens)}k since the resume, passes ${kTokens(s.remind_at)}k, or the user sends a message`
+    : `once the context passes ${kTokens(s.remind_at)}k or the user sends a message`
+  return `this conversation was continued from a handoff file${when}${state}. Carry on with the work the handoff file describes; registering works again ${until}.`
+}
+
+/** /autohandoff status 里守卫那一行：解除条件，以及增量的基准与目前的增量（排查用） */
+function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: number): string {
+  const head = `Just continued from a handoff file${r.resumedAt === null ? '' : ` ${agoText(now - r.resumedAt)}`}: a new handoff is not accepted until context`
+  const tail = '(this stops a reset loop).'
+  if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k or you send a message ${tail}`
+  const base =
+    r.resumedTokens === null
+      ? 'usage after the resume not read yet'
+      : `from ${kTokens(r.resumedTokens)}k${tokens === undefined ? '' : `, ${kTokens(Math.max(0, tokens - r.resumedTokens))}k so far`}`
+  return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, or you send a message ${tail}`
+}
+
 /** 自家重置完成：进入续接阶段，提交续接（用户已接手时不提交）。resetDone 和孤儿 job 的 SessionStart 共用。 */
 function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): void {
   clearLevels(r)
   j.stage = 'resuming'
   j.resetAt = now
-  // 续接开启的对话在越过 remind_at 或收到人工消息之前不受理登记；用户已接手（userTook）时不挡
-  r.resumed = !j.userTook
   if (j.userTook) {
+    // 用户已接手：不续接，也不挡登记
+    clearResumed(r)
     if (j.ctxGiven) finish(r, fx, 'the user wrote during the reset; resume message skipped')
     else fx.push({ type: 'timer', ms: RESUME_STUCK_MS })
     return
   }
+  // 续接开启的对话在解除之前不受理登记（PLAN §0 第 22、31 条）。增量基准此时通常读不到
+  // （重置后到第一次响应之前没有用量），由之后第一个带用量的事件记下（trackResume）
+  r.resumed = true
+  r.resumedAt = now
+  r.resumedTokens = null
   fx.push({ type: 'resume', seq: j.seq ?? 0, text: resumeText(cfg, j.file, j.action) })
   fx.push({ type: 'timer', ms: RESUME_STUCK_MS })
 }
@@ -1283,7 +1370,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         r.human = true
         r.teammate = false
         r.fallbackHeld = false
-        r.resumed = false
+        clearResumed(r)
       }
       if (o.cls === 'own') return
       if (o.cls === 'meta') {
@@ -1358,7 +1445,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
             : 'AutoHandoff is off for this conversation.',
         })
       } else {
-        fx.push({ type: 'log', text: formatStatus(r, cfg, { tokens: ev.tokens, window: ev.window, problems: ev.problems, configPath: ev.configPath }) })
+        fx.push({ type: 'log', text: formatStatus(r, cfg, { tokens: ev.tokens, window: ev.window, problems: ev.problems, configPath: ev.configPath }, now) })
       }
       return
     }
@@ -1455,13 +1542,9 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (!effectiveOn(r, s)) return deny('AutoHandoff is off for this conversation.')
       if (r.job && r.job.stage !== 'armed') return deny('a reset is already in progress.')
       if (r.fallback) return deny('a compaction is in progress.')
-      if (r.resumed && !(ev.tokens !== undefined && ev.tokens >= s.remind_at)) {
-        return deny(
-          `this conversation has just been continued from a handoff file and its context is below the first threshold (${kTokens(s.remind_at)}k). ` +
-            'Carry on with the work the handoff file describes instead of handing off again; registering works again once context usage passes ' +
-            `${kTokens(s.remind_at)}k or the user sends a message.`,
-        )
-      }
+      // 连环交接守卫：用量的两条解除条件（越过 remind_at、增量够了）已由 trackResume 按这次的用量算过，
+      // 基准还没拿到时这次的用量就是基准（增量 0）；读不到用量时仍拒绝
+      if (r.resumed) return deny(resumeGuardText(r, ev.tokens, s, now))
       if (!ev.verdict.ok) return deny(`${ev.verdict.why}.`)
       // 超长退回（PLAN §0 第 30 条）：新对话要整份读完，Read 一次只读 25000 token；估算读不到（undefined）时照收
       if (isOversize(ev.fileTokens, s)) return deny(oversizeText(ev.verdict.value, ev.fileTokens ?? 0, r.note, s))
@@ -1622,7 +1705,7 @@ export interface StatusExtra {
   configPath?: string
 }
 
-export function formatStatus(r: Rec, cfg: Config, x: StatusExtra): string {
+export function formatStatus(r: Rec, cfg: Config, x: StatusExtra, now: number): string {
   const s = cfg.settings
   const lines: string[] = []
   const on = effectiveOn(r, s)
@@ -1646,11 +1729,7 @@ export function formatStatus(r: Rec, cfg: Config, x: StatusExtra): string {
     const sent = r.levels.urge ? ' Second reminder sent.' : r.levels.remind ? ' First reminder sent.' : ''
     lines.push(`Handoff: none registered.${sent}${r.note === null ? '' : ` Handoff file to write: "${r.note}".`}`)
   }
-  if (r.resumed) {
-    lines.push(
-      `Just continued from a handoff file: a new handoff is not accepted until context passes ${kTokens(s.remind_at)}k or you send a message (this stops a reset loop).`,
-    )
-  }
+  if (r.resumed) lines.push(resumeStatusLine(r, x.tokens, s, now))
   if (r.fallbackFails >= FALLBACK_MAX_FAILS) lines.push(`Compaction at compact_at: given up after ${FALLBACK_MAX_FAILS} failures in this conversation.`)
   else if (r.fallbackHeld) lines.push('Compaction at compact_at: called off by you; it will be tried again after your next message.')
   if (x.configPath) lines.push(`Configuration: ${x.configPath}`)
