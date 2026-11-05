@@ -133,6 +133,9 @@ plugin status lines with a ⚠ in front). Short notices appear in the top-right 
 When a reminder arrives, the model writes a **handoff file for the next conversation** at the path AutoHandoff puts
 at the end of the reminder, then calls the **`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`)
 with that path, and ends its turn. The reminder text tells it all of this; it does not need to know the tool in advance.
+The model may also hand off on its own before any reminder, at a natural stopping point (for example when your own
+instructions ask it to hand off at a certain size); the tool's description allows that, and the same rules apply,
+except that no path has been named yet, so the model picks one that passes the rules below.
 
 The path is `<project folder>/.autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
 was started in (or, if that is the home folder, the working directory or the git root), the local time of the first
@@ -247,9 +250,14 @@ the handoff is cancelled with a toast, the model is told, and a later `/clear` o
 AutoHandoff tells the two apart with per-session state the host keeps across hot reloads but not across processes.
 
 **No reset loops.** A conversation that AutoHandoff has just continued from a handoff file does not accept a new
-registration until its context passes `remind_at` or you send a message; the model is told to carry on with the
-work instead. `/autohandoff status` shows this. The reminders also tell the model to write the work itself under
-"next steps", never "hand off again".
+registration until its context has grown by `resume_guard_tokens` (100k by default) since the resume, its context
+passes `remind_at`, or you send a message. The growth is counted from the first usage reading after the resume
+(Claude Code reports no usage between the reset and the first response). Messages from subagents, background tasks
+or other sessions do not lift it, so a conversation that another session keeps busy for hours can still hand off on
+its own once it has done that much new work. A refused model is told how long ago the conversation was continued,
+how much its context has grown and when registering works again, and to carry on with the work instead.
+`/autohandoff status` shows the same. The reminders also tell the model to write the work itself under "next steps",
+never "hand off again".
 
 **The `compact_at` safety net.** When a main-conversation turn ends at or above `compact_at` with no handoff
 registered, AutoHandoff queues `/compact <compact_focus>`. During that compaction no reminders are added and
@@ -283,6 +291,7 @@ wait_minutes: 60
 urge_block: true
 remind_every_turn: true
 handoff_max_tokens: 20000
+resume_guard_tokens: 100000
 
 ## remind
 
@@ -301,6 +310,7 @@ handoff_max_tokens: 20000
 | `urge_block` | `true` | Past `urge_at`, block the first attempt to end a turn without a handoff, once per turn. |
 | `remind_every_turn` | `true` | After the first reminder, add a short reminder to every later message until a handoff is registered. |
 | `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered (see *Handoff file size*). `0` turns the check off; otherwise at least 2000. |
+| `resume_guard_tokens` | `100000` | A conversation just continued from a handoff file accepts no new handoff until its context has grown by this much since the resume (or passes `remind_at`, or you send a message); this stops a reset loop. `0` drops the growth condition. |
 
 Token values accept `300000`, `300_000` or `300,000`, from 1 to 10,000,000. If `remind_at < urge_at < compact_at` does
 not hold, all three use their defaults.
