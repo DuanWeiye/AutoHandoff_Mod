@@ -98,6 +98,12 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
  */
 export const HANDOFF_MAX_MIN = 2000
 
+/**
+ * resume_guard_tokens 不为 0 时的下限：再小守卫就形同虚设（续接回合第二次读数就解除），拒绝文案里还会出现「about 0k」。
+ * 下限只挡明显写错的值；能不能挡住连环交接要看它是否明显大于读交接文件和工程文档的量（设置说明里写明）
+ */
+export const RESUME_GUARD_MIN = 10_000
+
 // 默认配置文件里每项设置上方的说明
 const SETTING_NOTES: Record<keyof Settings, string> = {
   default_on:
@@ -118,7 +124,7 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
   handoff_max_tokens:
     'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 2000. The estimate counts tokens, not lines; the Read tool also stops at 2000 lines per read, which matters only for a file of very short lines.',
   resume_guard_tokens:
-    'A conversation that AutoHandoff has just continued from a handoff file does not accept a new handoff until its context has grown by this many tokens since the resume, its context passes remind_at, or you send a message. This stops a reset loop in which the new conversation hands off again as soon as it has read the handoff file. 0 turns the growth condition off, leaving only remind_at and your message.',
+    'A conversation that AutoHandoff has just continued from a handoff file does not accept a new handoff until its context has grown by this many tokens since the resume, its context passes remind_at, or you type a message or a command in it (/autohandoff status does not count). This stops a reset loop in which the new conversation hands off again as soon as it has read the handoff file. The growth is counted from the first usage reading after the resume, which comes before the handoff file is read, so it includes the 20-60k tokens a resumed conversation usually spends reading the handoff file and project documents. 0 turns the growth condition off, leaving only remind_at and your input; otherwise at least 10000. A value at or above remind_at has the same effect as 0.',
 }
 
 export function defaultConfig(): Config {
@@ -229,6 +235,19 @@ export function parseConfig(text: string | undefined): ParsedConfig {
       `handoff_max_tokens should be 0 (off) or at least ${HANDOFF_MAX_MIN}, got ${s.handoff_max_tokens}; using the default (${DEFAULT_SETTINGS.handoff_max_tokens})`,
     )
     s.handoff_max_tokens = DEFAULT_SETTINGS.handoff_max_tokens
+  }
+  if (s.resume_guard_tokens !== 0 && s.resume_guard_tokens < RESUME_GUARD_MIN) {
+    problems.push(
+      `resume_guard_tokens should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${s.resume_guard_tokens}; using the default (${DEFAULT_SETTINGS.resume_guard_tokens})`,
+    )
+    s.resume_guard_tokens = DEFAULT_SETTINGS.resume_guard_tokens
+  }
+  // 增量 ≥ 它时用量必然已 ≥ remind_at（基准 ≥ 0），这条永远不会先成立：按 0 处理，拒绝文案与 status 就不会写出达不到的增量门槛
+  if (s.resume_guard_tokens >= s.remind_at) {
+    problems.push(
+      `resume_guard_tokens (${s.resume_guard_tokens}) is not below remind_at (${s.remind_at}), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you write to it`,
+    )
+    s.resume_guard_tokens = 0
   }
 
   // 提示词
@@ -887,7 +906,7 @@ export interface Rec {
   /** 已提示过「模型窗口小于 remind_at」 */
   windowWarned: boolean
   /**
-   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、上下文比续接时多出的还不到 resume_guard_tokens、也没收到人工消息：
+   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、上下文比续接时多出的还不到 resume_guard_tokens、也没收到人工消息或用户亲手敲的命令：
    * 不受理登记（挡连环交接，PLAN §0 第 22、31 条）
    */
   resumed: boolean
@@ -1032,8 +1051,10 @@ export type Ev =
   | { kind: 'submit'; origin?: OriginLike; isMeta?: boolean; tokens?: number; window?: number }
   /** 用户敲的内置命令（command.run，origin=composer），只需给命令名 */
   | { kind: 'userCommand'; command: string }
-  /** /autohandoff <args> */
-  | { kind: 'toggle'; args: string; tokens?: number; window?: number; problems?: readonly string[]; configPath?: string }
+  /**
+   * /autohandoff <args>。typed：用户亲手敲的（command.run 的 origin 为 composer/bridge），on/off 时解除连环交接守卫
+   */
+  | { kind: 'toggle'; args: string; typed?: boolean; tokens?: number; window?: number; problems?: readonly string[]; configPath?: string }
   | { kind: 'turnStart'; turnId: string }
   /** 主对话的 classic.PostToolUse */
   | { kind: 'postTool'; tokens?: number; window?: number }
@@ -1199,7 +1220,9 @@ function clearResumed(r: Rec): void {
 /**
  * 连环交接守卫的用量部分（PLAN §0 第 22、31 条）。每个事件进 reduce 之前先过这里：
  * 续接后第一个带用量的事件把它的用量记为基准（续接回合的 PostToolUse、Stop、回合结束、/autohandoff status，或登记本身）；
- * 用量越过 remind_at，或比基准多出 resume_guard_tokens（不为 0 时），就解除。
+ * 用量越过 remind_at，或比基准多出 resume_guard_tokens（不为 0 时），就解除；解除是锁存的，之后不再计算。
+ * 守卫期间 CC 自动压缩让用量回落到基准以下时不重取基准（增量按 0 计，要等基准 + N 或 remind_at）：只有 remind_at 设在
+ * CC 压缩点之上时才会碰到，那种设置下提醒本来也来不了；用户的 /compact 是亲手敲的命令，压缩之前就已解除（userCommand）
  */
 function trackResume(r: Rec, tokens: number | undefined, s: Settings): void {
   if (!r.resumed || tokens === undefined) return
@@ -1232,7 +1255,11 @@ export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tok
   const until = growth
     ? `once the context has grown by about ${kTokens(s.resume_guard_tokens)}k since the resume, passes ${kTokens(s.remind_at)}k, or the user sends a message`
     : `once the context passes ${kTokens(s.remind_at)}k or the user sends a message`
-  return `this conversation was continued from a handoff file${when}${state}. Carry on with the work the handoff file describes; registering works again ${until}.`
+  // 先说什么时候该交接（提醒、用户或工程的指示），再给放行条件：免得模型把增量门槛当成交接的时点
+  return (
+    `this conversation was continued from a handoff file${when}${state}. Carry on with the work the handoff file describes, ` +
+    `and hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for it. Registering works again ${until}.`
+  )
 }
 
 /** /autohandoff status 里守卫那一行：解除条件，以及增量的基准与目前的增量（排查用） */
@@ -1240,10 +1267,16 @@ function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: 
   const head = `Just continued from a handoff file${r.resumedAt === null ? '' : ` ${agoText(now - r.resumedAt)}`}: a new handoff is not accepted until context`
   const tail = '(this stops a reset loop).'
   if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k or you send a message ${tail}`
-  const base =
-    r.resumedTokens === null
-      ? 'usage after the resume not read yet'
-      : `from ${kTokens(r.resumedTokens)}k${tokens === undefined ? '' : `, ${kTokens(Math.max(0, tokens - r.resumedTokens))}k so far`}`
+  let base: string
+  if (r.resumedTokens === null) base = 'usage after the resume not read yet'
+  else if (tokens === undefined) base = `from ${kTokens(r.resumedTokens)}k`
+  else if (tokens < r.resumedTokens) base = `from ${kTokens(r.resumedTokens)}k; the context is below that now`
+  else {
+    // 增量按精确值相减后取整（不会多报，免得显示够了却还挡着），基准由「目前用量 − 增量」推出：
+    // 这样「基准 + 增量」等于 Context 行的用量，代价是基准最多多显示 1k
+    const grown = kTokens(tokens - r.resumedTokens)
+    base = `from ${kTokens(tokens) - grown}k, ${grown}k so far`
+  }
   return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, or you send a message ${tail}`
 }
 
@@ -1403,6 +1436,9 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     case 'userCommand': {
       r.human = true
       r.teammate = false
+      // 用户亲手敲的命令说明人在场，与人工消息一样解除连环交接守卫（PLAN §0 第 22 条 (b)）；
+      // 用户的 /compact 也因此先解除、后压缩，压缩后用量回落不会让守卫重新挡住
+      clearResumed(r)
       if (ev.command === 'clear' || ev.command === 'compact' || ev.command === 'resume') {
         if (resetQueued(r)) keepQueued(r, fx, `the user ran /${ev.command}`, ev.command === 'resume' ? resumeQueuedToast(r.job!.action) : QUEUED_TOAST)
         else cancelQuiet(r, fx, `the user ran /${ev.command}`)
@@ -1422,6 +1458,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         fx.push({ type: 'log', text: 'Usage: /autohandoff [on|off|status] (no argument toggles)' })
         return
       }
+      // 亲手开关（不含 status：查看状态不改变正在查看的守卫）与其它亲手敲的命令一样解除连环交接守卫
+      if (turnOn !== null && ev.typed === true) clearResumed(r)
       if (turnOn === true) {
         r.on = true
         warnWindow(r, s, ev.window, fx)

@@ -1038,7 +1038,7 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   const r = await registerTool($, HANDOVER)
   expect(r.deny).toBe(
     'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (31k now). ' +
-      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
   )
   expect(stored(x, NEW).job).toBeNull()
   expect(stored(x, NEW).resumedTokens).toBe(31_800)
@@ -1057,6 +1057,36 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
 })
 
+test('chain guard: a command the user types (/autohandoff on) lifts it like a message; /autohandoff status and commands from the SDK host do not', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  cmd.resolve()
+  await clock.settle()
+  await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  w.tokens = 33_200
+  await tool($)
+  await stop($)
+  await complete($, T2)
+  expect([stored(x, NEW).resumed, stored(x, NEW).resumedTokens]).toEqual([true, 33_200])
+  // SDK 主机发来的命令（不是人敲的）、查看状态：不解除
+  await $.command.run({ command: 'model', args: 'sonnet', origin: { kind: 'sdk' }, presentation: PRESENTATION })
+  await $.command.run({ command: COMMAND_NAME, args: 'on', origin: { kind: 'sdk' }, presentation: PRESENTATION })
+  await slash($, 'status')
+  expect(stored(x, NEW).resumed).toBe(true)
+  // 用户亲手敲 /autohandoff on（本来就开着）：人在场，解除
+  await slash($, 'on')
+  expect([stored(x, NEW).resumed, stored(x, NEW).resumedAt, stored(x, NEW).resumedTokens]).toEqual([false, null, null])
+  x.writeHandoff()
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+})
+
 test('chain guard, driven by another session: the resumed conversation gets only agent messages for hours and hands off on its own once its context has grown by resume_guard_tokens', async ($, on) => {
   // 主人的设置：remind_at 400k、默认的 resume_guard_tokens（100k）；全局规则是约 300k 主动交接
   const config = LOW_CONFIG.replace('remind_at: 40000', 'remind_at: 400000')
@@ -1068,7 +1098,7 @@ test('chain guard, driven by another session: the resumed conversation gets only
   const PEER = { kind: 'peer-send-message' }
   const T3 = '8c2f4e61-9b0d-4a3c-b5e7-0d1f2a3b4c5d'
   const T4 = 'e1d2c3b4-a596-4877-8a9b-0c1d2e3f4a5b'
-  // 上一段对话：没等提醒，约 300k 时在自然停顿处自己交接
+  // 上一段对话：还没到提醒（remind_at 400k），约 300k 时用户要求交接
   await start($)
   w.tokens = 288_000
   await say($, 'Batch 4 is merged. Hand off now, the context is getting long.')
@@ -1109,7 +1139,7 @@ test('chain guard, driven by another session: the resumed conversation gets only
   const early = await registerTool($, HANDOVER)
   expect(early.deny).toBe(
     'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
   )
   await stop($)
   await complete($, T3)
@@ -1120,7 +1150,7 @@ test('chain guard, driven by another session: the resumed conversation gets only
   await tool($)
   expect(stored(x, NEW).resumed).toBe(false)
   expect(stored(x, NEW).resumedTokens).toBeNull()
-  // 约 300k 的自然停顿处交接：受理，回合结束后重置
+  // 约 300k 按工程规则主动交接：受理，回合结束后重置
   w.tokens = 296_000
   await tool($)
   x.writeHandoff()

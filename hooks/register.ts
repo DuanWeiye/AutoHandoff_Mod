@@ -77,9 +77,10 @@ const TOAST_MS = 12_000
 // 登记工具的说明（模型读）。路径规则与 core.checkPathText / checkHandoffStat 一致。
 const TOOL_DESCRIPTION =
   'AutoHandoff: register the handoff file you have just written, so that when this turn ends the conversation is reset ' +
-  '(/clear or /compact, as configured) and continued from that file. Call it once the file is written, after an AutoHandoff ' +
-  'reminder or when you decide on your own to hand off at a natural stopping point; only the main conversation can register ' +
-  '(subagents and forks are refused). ' +
+  '(/clear or /compact, as configured) and continued from that file. Call it once the file is written, and only after an ' +
+  'AutoHandoff reminder asked you to hand off or when the user\'s or the project\'s instructions tell you to (for example at a ' +
+  'context size they name); do not hand off just because a task or a step is finished. Only the main conversation can ' +
+  'register; subagents and forks are refused. ' +
   'Then end your turn at once. The file must be inside the project folder (the working directory, the folder Claude Code ' +
   'was started in, or the git repository root) or the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ' +
   'non-empty, just modified and not over the size limit (handoff_max_tokens); its path is absolute or relative to the working ' +
@@ -596,7 +597,8 @@ async function onRegister($: Api, e: { agentId?: string; file?: unknown }): Prom
   return step.accepted === true ? { result: reply } : { deny: reply }
 }
 
-async function onToggle($: Api, args: string): Promise<void> {
+/** typed：用户亲手敲的（origin 为 composer/bridge）；开关时解除连环交接守卫 */
+async function onToggle($: Api, args: string, typed: boolean): Promise<void> {
   if (!(await enabled($))) {
     $.ui.log(`AutoHandoff is not active in this session: ${gateWhy()}.`)
     return
@@ -605,7 +607,7 @@ async function onToggle($: Api, args: string): Promise<void> {
   const u = await usageNow($)
   await dispatch(
     $,
-    () => ({ kind: 'toggle', args, tokens: u.tokens, window: u.window, problems: config.parsed.problems, configPath: config.path }),
+    () => ({ kind: 'toggle', args, typed, tokens: u.tokens, window: u.window, problems: config.parsed.problems, configPath: config.path }),
     { config },
   )
 }
@@ -658,7 +660,7 @@ export const register: Register = (on) => {
   // /autohandoff：md 命令的真名；不调 next，命令被完全拦截，输出只走 ui.log（模型看不到）
   on('command.run', { command: COMMAND_NAME }, async ($, e) => {
     try {
-      await onToggle($, e.args)
+      await onToggle($, e.args, e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     } catch (err) {
       fail($, '/autohandoff', err)
       $.ui.log(`AutoHandoff: internal error (${errText(err)})`)
@@ -666,7 +668,7 @@ export const register: Register = (on) => {
     return {}
   }).catch(() => ({}))
 
-  // 用户自己敲的命令（/clear、/compact、/resume 作废登记）；自家发起的命令这里看不到
+  // 用户自己敲的命令（/clear、/compact、/resume 作废登记；任何命令都解除连环交接守卫）；自家发起的命令这里看不到
   on('command.run', async ($, e, next) => {
     try {
       const kind = e.origin.kind

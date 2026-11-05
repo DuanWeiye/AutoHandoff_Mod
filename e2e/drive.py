@@ -46,6 +46,8 @@ PANE_PIDS = []
 QUEUED_TOAST = "AutoHandoff: the reset is already queued and cannot be withdrawn; the conversation will continue from the handoff file."
 # 连环交接守卫拒绝登记时审计行的开头（core.ts resumeGuardText）
 GUARD_REFUSAL = "registration refused: this conversation was continued from a handoff file"
+# 拒绝文案里先说什么时候该交接（PLAN §0 第 22 条），再给放行条件
+GUARD_WHEN = "hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for it"
 
 
 def tmux(*args, check=True):
@@ -259,6 +261,34 @@ def reset_project(work):
     subprocess.run(["git", "clean", "-qfd"], cwd=proj(work), check=True)
 
 
+def config_settings(path):
+    """e2e 配置文件 `## settings` 节里的 key: value（断言按场景实际用的配置拼期望文字，不写死数值）"""
+    out, inside = {}, False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("## "):
+                inside = line.strip() == "## settings"
+                continue
+            m = re.match(r"^([a-z_]+):\s*(\S+)\s*$", line) if inside else None
+            if m:
+                out[m.group(1)] = m.group(2)
+    return out
+
+
+def guard_until(settings):
+    """core.resumeGuardText 里「什么时候能再登记」那半句与是否提增量（下限与「不小于 remind_at 按 0 处理」同 core.parseConfig）"""
+    num = lambda v: int(str(v).replace("_", "").replace(",", ""))
+    remind = num(settings["remind_at"])
+    guard = num(settings.get("resume_guard_tokens", 100000))
+    if 0 < guard < 10000:
+        guard = 100000
+    if guard >= remind:
+        guard = 0
+    if guard:
+        return f"once the context has grown by about {guard // 1000}k since the resume, passes {remind // 1000}k, or the user sends a message", True
+    return f"once the context passes {remind // 1000}k or the user sends a message", False
+
+
 def text_of(entry):
     m = entry.get("message") or {}
     c = m.get("content")
@@ -396,6 +426,12 @@ def scenario_clear(work, tag="clear", draft=None):
         done = [os.path.exists(os.path.join(proj(work), "notes", f)) for f in ("a.txt", "b.txt", "c.txt")]
         c.ok(all(done), f"work finished across the reset (notes a/b/c: {done})")
         c.ok(sum(1 for x in a if x.startswith("handoff registered")) == 1, "exactly one handoff (no repeated cycle)")
+        # 普通任务（没有任何交接指示）：只在提醒之后登记；续接出来的对话没去登记（守卫没拒过）
+        i_remind = next((i for i, x in enumerate(a) if x.startswith("remind sent at")), None)
+        i_reg = next((i for i, x in enumerate(a) if x.startswith(("handoff registered", "registration refused"))), None)
+        c.ok(i_reg is not None and i_remind is not None and i_remind < i_reg, "the first registration attempt came after the reminder")
+        guard_refused = [x for x in a if x.startswith(GUARD_REFUSAL)]
+        c.ok(not guard_refused, f"the resumed conversation did not try to hand off on its own ({len(guard_refused)} refused)")
         if draft:
             c.ok(draft in s.pane(), "the draft is still in the input box")
             prompts = [h.get("prompt", "") for h in s.hooks() if h.get("hook_event_name") == "UserPromptSubmit"]
@@ -1276,10 +1312,13 @@ def scenario_chain(work):
     配置 autohandoff-chain.md：start_context 换成中性说明（内置那句「不要马上再交接」会劝住新对话，(b) 守卫就测不到，第 3 批审查 Minor-6）；
     remind_at 抬到 150k（第一段对话由用户要求主动登记，不靠提醒），resume_guard_tokens 用默认 100k：
     新对话照做时用量只比续接后第一次读数多几 k，登记被拒（增量不够、没越过 remind_at、也没收到人工消息），不会再 clear。
-    期望：守卫至少拒绝一次登记，拒绝理由给出增量与放行条件；恰好两个 sid、恰好一次 /clear。新对话没去登记时判 FAIL（守卫没被测到）。"""
+    期望：守卫至少拒绝一次登记，拒绝理由先说只在提醒或指示要求时交接、再给增量与放行条件（数值按 autohandoff-chain.md 的设置算，
+    RESUME_GUARD 换了也对得上）；恰好两个 sid、恰好一次 /clear。新对话没去登记时判 FAIL（守卫没被测到）。"""
     reset_project(work)
     c = Check("chain: a handoff file that says 'hand off again' does not start a reset loop")
-    s = Session(work, "chain", config=os.path.join(work, "autohandoff-chain.md"))
+    config = os.path.join(work, "autohandoff-chain.md")
+    until, growth = guard_until(config_settings(config))
+    s = Session(work, "chain", config=config)
     try:
         s.send(TEST_INTRO + "(1) Write docs/HANDOVER.md (replace its content) with: '# Handover\\n\\nTask: reply PEAR.\\n"
                f"Next step: first write docs/HANDOVER.md again (same content), then call the {TOOL} tool with file docs/HANDOVER.md "
@@ -1293,8 +1332,9 @@ def scenario_chain(work):
         sids = s.sids()
         refused = [x for x in a if x.startswith(GUARD_REFUSAL)]
         c.ok(len(refused) >= 1, f"the chain guard refused the resumed conversation's registration ({len(refused)}x; 0 means the guard was not exercised)")
-        c.ok(bool(refused) and "has grown only" in refused[0] and "grown by about 100k since the resume, passes 150k, or the user sends a message" in refused[0],
-             f"the refusal gives the growth since the resume and when registering works again ({refused[:1]})")
+        c.ok(bool(refused) and ("has grown only" in refused[0] if growth else "is below" in refused[0]) and until in refused[0],
+             f"the refusal gives the {'growth since the resume' if growth else 'usage'} and when registering works again: {until} ({refused[:1]})")
+        c.ok(bool(refused) and GUARD_WHEN in refused[0], "the refusal says to hand off only when a reminder or instructions ask for it")
         c.ok(s.count("turn ended; running /clear") == 1, f"reset exactly once ({s.count('turn ended; running /clear')})")
         c.ok(len(sids) == 2, f"exactly two sessions ({len(sids)})")
         c.ok(len(resume_entries(s.entries(sids[-1]))) == 1 if len(sids) > 1 else False, "the new conversation was resumed once")

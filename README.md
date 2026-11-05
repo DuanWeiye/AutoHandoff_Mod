@@ -73,6 +73,12 @@ To try it in one session without installing: `claude --plugin-dir <dir>`.
   the folder itself is what runs, close running sessions before pulling a new major version (see [Upgrading from version 3](#upgrading-from-version-3)).
   If `claude plugin list` shows no `Read from:` line, your Claude Code copies the plugin into the cache instead: use
   the two update commands above.
+- **Your configuration file is not updated.** `~/.claude/autohandoff.md` keeps every prompt as it was when the file
+  was created, and a prompt written in the file replaces the built-in one, so a new version's prompt changes do not
+  reach you by themselves (4.2.0 changed `start_context`; 4.1.0 changed `remind`, `remind_short`, `urge`, `urge_block`,
+  `start_context` and `resume`). Merge the new text from `hooks/prompts.ts` into the sections you have not
+  customised, or delete those sections, or delete the file to get a fresh copy (note your settings first and put them
+  back). New settings use their defaults until you add them; `/autohandoff status` lists the missing ones.
 
 ### Uninstall
 
@@ -133,9 +139,10 @@ plugin status lines with a ⚠ in front). Short notices appear in the top-right 
 When a reminder arrives, the model writes a **handoff file for the next conversation** at the path AutoHandoff puts
 at the end of the reminder, then calls the **`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`)
 with that path, and ends its turn. The reminder text tells it all of this; it does not need to know the tool in advance.
-The model may also hand off on its own before any reminder, at a natural stopping point (for example when your own
-instructions ask it to hand off at a certain size); the tool's description allows that, and the same rules apply,
-except that no path has been named yet, so the model picks one that passes the rules below.
+The model may also hand off before any reminder when your instructions or the project's (for example a `CLAUDE.md`
+rule to hand off at a certain size) ask it to; the tool's description allows that, but not handing off just because a
+task is finished. The same rules apply, except that no path has been named yet, so the model picks one that passes the
+rules below.
 
 The path is `<project folder>/.autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
 was started in (or, if that is the home folder, the working directory or the git root), the local time of the first
@@ -251,11 +258,16 @@ AutoHandoff tells the two apart with per-session state the host keeps across hot
 
 **No reset loops.** A conversation that AutoHandoff has just continued from a handoff file does not accept a new
 registration until its context has grown by `resume_guard_tokens` (100k by default) since the resume, its context
-passes `remind_at`, or you send a message. The growth is counted from the first usage reading after the resume
-(Claude Code reports no usage between the reset and the first response). Messages from subagents, background tasks
-or other sessions do not lift it, so a conversation that another session keeps busy for hours can still hand off on
-its own once it has done that much new work. A refused model is told how long ago the conversation was continued,
-how much its context has grown and when registering works again, and to carry on with the work instead.
+passes `remind_at`, or you type a message or a command in it (`/autohandoff status` does not count). The growth is
+counted from the first usage reading after the resume (Claude Code reports no usage between the reset and the first
+response), which comes before the model reads the handoff file: the 20–60k tokens a resumed conversation usually
+spends reading the handoff file and project documents are part of it. If Claude Code's own compaction drops the
+context below that first reading, the growth counts as zero until the context is back above it (this happens only
+when `remind_at` is above the point where Claude Code compacts). Messages from subagents, background tasks or other
+sessions do not lift it, so a conversation that another session keeps busy for hours can still hand off once it has
+done that much new work and your or the project's instructions call for a handoff. A refused model is told to carry
+on with the work and to hand off only when a reminder or those instructions ask for it, how long ago the
+conversation was continued, how much its context has grown and when registering works again.
 `/autohandoff status` shows the same. The reminders also tell the model to write the work itself under "next steps",
 never "hand off again".
 
@@ -310,10 +322,11 @@ resume_guard_tokens: 100000
 | `urge_block` | `true` | Past `urge_at`, block the first attempt to end a turn without a handoff, once per turn. |
 | `remind_every_turn` | `true` | After the first reminder, add a short reminder to every later message until a handoff is registered. |
 | `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered (see *Handoff file size*). `0` turns the check off; otherwise at least 2000. |
-| `resume_guard_tokens` | `100000` | A conversation just continued from a handoff file accepts no new handoff until its context has grown by this much since the resume (or passes `remind_at`, or you send a message); this stops a reset loop. `0` drops the growth condition. |
+| `resume_guard_tokens` | `100000` | A conversation just continued from a handoff file accepts no new handoff until its context has grown by this much since the resume (or passes `remind_at`, or you type a message or command); this stops a reset loop. The growth includes the 20–60k spent reading the handoff file and project documents after the resume. `0` drops the growth condition; otherwise at least 10000. A value at or above `remind_at` has no effect and counts as `0`. |
 
-Token values accept `300000`, `300_000` or `300,000`, from 1 to 10,000,000. If `remind_at < urge_at < compact_at` does
-not hold, all three use their defaults.
+Token values accept `300000`, `300_000` or `300,000`, up to 10,000,000 (`remind_at`, `urge_at` and `compact_at` from 1;
+`handoff_max_tokens` and `resume_guard_tokens` also take `0`, see the table). If `remind_at < urge_at < compact_at`
+does not hold, all three use their defaults.
 
 **Prompts.** Ten prompts can be replaced; a section you leave out uses the built-in text (the generated file contains
 all of them, so you can edit in place):

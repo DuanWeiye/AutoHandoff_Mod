@@ -563,12 +563,12 @@ test('chain guard reply: how long ago, how much the context grew, and when regis
   const r = { resumedAt: NOW - 47 * MIN, resumedTokens: 38_400 }
   expect(resumeGuardText(r, 121_300, s, NOW)).toBe(
     'this conversation was continued from a handoff file 47 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
   )
   // 几小时之前续接、读不到用量
   expect(resumeGuardText(r, undefined, s, NOW + 3 * 60 * MIN)).toBe(
     'this conversation was continued from a handoff file about 4 hours ago, and its context usage cannot be read right now. ' +
-      'Carry on with the work the handoff file describes; registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
   )
   // 刚续接、基准就是这次的用量
   expect(resumeGuardText({ resumedAt: NOW - 20_000, resumedTokens: 41_000 }, 41_000, s, NOW)).toStartWith(
@@ -577,7 +577,7 @@ test('chain guard reply: how long ago, how much the context grew, and when regis
   // resume_guard_tokens 为 0：不提增量
   expect(resumeGuardText(r, 250_000, { ...s, resume_guard_tokens: 0 }, NOW - 46 * MIN)).toBe(
     'this conversation was continued from a handoff file 1 minute ago and its context (250k) is below 400k. ' +
-      'Carry on with the work the handoff file describes; registering works again once the context passes 400k or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context passes 400k or the user sends a message.',
   )
   // 续接时刻不知道（4.1.0 存下的记录）：不说多久以前
   expect(resumeGuardText({ resumedAt: null, resumedTokens: null }, undefined, s, NOW)).toStartWith(
@@ -619,11 +619,40 @@ test('handoff size: handoff_max_tokens accepts 0 (off) and 2000 or more; smaller
   expect(text).toContain('{handoff_note}')
 })
 
-test('config: resume_guard_tokens accepts 0 (growth condition off); a file written by 4.1.0 without it gets the default and a note', () => {
+test('config: resume_guard_tokens accepts 0 (growth condition off) and 10000 up to below remind_at; a file written by 4.1.0 without it gets the default and a note', () => {
   const withGuard = (v: string) => parseConfig(defaultConfigText().replace('resume_guard_tokens: 100000', `resume_guard_tokens: ${v}`))
   expect(withGuard('0').cfg.settings.resume_guard_tokens).toBe(0)
   expect(withGuard('0').problems).toEqual([])
   expect(withGuard('60,000').cfg.settings.resume_guard_tokens).toBe(60_000)
+  // 下限本身：拒绝文案里是「about 10k」，不会是 0k
+  const least = withGuard('10000')
+  expect(least.cfg.settings.resume_guard_tokens).toBe(10_000)
+  expect(least.problems).toEqual([])
+  expect(resumeGuardText({ resumedAt: NOW - 2 * MIN, resumedTokens: 41_000 }, 45_000, least.cfg.settings, NOW)).toContain(
+    'grown only 4k since (45k now). Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 10k since the resume, passes 300k, or the user sends a message.',
+  )
+  // 比下限小：多半是写错了（守卫形同虚设），回落默认
+  const tiny = withGuard('500')
+  expect(tiny.cfg.settings.resume_guard_tokens).toBe(100_000)
+  expect(tiny.problems).toEqual(['resume_guard_tokens should be 0 (off) or at least 10000, got 500; using the default (100000)'])
+  // 不小于 remind_at：增量这条永远不会先成立，按 0 处理；文案不写达不到的增量门槛
+  const big = withGuard('500,000')
+  expect(big.cfg.settings.resume_guard_tokens).toBe(0)
+  expect(big.problems).toEqual([
+    'resume_guard_tokens (500000) is not below remind_at (300000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you write to it',
+  ])
+  expect(withGuard('300000').cfg.settings.resume_guard_tokens).toBe(0)
+  expect(withGuard('299999').cfg.settings.resume_guard_tokens).toBe(299_999)
+  expect(resumeGuardText({ resumedAt: NOW - 5 * MIN, resumedTokens: 41_000 }, 52_000, big.cfg.settings, NOW)).toBe(
+    'this conversation was continued from a handoff file 5 minutes ago and its context (52k) is below 300k. ' +
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context passes 300k or the user sends a message.',
+  )
+  // 小窗口模型把 remind_at 调到 80k、这一项没动（默认 100k）：同样按 0 处理并说明
+  const lowRemind = parseConfig(defaultConfigText().replace('remind_at: 300000', 'remind_at: 80000'))
+  expect(lowRemind.cfg.settings.resume_guard_tokens).toBe(0)
+  expect(lowRemind.problems).toEqual([
+    'resume_guard_tokens (100000) is not below remind_at (80000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you write to it',
+  ])
   const words = withGuard('100k')
   expect(words.cfg.settings.resume_guard_tokens).toBe(100_000)
   expect(words.problems).toEqual(['resume_guard_tokens should be a whole number, got "100k"; using the default (100000)'])
