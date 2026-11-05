@@ -47,7 +47,7 @@ QUEUED_TOAST = "AutoHandoff: the reset is already queued and cannot be withdrawn
 # 连环交接守卫拒绝登记时审计行的开头（core.ts resumeGuardText）
 GUARD_REFUSAL = "registration refused: this conversation was continued from a handoff file"
 # 拒绝文案里先说什么时候该交接（PLAN §0 第 22 条），再给放行条件
-GUARD_WHEN = "hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for it"
+GUARD_WHEN = "hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count)"
 
 
 def tmux(*args, check=True):

@@ -517,13 +517,23 @@ test('default_on takes effect at the first human message; teammates never switch
   expect(contexts(h.all)[0]).toContain('[AutoHandoff: reminder]')
   // 显式 off 优先于 default_on
   expect(contexts(run({ ...h.rec, on: false, levels: { remind: false, urge: false } }, [{ kind: 'submit', origin: COMPOSER, tokens: 320_000 }], cfg).all)).toEqual([])
-  // 误标为 teammate 的进程：人工输入或 /autohandoff 一来就撤销标记（teammate 从不收到这两种）
-  const wrong = run(fresh, [{ kind: 'teammate' }, { kind: 'toggle', args: 'on' }, { kind: 'postTool', tokens: 320_000 }], cfg)
+  // 误标为 teammate 的进程：人工输入或亲手敲的 /autohandoff 一来就撤销标记（teammate 从不收到这两种）
+  const wrong = run(fresh, [{ kind: 'teammate' }, { kind: 'toggle', args: 'on', typed: true }, { kind: 'postTool', tokens: 320_000 }], cfg)
   expect(wrong.rec.teammate).toBe(false)
   expect(contexts(wrong.all)[0]).toContain('[AutoHandoff: reminder]')
   const wrong2 = run(fresh, [{ kind: 'teammate' }, { kind: 'submit', origin: COMPOSER, tokens: 320_000 }], cfg)
   expect(wrong2.rec.teammate).toBe(false)
   expect(contexts(wrong2.all)[0]).toContain('[AutoHandoff: reminder]')
+  // SDK 主机或别的插件发的 /autohandoff 不说明人在场：不撤 teammate 标记，也不让 default_on 生效
+  const sdkMate = run(fresh, [{ kind: 'teammate' }, { kind: 'toggle', args: 'status' }], cfg)
+  expect([sdkMate.rec.teammate, sdkMate.rec.human]).toEqual([true, false])
+  const sdkStatus = run(fresh, [{ kind: 'toggle', args: 'status' }, { kind: 'postTool', tokens: 320_000 }], cfg)
+  expect(sdkStatus.rec.human).toBe(false)
+  expect(contexts(sdkStatus.all)).toEqual([])
+  // 亲手敲的 status 算人在场：default_on 生效
+  const typedStatus = run(fresh, [{ kind: 'toggle', args: 'status', typed: true }, { kind: 'postTool', tokens: 320_000 }], cfg)
+  expect(typedStatus.rec.human).toBe(true)
+  expect(contexts(typedStatus.all)[0]).toContain('[AutoHandoff: reminder]')
 })
 
 test('compact_at: a turn ending past it with no handoff compacts; the levels reset afterwards', () => {
@@ -943,7 +953,7 @@ test('chain guard: a conversation just continued from a handoff refuses to regis
   expect(a.steps[1]!.rec.resumedTokens).toBe(61_000)
   expect(a.steps[2]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 2k since (63k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 300k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 300k, or the user sends a message.',
   )
   expect(a.steps[2]!.accepted).toBe(false)
   expect(a.rec.job).toBe(null)
@@ -1030,7 +1040,7 @@ test('chain guard: a conversation driven by another session (agent messages only
   expect(t.steps[1]!.rec.resumedTokens).toBe(38_400)
   expect(t.steps[7]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
   )
   // 主人这时看 /autohandoff status：守卫那一行给出基准与目前的增量（查看状态不算发话，不解除）。
   // 增量 83,600 取整为 83k，基准按 122k − 83k 显示为 39k（实际 38,400），与 Context 行的 122k 对得上
@@ -1038,7 +1048,7 @@ test('chain guard: a conversation driven by another session (agent messages only
   const lines = ofType(st.all, 'log')[0]!.text.split('\n')
   expect(lines).toContain('Context: 122k of 1000k. Reminders at 400k and 450k, compaction at 650k; reset with /clear.')
   expect(lines).toContain(
-    'Just continued from a handoff file about 2 hours ago: a new handoff is not accepted until context has grown by 100k since the resume (from 39k, 83k so far), passes 400k, or you send a message (this stops a reset loop).',
+    'Just continued from a handoff file about 2 hours ago: a new handoff is not accepted until context has grown by 100k since the resume (from 39k, 83k so far), passes 400k, or you type a message or a command (this stops a reset loop).',
   )
   expect(st.rec.resumed).toBe(true)
   // 第二批：增量差一个 token 时仍挡着，到 100k 解除；之后到 296k 按工程规则（约 300k 主动交接）交接，受理
@@ -1080,11 +1090,11 @@ test('chain guard: resume_guard_tokens 0 leaves only remind_at and the user\'s m
   expect(t.steps[2]!.accepted).toBe(false)
   expect(t.steps[2]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file about 3 hours ago and its context (251k) is below 400k. ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context passes 400k or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 400k or the user sends a message.',
   )
   const st = run(t.rec, [[{ kind: 'toggle', args: 'status', tokens: 251_000 }, NOW + 3 * 60 * MIN]], cfg)
   expect(ofType(st.all, 'log')[0]!.text).toContain(
-    'Just continued from a handoff file about 3 hours ago: a new handoff is not accepted until context passes 400k or you send a message (this stops a reset loop).',
+    'Just continued from a handoff file about 3 hours ago: a new handoff is not accepted until context passes 400k or you type a message or a command (this stops a reset loop).',
   )
   // 越过 remind_at：解除，提醒照常
   const big = run(t.rec, [{ kind: 'postTool', tokens: 401_000 }, { kind: 'register', verdict: FILE_OK, tokens: 402_000 }], cfg)
@@ -1098,11 +1108,11 @@ test('chain guard in /autohandoff status: before the first usage reading after t
   const r = resumed()
   const unread = ofType(run(r, [[{ kind: 'toggle', args: 'status' }, NOW + 4 * MIN]]).all, 'log')[0]!.text
   expect(unread).toContain(
-    'Just continued from a handoff file 4 minutes ago: a new handoff is not accepted until context has grown by 100k since the resume (usage after the resume not read yet), passes 300k, or you send a message (this stops a reset loop).',
+    'Just continued from a handoff file 4 minutes ago: a new handoff is not accepted until context has grown by 100k since the resume (usage after the resume not read yet), passes 300k, or you type a message or a command (this stops a reset loop).',
   )
   const first = run(r, [[{ kind: 'toggle', args: 'status', tokens: 52_300 }, NOW + 4 * MIN]])
   expect(first.rec.resumedTokens).toBe(52_300)
-  expect(ofType(first.all, 'log')[0]!.text).toContain('(from 52k, 0k so far), passes 300k, or you send a message')
+  expect(ofType(first.all, 'log')[0]!.text).toContain('(from 52k, 0k so far), passes 300k, or you type a message or a command')
 })
 
 test('chain guard with action compact: set when our /compact resolves; the growth base is the first usage reading after the compaction', () => {
@@ -1181,7 +1191,8 @@ test('chain guard: a command the user types lifts it like a message (/compact be
     [
       { kind: 'userCommand', command: 'compact' },
       { kind: 'sessionStart', source: 'compact' },
-      { kind: 'submit', origin: { kind: 'peer-send-message' }, tokens: 38_000 },
+      // 压缩后到第一次响应之前读不到用量
+      { kind: 'submit', origin: { kind: 'peer-send-message' } },
       { kind: 'turnStart', turnId: T2 },
       { kind: 'postTool', tokens: 40_000 },
       { kind: 'register', verdict: FILE_OK, tokens: 41_000 },
@@ -1212,7 +1223,7 @@ test('chain guard and Claude Code\'s own compaction: usage falling below the bas
   expect(t.steps[5]!.accepted).toBe(false)
   expect(t.steps[5]!.reply).toContain('continued from a handoff file 43 minutes ago and its context has grown only 0k since (41k now).')
   const st = ofType(run(t.rec, [[{ kind: 'toggle', args: 'status', typed: true, tokens: 41_000 }, NOW + 44 * MIN]], cfg).all, 'log')[0]!.text
-  expect(st).toContain('has grown by 100k since the resume (from 70k; the context is below that now), passes 400k, or you send a message')
+  expect(st).toContain('has grown by 100k since the resume (from 70k; the context is below that now), passes 400k, or you type a message or a command')
   // 要涨到基准 + 100k（170k）才解除
   const u = run(
     t.rec,
@@ -1242,7 +1253,7 @@ test('chain guard prompts: the handoff instructions say next steps are the work 
   expect(p.urge).toContain('Under next steps write the work itself, not "hand off" or "continue the handoff".')
   expect(p.cancelled).toContain('(next steps are the work itself, never "hand off again")')
   expect(p.start_context).toContain(
-    'Do not hand off again right away: hand off again only when a new AutoHandoff reminder asks for it, or when the user\'s or the project\'s instructions call for it.',
+    'Do not hand off again right away: hand off again only when a new AutoHandoff reminder asks for it, or when the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count).',
   )
 })
 

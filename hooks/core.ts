@@ -236,18 +236,25 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     )
     s.handoff_max_tokens = DEFAULT_SETTINGS.handoff_max_tokens
   }
-  if (s.resume_guard_tokens !== 0 && s.resume_guard_tokens < RESUME_GUARD_MIN) {
-    problems.push(
-      `resume_guard_tokens should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${s.resume_guard_tokens}; using the default (${DEFAULT_SETTINGS.resume_guard_tokens})`,
-    )
-    s.resume_guard_tokens = DEFAULT_SETTINGS.resume_guard_tokens
-  }
-  // 增量 ≥ 它时用量必然已 ≥ remind_at（基准 ≥ 0），这条永远不会先成立：按 0 处理，拒绝文案与 status 就不会写出达不到的增量门槛
-  if (s.resume_guard_tokens >= s.remind_at) {
-    problems.push(
-      `resume_guard_tokens (${s.resume_guard_tokens}) is not below remind_at (${s.remind_at}), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you write to it`,
-    )
-    s.resume_guard_tokens = 0
+  if (s.resume_guard_tokens !== 0) {
+    const got = s.resume_guard_tokens
+    const tooSmall = got < RESUME_GUARD_MIN
+    // 太小时回落默认；回落后（或原值）≥ remind_at 时增量条件永远不会先于 remind_at 成立（用量 − 基准 ≥ 它 ⇒ 用量 ≥ remind_at）：
+    // 按 0 处理，拒绝文案与 status 就不会写出达不到的增量门槛。两种情况同时出现只报一条
+    const value = tooSmall ? DEFAULT_SETTINGS.resume_guard_tokens : got
+    const fix = `set it to 0, or to at least ${RESUME_GUARD_MIN} and below remind_at, to clear this`
+    if (value >= s.remind_at) {
+      const why = tooSmall
+        ? `should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${got}, and the default (${value}) is not below remind_at (${s.remind_at})`
+        : `(${got}) is not below remind_at (${s.remind_at}), so it has no effect`
+      problems.push(
+        `resume_guard_tokens ${why}; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you type a message or a command in it; ${fix}`,
+      )
+      s.resume_guard_tokens = 0
+    } else if (tooSmall) {
+      problems.push(`resume_guard_tokens should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${got}; using the default (${value})`)
+      s.resume_guard_tokens = value
+    }
   }
 
   // 提示词
@@ -1258,7 +1265,7 @@ export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tok
   // 先说什么时候该交接（提醒、用户或工程的指示），再给放行条件：免得模型把增量门槛当成交接的时点
   return (
     `this conversation was continued from a handoff file${when}${state}. Carry on with the work the handoff file describes, ` +
-    `and hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for it. Registering works again ${until}.`
+    `and hand off only when an AutoHandoff reminder asks for it or the user's or the project's instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again ${until}.`
   )
 }
 
@@ -1266,7 +1273,7 @@ export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tok
 function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: number): string {
   const head = `Just continued from a handoff file${r.resumedAt === null ? '' : ` ${agoText(now - r.resumedAt)}`}: a new handoff is not accepted until context`
   const tail = '(this stops a reset loop).'
-  if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k or you send a message ${tail}`
+  if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k or you type a message or a command ${tail}`
   let base: string
   if (r.resumedTokens === null) base = 'usage after the resume not read yet'
   else if (tokens === undefined) base = `from ${kTokens(r.resumedTokens)}k`
@@ -1277,7 +1284,7 @@ function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: 
     const grown = kTokens(tokens - r.resumedTokens)
     base = `from ${kTokens(tokens) - grown}k, ${grown}k so far`
   }
-  return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, or you send a message ${tail}`
+  return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, or you type a message or a command ${tail}`
 }
 
 /** 自家重置完成：进入续接阶段，提交续接（用户已接手时不提交）。resetDone 和孤儿 job 的 SessionStart 共用。 */
@@ -1446,8 +1453,11 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       return
     }
     case 'toggle': {
-      r.human = true
-      r.teammate = false
+      // 只有亲手敲的才说明人在场（default_on 生效、撤 teammate 标记）；SDK 主机或别的插件发的 /autohandoff 不算
+      if (ev.typed === true) {
+        r.human = true
+        r.teammate = false
+      }
       const arg = ev.args.trim().toLowerCase()
       const wasOn = effectiveOn(r, s)
       let turnOn: boolean | null = null

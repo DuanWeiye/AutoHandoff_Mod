@@ -78,8 +78,9 @@ const TOAST_MS = 12_000
 const TOOL_DESCRIPTION =
   'AutoHandoff: register the handoff file you have just written, so that when this turn ends the conversation is reset ' +
   '(/clear or /compact, as configured) and continued from that file. Call it once the file is written, and only after an ' +
-  'AutoHandoff reminder asked you to hand off or when the user\'s or the project\'s instructions tell you to (for example at a ' +
-  'context size they name); do not hand off just because a task or a step is finished. Only the main conversation can ' +
+  'AutoHandoff reminder asked you to hand off or when the user\'s or the project\'s instructions tell you to end this ' +
+  'conversation and continue in a new one (for example at a context size they name). Updating a handover or notes document ' +
+  'such as HANDOVER.md is not such an instruction, and neither is finishing a task or a step. Only the main conversation can ' +
   'register; subagents and forks are refused. ' +
   'Then end your turn at once. The file must be inside the project folder (the working directory, the folder Claude Code ' +
   'was started in, or the git repository root) or the Claude Code auto-memory folder (<config dir>/projects/<project>/memory/), ' +
@@ -660,7 +661,7 @@ export const register: Register = (on) => {
   // /autohandoff：md 命令的真名；不调 next，命令被完全拦截，输出只走 ui.log（模型看不到）
   on('command.run', { command: COMMAND_NAME }, async ($, e) => {
     try {
-      await onToggle($, e.args, e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+      await onToggle($, e.args, e.origin?.kind === 'composer' || e.origin?.kind === 'bridge')
     } catch (err) {
       fail($, '/autohandoff', err)
       $.ui.log(`AutoHandoff: internal error (${errText(err)})`)
@@ -671,7 +672,7 @@ export const register: Register = (on) => {
   // 用户自己敲的命令（/clear、/compact、/resume 作废登记；任何命令都解除连环交接守卫）；自家发起的命令这里看不到
   on('command.run', async ($, e, next) => {
     try {
-      const kind = e.origin.kind
+      const kind = e.origin?.kind
       if (e.command !== COMMAND_NAME && (kind === 'composer' || kind === 'bridge') && (await enabled($))) {
         await dispatch($, () => ({ kind: 'userCommand', command: e.command }))
       }

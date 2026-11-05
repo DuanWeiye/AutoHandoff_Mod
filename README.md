@@ -140,8 +140,9 @@ When a reminder arrives, the model writes a **handoff file for the next conversa
 at the end of the reminder, then calls the **`register_handoff`** tool (full name `mcp__autohandoff__register_handoff`)
 with that path, and ends its turn. The reminder text tells it all of this; it does not need to know the tool in advance.
 The model may also hand off before any reminder when your instructions or the project's (for example a `CLAUDE.md`
-rule to hand off at a certain size) ask it to; the tool's description allows that, but not handing off just because a
-task is finished. The same rules apply, except that no path has been named yet, so the model picks one that passes the
+rule to hand off at a certain size) ask it to end the conversation and continue in a new one; the tool's description
+allows that, but not handing off just because a task is finished or a handover document (such as `HANDOVER.md`) was
+updated. The same rules apply, except that no path has been named yet, so the model picks one that passes the
 rules below.
 
 The path is `<project folder>/.autohandoff/_AUTOHANDOFF_<YYYYMMDD>_<HHMMSS>_<session>.md`: the folder Claude Code
@@ -265,7 +266,8 @@ spends reading the handoff file and project documents are part of it. If Claude 
 context below that first reading, the growth counts as zero until the context is back above it (this happens only
 when `remind_at` is above the point where Claude Code compacts). Messages from subagents, background tasks or other
 sessions do not lift it, so a conversation that another session keeps busy for hours can still hand off once it has
-done that much new work and your or the project's instructions call for a handoff. A refused model is told to carry
+done that much new work and your or the project's instructions call for ending the conversation and continuing in a
+new one (updating a handover document does not count). A refused model is told to carry
 on with the work and to hand off only when a reminder or those instructions ask for it, how long ago the
 conversation was continued, how much its context has grown and when registering works again.
 `/autohandoff status` shows the same. The reminders also tell the model to write the work itself under "next steps",

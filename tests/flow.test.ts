@@ -1038,7 +1038,7 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   const r = await registerTool($, HANDOVER)
   expect(r.deny).toBe(
     'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (31k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
   )
   expect(stored(x, NEW).job).toBeNull()
   expect(stored(x, NEW).resumedTokens).toBe(31_800)
@@ -1049,7 +1049,7 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   // 用户能在 /autohandoff status 里看到登记暂不受理和增量（查看状态不算发话，不解除）
   await slash($, 'status')
   expect(w.logs).toContain(
-    'Just continued from a handoff file less than a minute ago: a new handoff is not accepted until context has grown by 20k since the resume (from 31k, 0k so far), passes 40k, or you send a message (this stops a reset loop).',
+    'Just continued from a handoff file less than a minute ago: a new handoff is not accepted until context has grown by 20k since the resume (from 31k, 0k so far), passes 40k, or you type a message or a command (this stops a reset loop).',
   )
   expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
   // 用户发话之后（比如要求交接）照常受理
@@ -1139,7 +1139,7 @@ test('chain guard, driven by another session: the resumed conversation gets only
   const early = await registerTool($, HANDOVER)
   expect(early.deny).toBe(
     'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for it. Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
   )
   await stop($)
   await complete($, T3)
