@@ -44,6 +44,8 @@ SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 # 测试会话所在 pane 的进程号：清理前等它们都退出（Claude Code 收到 SIGHUP 后还会往 transcript 补写几行）
 PANE_PIDS = []
 QUEUED_TOAST = "AutoHandoff: the reset is already queued and cannot be withdrawn; the conversation will continue from the handoff file."
+# 连环交接守卫拒绝登记时审计行的开头（core.ts resumeGuardText）
+GUARD_REFUSAL = "registration refused: this conversation was continued from a handoff file"
 
 
 def tmux(*args, check=True):
@@ -543,7 +545,7 @@ def scenario_interject(work):
             n_clear = s.count("turn ended; running /clear")
             c.ok(n_clear == 1, f"reset exactly once ({n_clear})")
             c.ok(len(sids) == 2, f"exactly two sessions, no chained handoff ({len(sids)})")
-            refused = [x for x in a if x.startswith("registration refused: this conversation has just been continued")]
+            refused = [x for x in a if x.startswith(GUARD_REFUSAL)]
             if refused:
                 c.note(f"the resumed conversation tried to hand off again and was refused ({len(refused)}x)")
             c.ok(CODE_WORD in open(handover, encoding="utf-8").read(), f"the handoff file was updated with the interjected request ({CODE_WORD})")
@@ -1270,10 +1272,11 @@ def scenario_userclear(work):
 
 
 def scenario_chain(work):
-    """连环交接（PLAN §0 第 22 条）：交接文件的「下一步」写成「再写交接、再登记」（模拟模型把交接指令抄进了交接文件）。
-    配置 autohandoff-chain.md：start_context 换成中性说明（内置那句「不要再交接」会劝住新对话，(b) 守卫就测不到，第 3 批审查 Minor-6）。
-    新对话照做时登记被拒（刚续接、没越过 remind_at、也没收到人工消息），不会再 clear。
-    期望：守卫至少拒绝一次登记；恰好两个 sid、恰好一次 /clear。新对话没去登记时判 FAIL（守卫没被测到）。"""
+    """连环交接（PLAN §0 第 22、31 条）：交接文件的「下一步」写成「再写交接、再登记」（模拟模型把交接指令抄进了交接文件）。
+    配置 autohandoff-chain.md：start_context 换成中性说明（内置那句「不要马上再交接」会劝住新对话，(b) 守卫就测不到，第 3 批审查 Minor-6）；
+    remind_at 抬到 150k（第一段对话由用户要求主动登记，不靠提醒），resume_guard_tokens 用默认 100k：
+    新对话照做时用量只比续接后第一次读数多几 k，登记被拒（增量不够、没越过 remind_at、也没收到人工消息），不会再 clear。
+    期望：守卫至少拒绝一次登记，拒绝理由给出增量与放行条件；恰好两个 sid、恰好一次 /clear。新对话没去登记时判 FAIL（守卫没被测到）。"""
     reset_project(work)
     c = Check("chain: a handoff file that says 'hand off again' does not start a reset loop")
     s = Session(work, "chain", config=os.path.join(work, "autohandoff-chain.md"))
@@ -1288,8 +1291,10 @@ def scenario_chain(work):
         time.sleep(5)
         a = s.audit()
         sids = s.sids()
-        refused = [x for x in a if x.startswith("registration refused: this conversation has just been continued")]
+        refused = [x for x in a if x.startswith(GUARD_REFUSAL)]
         c.ok(len(refused) >= 1, f"the chain guard refused the resumed conversation's registration ({len(refused)}x; 0 means the guard was not exercised)")
+        c.ok(bool(refused) and "has grown only" in refused[0] and "grown by about 100k since the resume, passes 150k, or the user sends a message" in refused[0],
+             f"the refusal gives the growth since the resume and when registering works again ({refused[:1]})")
         c.ok(s.count("turn ended; running /clear") == 1, f"reset exactly once ({s.count('turn ended; running /clear')})")
         c.ok(len(sids) == 2, f"exactly two sessions ({len(sids)})")
         c.ok(len(resume_entries(s.entries(sids[-1]))) == 1 if len(sids) > 1 else False, "the new conversation was resumed once")

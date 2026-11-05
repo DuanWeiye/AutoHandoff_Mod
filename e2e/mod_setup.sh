@@ -20,7 +20,7 @@
 #                                                PLUGIN_DIR=<插件目录> 换一份插件（热重载场景用工作目录里的副本，改它触发重载）
 #   mod_setup.sh stop <工作目录>                  kill 测试用 tmux server
 # 环境变量：SOCK（默认 ahmod）、MODEL（默认 sonnet）、REMIND / URGE / COMPACT（默认 52000 / 200000 / 900000；新对话开头约 45k）、
-#   ACTION（clear|compact，默认 clear）、DEFAULT_ON（默认 true）、EFFORT（默认 medium）
+#   ACTION（clear|compact，默认 clear）、DEFAULT_ON（默认 true）、EFFORT（默认 medium）、RESUME_GUARD（resume_guard_tokens，默认 100000）
 set -euo pipefail
 cmd=${1:?usage: mod_setup.sh init|start|stop <work dir> ...}
 S=$(realpath -m "${2:?work dir}")
@@ -48,6 +48,7 @@ wait_minutes: 30
 urge_block: $block
 remind_every_turn: true
 handoff_max_tokens: $hmax
+resume_guard_tokens: ${RESUME_GUARD:-100000}
 EOF
   if [ -n "$neutral" ]; then
     for k in remind urge remind_short; do
@@ -132,8 +133,9 @@ case "$cmd" in
     # fallback 另关 urge_block：模型一直不交接，回合在 compact_at 之上结束
     write_config "$S/autohandoff-fallback.md" clear 56000 58000 60000 neutral false
     write_config "$S/autohandoff-urge.md" clear 54000 56000 900000 neutral
-    # chain：内置 start_context 里「除非有新提醒，不要再交接」那句会劝住新对话，守卫就测不到；换成中性说明
-    write_config "$S/autohandoff-chain.md" clear
+    # chain：内置 start_context 里「不要马上再交接」那句会劝住新对话，守卫就测不到；换成中性说明。
+    # remind_at 抬到 150k：新对话开头约 45k，守卫只能靠增量（resume_guard_tokens 默认 100k）挡住，不是 remind_at
+    write_config "$S/autohandoff-chain.md" clear 150000 200000 "${COMPACT:-900000}"
     printf '\n## start_context\n\n[AutoHandoff e2e] This conversation was reset by AutoHandoff ({action}). Follow the handoff file.\n' >>"$S/autohandoff-chain.md"
     # limit：上限压到 2000；提醒要求抄 120 行参考表（约 3.5k token），第一次登记必然超长被退回（路径照样由 mod 追加在末尾）。
     # urge_at 也压到读一次 catalog 就越过：直接送 urge，并有 Stop block 兜底（haiku 对只有 remind 的自写提醒有时不理）
