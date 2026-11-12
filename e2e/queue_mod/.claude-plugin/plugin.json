@@ -1,0 +1,5 @@
+{
+  "name": "ahq",
+  "version": "0.0.1",
+  "description": "AutoHandoff e2e helper: submits one prompt while the first turn runs, so that it waits in the queue until the turn ends (as a Remote Control message does)."
+}

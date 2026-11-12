@@ -10,6 +10,7 @@
   drive.py <工作目录> --cleanup-only        （--keep 跑过之后清理）
 场景：clear draft dialog deny interject notify cmp slash print
       compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain limit
+      queued queuedc escq
       （缺省全跑；--repeat N 每个场景跑 N 次并统计）
 同一个仓库（worktree）同时只跑一组 drive.py：store 文件被同一插件目录的所有 --plugin-dir 会话共用，清理时要改它。
 清理时发现别的 --plugin-dir 会话还在跑、或这次运行期间有别的会话写过记录，就跳过 store 这一步并打印出来。
@@ -28,6 +29,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -169,6 +171,17 @@ class Session:
             m = re.search(r'\[autohandoff\] \$\.ui\.log: (.*)$', line) or re.search(r'\$\.ui\.toast \(autohandoff\): (.*)$', line)
             if m:
                 out.append(m.group(1).rstrip('"'))
+        return out
+
+    def statuses(self):
+        """mod 的状态行每次变化后的文字（清除时为 None），按顺序"""
+        out = []
+        if not os.path.exists(self.debug):
+            return out
+        for line in open(self.debug, encoding="utf-8", errors="replace"):
+            m = re.search(r'\$\.ui\.status \(autohandoff\): (.*)$', line.rstrip("\n"))
+            if m:
+                out.append(None if m.group(1) == "(cleared)" else m.group(1))
         return out
 
     def has(self, text):
@@ -955,6 +968,171 @@ def scenario_ctype(work):
     return c
 
 
+QUEUED_WORD = "LYCHEE-4068"
+
+
+def copy_queue_mod(work):
+    """辅助 mod 的副本（Claude Code 加载 mod 时会往它的目录里写类型声明；用副本，不碰仓库，也不让 AutoHandoff 的目录变动而热重载）"""
+    dst = os.path.join(work, "queue-mod")
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(os.path.join(HERE, "queue_mod"), dst)
+    return dst
+
+
+def scenario_queued(work, action="clear"):
+    """回合结束前就在排队的用户类消息（PLAN §0 第 32 条；2026-11-12 的实例是回合中从 Remote Control 发来的一句话）。
+    这种消息不会送进正在跑的回合，一直排到回合结束；AutoHandoff 的 /clear（或 /compact）在回合结束时才入队，排在它后面，
+    所以引擎先在旧对话里为它跑一个回合，然后才重置。驱动没有 Remote Control 客户端，用辅助 mod（e2e/queue_mod）在第一个回合
+    开始时提交一条 prompt 代替：排法相同，来源是「别的插件」，在 AutoHandoff 里同属用户类。
+    期望：不作废；消息在旧对话里得到回答并附 reset_note_user；只重置一次；重置后续接恰好一次（修复前这里不续接，新对话空等）；
+    消息里对后续工作的要求（暗号）被补进已登记的交接文件，新对话做完工作后的回复带着它。"""
+    reset_project(work)
+    tag = "queued" if action == "clear" else "queuedc"
+    c = Check(f"{tag}: a message queued before the registered turn ended is answered before /{action}; the resume still follows")
+    text = (f"One more thing for the remaining work: once notes/done.txt exists, the reply that reports it must include "
+            f"the code word {QUEUED_WORD} exactly as written.")
+    s = Session(work, tag, extra=("--plugin-dir", copy_queue_mod(work)),
+                config=os.path.join(work, "autohandoff-compact.md") if action == "compact" else None,
+                ah_env="AHQ_TEXT=" + shlex.quote(text))
+    handover = os.path.realpath(os.path.join(proj(work), "docs", "HANDOVER.md"))
+    done_file = os.path.join(proj(work), "notes", "done.txt")
+    try:
+        old = s.sids()[0]
+        s.send(TEST_INTRO + "(1) Write docs/HANDOVER.md (replace its content) with: '# Handover\\n\\nTask: create notes/done.txt "
+               "containing the word done (use the Write tool), then tell the user it is done.\\nNext step: create notes/done.txt.' "
+               f"(2) Call the {TOOL} tool with file docs/HANDOVER.md. (3) End your turn with one short sentence.")
+        s.wait(lambda: s.has(f"turn ended; running /{action}") or s.has("handoff cancelled"), 240, f"the queued /{action}")
+        s.wait(lambda: s.has("handoff finished") or s.has("handoff cancelled"), 300, "the end of the handoff")
+        if action == "clear":
+            s.wait(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1]), 300, "the resumed turn to end")
+        else:
+            s.wait(lambda: stopped_after_compact(s), 300, "the resumed turn to end")
+        s.wait_idle()
+        a = s.audit()
+        sids = s.sids()
+        ent_old = s.entries(old)
+        # 重置前的记录（clear：旧 transcript；compact：同一个文件里压缩边界之前）与重置后的记录
+        if action == "clear":
+            pre, post = ent_old, (s.entries(sids[1]) if len(sids) > 1 else [])
+        else:
+            post = after_compact(ent_old)
+            pre = ent_old[: len(ent_old) - len(post)]
+        mine = lambda e: e.get("type") == "user" and (e.get("origin") or {}).get("name") == "ahq"
+        c.ok(s.count(f"turn ended; running /{action}") == 1, f"/{action} queued exactly once ({s.count(f'turn ended; running /{action}')})")
+        c.ok(not any(x.startswith("handoff cancelled") for x in a), "nothing cancelled")
+        i_run = next((i for i, x in enumerate(a) if x.startswith(f"turn ended; running /{action}")), None)
+        i_msg = next((i for i, x in enumerate(a) if x.startswith(f"a user message arrived before the queued /{action}")), None)
+        c.ok(i_run is not None and i_msg is not None and i_run < i_msg, "the queued message reached AutoHandoff after the reset was queued (the measured order)")
+        c.ok(any(mine(e) for e in pre) and not any(mine(e) for e in post), f"the queued message was answered before the /{action}, in the old conversation")
+        c.ok(any("The handoff you registered is still in effect" in json.dumps(e, ensure_ascii=False) for e in pre), "it carried the reset note")
+        c.ok(any(f'Registered handoff file: \\"{handover}\\"' in json.dumps(e, ensure_ascii=False) for e in pre), "the note names the registered handoff file")
+        if action == "clear":
+            c.ok(len(sids) == 2, f"exactly two sessions ({len(sids)})")
+        else:
+            c.ok(len(sids) == 1 and len(compact_starts(s)) == 1, f"same session, one SessionStart(compact) ({len(sids)}, {len(compact_starts(s))})")
+        c.ok("handoff finished: resumed" in a, "the resume message was submitted after the reset")
+        c.ok(not s.has("resume message skipped"), "the resume message was not skipped")
+        c.ok(len(resume_entries(post)) == 1, f"exactly one resume message after the reset ({len(resume_entries(post))})")
+        c.ok(attachments(post, f"This conversation was just reset by AutoHandoff (/{action})"), "start context after the reset")
+        c.ok(QUEUED_WORD in open(handover, encoding="utf-8").read(), f"the request was added to the registered handoff file ({QUEUED_WORD})")
+        c.ok(os.path.exists(done_file), "the work in the handoff file was done after the reset (notes/done.txt)")
+        c.ok(QUEUED_WORD in assistant_text(post), f"the conversation after the reset honoured the request ({QUEUED_WORD})")
+        again = [x for x in a if x.startswith("registration refused: a reset is already in progress")]
+        c.note(f"registration attempts while the reset was queued: {len(again)}")
+        c.note(" | ".join(x for x in a if x.startswith(("handoff", "turn ended", "a user message", "record moved", "registration", "message: origin"))))
+    except TimeoutError as e:
+        c.ok(False, str(e).splitlines()[0])
+        c.note("\n".join(str(e).splitlines()[1:40]))
+    finally:
+        s.close()
+    return c
+
+
+ESCQ_PAUSED = "AutoHandoff is paused until the user's next message or command"
+ESCQ_TOAST = "AutoHandoff: handoff cancelled (the queued reset was called off by Esc)"
+
+
+def scenario_escq(work):
+    """Esc 否决已排队的重置（PLAN §0 第 33 条 (b)、第 34 条）。辅助 mod 排一条消息到登记那个回合后面（同 queued），它要模型跑一条
+    45 秒的命令；驱动在这个回合里按 Esc。引擎把排在后面的 /clear 一并移出队列（command.run 以「removed from the queue」被拒）。
+    期望：重置没有执行（sid 不变、没有 SessionEnd(clear)）；toast 恰好一次；之后一条代理消息（第一个回合里起的后台命令结束，
+    任务通知开一个回合）不引出重新登记——它带着一次作废说明和「先别再交接」那句，没有完整提醒、没有新的登记和重置、没有第二个 toast；
+    之后用户发一句话，提醒随这条消息恢复。任务通知在 Esc 之后投不投递由引擎定：等不到就只记一笔，其余照查。"""
+    reset_project(work)
+    c = Check("escq: Esc in the turn ahead of the queued /clear calls the reset off; AutoHandoff pauses until the user's next input")
+    text = ('One more check before the reset: run `python3 -c "import time; time.sleep(45); print(42)"` with the Bash tool '
+            "and reply with its output.")
+    go = os.path.join(proj(work), ".go-escq")
+    s = Session(work, "escq", extra=("--plugin-dir", copy_queue_mod(work)), ah_env="AHQ_TEXT=" + shlex.quote(text))
+    try:
+        sid = s.sids()[0]
+        s.send(
+            TEST_INTRO + "(1) Start `python3 tools/wait_for.py .go-escq` with the Bash tool with run_in_background set to true. "
+            "(2) Read data/catalog.md in full with the Read tool (it is background only). "
+            "(3) Write docs/HANDOVER.md (replace its content) with: '# Handover\\n\\nTask: list src.\\nA background command "
+            "`python3 tools/wait_for.py .go-escq` is running; when its result arrives, tell the user BG-DONE.\\nNext step: run ls src.' "
+            f"(4) Call the {TOOL} tool with file docs/HANDOVER.md. (5) End your turn with one short sentence."
+        )
+        s.wait(lambda: s.has("turn ended; running /clear") or s.has("handoff cancelled"), 240, "the queued /clear")
+        s.wait(lambda: s.has("a user message arrived before the queued /clear"), 60, "the queued message's turn")
+        s.wait(lambda: "time.sleep(45)" in s.pane(), 120, "the slow command to start")
+        time.sleep(2)
+        s.keys("Escape")
+        s.wait(lambda: s.has("handoff cancelled"), 60, "the veto")
+        s.wait_idle()
+        n_esc = len(s.audit())
+        stops_esc = len(s.stops(sid))
+        # 后台命令结束：任务通知（代理类消息）在主对话里开一个回合
+        open(go, "w").close()
+        delivered = True
+        try:
+            s.wait(lambda: any(x.startswith("message: origin task-notification") for x in s.audit()[n_esc:]), 90, "the task notification")
+            s.wait(lambda: len(s.stops(sid)) > stops_esc, 180, "the end of the notification's turn")
+            s.wait_idle()
+        except TimeoutError as e:
+            delivered = False
+            c.note("the task notification did not open a turn before the user's next input: " + str(e).splitlines()[0])
+        n_task = len(s.audit())
+        toasts_task = [x for x in s.shown() if "handoff cancelled" in x]
+        sids_task = list(s.sids())
+        status_task = s.statuses()
+        # 用户回来发一句话：挂起解除，提醒随这条消息恢复
+        s.send("Reply with the single word OK.")
+        s.wait(lambda: any(x.startswith("message: origin composer") for x in s.audit()[n_task:]), 60, "the user's message")
+        s.wait(lambda: any(x.startswith(("remind sent", "urge sent")) for x in s.audit()[n_task:]), 120, "the reminder after the user's message")
+        a = s.audit()
+        ent = s.entries(sid)
+        hooks = s.hooks()
+        veto, between, after = a[:n_esc], a[n_esc:n_task], a[n_task:]
+        c.ok(sum(1 for x in veto if x.startswith("turn ended; running /clear")) == 1, "/clear was queued once")
+        c.ok(any(x.startswith("/clear (request") and "removed from the queue" in x for x in veto), "Claude Code dropped the queued /clear with the interrupted turn")
+        c.ok("handoff cancelled: the queued reset was called off by Esc" in veto, "cancelled as called off by Esc")
+        c.ok(not any(h.get("hook_event_name") == "SessionEnd" and h.get("reason") == "clear" for h in hooks) and sids_task == [sid],
+             f"the reset did not run (sessions: {len(sids_task)})")
+        c.ok(toasts_task == [ESCQ_TOAST], f"the cancellation was shown once ({toasts_task})")
+        c.ok(status_task[-1:] == ["paused until your next input (stopped with Esc)"], f"the status line says it is paused ({status_task[-1:]})")
+        if delivered:
+            c.ok(attachments(ent, ESCQ_PAUSED), "the agent message carried the cancel notice with the pause sentence")
+            c.ok(not any(x.startswith(("remind sent", "urge sent")) for x in between), "no reminder while paused")
+            c.ok(not any(x.startswith("handoff registered") for x in between), "no new registration while paused")
+            c.ok(not any(x.startswith("turn ended; running") for x in between), "no reset queued while paused")
+            refused = [x for x in between if x.startswith("registration refused: the user stopped the session with Esc")]
+            c.note(f"registration attempts refused while paused: {len(refused)}")
+        c.ok(s.statuses()[-1:] == [None], "the status line was cleared by the user's message")
+        c.ok(any(x.startswith(("remind sent", "urge sent")) for x in after), "the user's next message brought the reminder back")
+        c.ok(attachments(ent, "[AutoHandoff: reminder]") or attachments(ent, "[AutoHandoff: hand off now]"), "the reminder reached the model")
+        c.note(" | ".join(x for x in a if x.startswith(("handoff", "turn ended", "a user message", "the reset was", "/clear", "remind", "urge", "registration", "message: origin"))))
+    except TimeoutError as e:
+        c.ok(False, str(e).splitlines()[0])
+        c.note("\n".join(str(e).splitlines()[1:40]))
+    finally:
+        s.close()
+        if os.path.exists(go):
+            os.remove(go)
+    return c
+
+
 def scenario_agentdialog(work):
     """编排模式：后台子代理的权限框开着时主回合结束、/clear 排队（审查员第 3 批第 4 点）。
     实测这个权限框不会挡住排队的 /clear：主回合一结束就重置，权限框跨过重置留着；用户答复后子代理跑完，汇报落到新对话，
@@ -1429,6 +1607,9 @@ SCENARIOS = {
     "userclear": scenario_userclear,
     "chain": scenario_chain,
     "limit": scenario_limit,
+    "queued": scenario_queued,
+    "queuedc": lambda w: scenario_queued(w, action="compact"),
+    "escq": scenario_escq,
 }
 
 

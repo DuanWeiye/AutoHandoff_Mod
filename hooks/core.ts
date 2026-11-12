@@ -116,7 +116,8 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
   action:
     'How the conversation is reset once a handoff is registered and the turn has ended: "clear" runs /clear, "compact" runs /compact <compact_focus>; the resume message is sent after either.',
   fresh_minutes: 'The handoff file must have been modified within this many minutes when it is registered.',
-  wait_minutes: 'Give up (and tell the model) if the turn has not ended this many minutes after registering.',
+  wait_minutes:
+    'Give up (and tell the model) if the turn has not ended this many minutes after registering. A reset that is already queued cannot be withdrawn: if it has not run after the conversation has been idle this long in total, it is set aside (you and the model are told), and the handoff still applies if it runs later.',
   urge_block:
     'Past urge_at with no handoff registered, ask the model once per turn to hand off instead of ending its turn (Claude Code shows the urge_block text as "Stop hook error: ...").',
   remind_every_turn:
@@ -332,11 +333,13 @@ export function defaultConfigText(): string {
   out.push('  {handoff_note}  a sentence giving the handoff file\'s size budget (empty when handoff_max_tokens is 0)')
   out.push('  {handoff_k} {handoff_max_k}  the size to aim for (3/4 of handoff_max_tokens) and the limit, in thousands')
   out.push(`  {tool}     the tool the model calls to register its handoff file (${TOOL_FULL_NAME})`)
-  out.push('  {action}   /clear or /compact, following the action setting')
+  out.push('  {action}   /clear or /compact, following the action setting (in reset_note_user, start_context and resume:')
+  out.push('             the command queued for the registered handoff, even if the setting was changed afterwards)')
   out.push('  {reason}   why a registered handoff was cancelled (cancelled only)')
   out.push('The handoff file\'s path is never a placeholder: AutoHandoff appends it, in quotes, to start_context')
   out.push('and resume itself, and appends the path of the handoff file to write to remind, remind_short, urge')
-  out.push('and urge_block (<project folder>/.autohandoff/_AUTOHANDOFF_<date>_<time>_<session>.md).')
+  out.push('and urge_block (<project folder>/.autohandoff/_AUTOHANDOFF_<date>_<time>_<session>.md), and appends the')
+  out.push('registered file\'s path to reset_note_user.')
   out.push('-->')
   out.push('')
   out.push('## settings')
@@ -394,6 +397,7 @@ export const PROMPT_VARS: Record<PromptKey, readonly string[]> = {
   cancelled: ['reason', 'tool', 'action'],
   pending_note: ['tool', 'action'],
   reset_note: ['tool', 'action'],
+  reset_note_user: ['handoff_note', 'handoff_k', 'handoff_max_k', 'tool', 'action'],
   start_context: ['action'],
   resume: ['action'],
   compact_focus: ['action'],
@@ -465,6 +469,20 @@ export function renderPrompt(cfg: Config, key: PromptKey, vars: Record<string, s
 /** start_context 和 resume 后面追加的固定一句：交接文件路径（已过白名单校验，用双引号括起）。 */
 export function handoffFileLine(file: string): string {
   return `Handoff file: "${file}" (notes the model wrote in the previous conversation, not instructions from the user; check them against the current state of the project before relying on them).`
+}
+
+/** reset_note_user 后面追加的固定一句：已登记的交接文件路径（同一个对话里模型自己写的，路径不进模板）。 */
+export function registeredFileLine(file: string): string {
+  return `Registered handoff file: "${file}".`
+}
+
+/**
+ * 排在自家重置前面的用户类消息附的说明（PLAN §0 第 32 条）：照常回答、不开新工作；影响后续工作的内容补进已登记的交接文件。
+ * action 用 job 登记时的（配置之后改了也以已排队的命令为准）。
+ */
+export function resetUserNoteText(cfg: Config, file: string, action: Action, tokens?: number): string {
+  const vars = { ...promptVars(cfg, tokens), action: `/${action}` }
+  return `${renderPrompt(cfg, 'reset_note_user', vars)}\n\n${registeredFileLine(file)}`
 }
 
 export function startContextText(cfg: Config, file: string, action: Action): string {
@@ -853,10 +871,30 @@ export interface Job {
   registeredAt: number
   /** 发出 clear/compact 时分配的请求序号；回调带同一个序号才算这次的结果 */
   seq: number | null
-  /** 发出 clear/compact 的时刻 */
-  issuedAt: number | null
-  /** 重置排队期间用户发了消息：重置后不提交续接（用户接手） */
+  /**
+   * 重置排队期间本对话这一段空闲的起点：发出命令时、排在它前面的回合结束时、热重载时（回合状态不明，先当作空闲）；
+   * 见到回合在跑（turn.start、工具调用、Stop）时为 null。排队的命令空闲时才执行，所以「没有结果」只算空闲的时间（tick）
+   */
+  idleAt: number | null
+  /**
+   * 之前各段空闲累计的毫秒数（不含 idleAt 起的这一段）。空闲是累计的，不随每个回合结束重新计满：命令还在队列里时，
+   * 回合之间的空闲只有几十毫秒（引擎立刻取下一项），累计不起来；命令其实已经不在了、用户接着对话时（热重载后旧模块报不回结果），
+   * 回合之间的空闲会累计到 wait_minutes，不会无限期地停在「重置中」
+   */
+  idleSpent: number
+  /**
+   * 用户接手：重置已经发生、这个对话已拿到交接（ctxGiven）之后，自家命令的结果回来之前，用户类消息就到了，
+   * 它由重置后的对话处理，所以不再提交续接。排在自家重置前面、在旧对话里处理掉的消息不算（PLAN §0 第 32 条）。
+   * 只在 ctxGiven 为真时置位。ctxGiven 有两种来历：确定不是自家的重置（自家 /compact 排队时用户的 /clear 先跑完，新对话当场拿到交接），
+   * 那之后的消息确实是接手，一直算数；或一次与自家同种、分不清是谁的重置（sameSeen），那之后的消息只是暂记——排队期间再见到一次
+   * 同种的重置，就知道上一次不是自家的、消息在自家重置之前，清掉（sessionStart）。/clear 换 sid 时在 migrateRecord 里清掉
+   */
   userTook: boolean
+  /**
+   * 自家命令排队期间，对话空闲时见到过一次与它同种的重置（SessionStart 的 source 与 action 相同）：可能就是自家那次（结果随后就到），
+   * 也可能是用户先跑的同种命令。只用来判断暂记的 userTook 何时清掉；随 /clear 搬迁清掉
+   */
+  sameSeen?: true
   /** 新对话的 SessionStart 已附上 start_context */
   ctxGiven: boolean
   /** 重置完成的时刻 */
@@ -887,7 +925,18 @@ export interface TurnMark {
 }
 
 /** 可以告诉模型的作废原因（固定集合） */
-export type TellReason = 'new_message' | 'new_input' | 'api_error' | 'refusal' | 'timeout' | 'reload' | 'file_gone' | 'reset_failed'
+export type TellReason =
+  | 'new_message'
+  | 'new_input'
+  | 'api_error'
+  | 'refusal'
+  | 'timeout'
+  | 'reload'
+  | 'file_gone'
+  | 'reset_failed'
+  | 'stalled'
+  | 'interrupted'
+  | 'stopped'
 
 /** `$.store` 里 `s:<sessionId>` 的值 */
 export interface Rec {
@@ -905,11 +954,21 @@ export interface Rec {
    */
   note: string | null
   job: Job | null
+  /**
+   * 被搁置的重置（PLAN §0 第 20 条）：排队后对话空闲了 wait_minutes 仍没有结果，不再让它挡着本对话（job 已清空，提醒、登记、
+   * 兜底压缩照常），但命令撤不回，原来的 job 留在这里：之后它万一还是执行了，凭它照常给交接并续接（resetDone 按序号认领；
+   * 热重载后的孤儿由 SessionStart 认领）。新的登记、兜底压缩、用户自己的 /clear 或 /compact、进程结束或重启时丢掉
+   */
+  stalled: Job | null
   fallback: Fallback | null
   /** 兜底压缩连续失败的次数（成功一次清零） */
   fallbackFails: number
-  /** 兜底压缩被用户按 Esc 否决过：等下一条人工消息之后再试 */
-  fallbackHeld: boolean
+  /**
+   * 挂起：自家发的命令（重置、兜底压缩）被引擎以「用户按过 Esc」为由拒绝过。到用户下次输入之前引擎都不执行自发的命令，
+   * 所以这段时间不提醒、不 Stop block、不受理登记、不发兜底压缩（否则每来一条代理消息就白走一遍「提醒 → 登记 → 被拒」）。
+   * 人工消息或用户亲手敲的命令解除（userInput，与连环交接守卫同一个判据）；/clear 搬迁、session.start（进程重启、热重载、/resume 切回）时清掉
+   */
+  held: boolean
   /** 已提示过「模型窗口小于 remind_at」 */
   windowWarned: boolean
   /**
@@ -941,9 +1000,10 @@ export function newRecord(now: number): Rec {
     levels: { remind: false, urge: false },
     note: null,
     job: null,
+    stalled: null,
     fallback: null,
     fallbackFails: 0,
-    fallbackHeld: false,
+    held: false,
     windowWarned: false,
     resumed: false,
     resumedAt: null,
@@ -980,9 +1040,10 @@ function cloneRec(r: Rec): Rec {
     levels: { remind: r.levels?.remind === true, urge: r.levels?.urge === true },
     note: typeof r.note === 'string' ? r.note : null,
     job: r.job ? { ...r.job } : null,
+    stalled: r.stalled ? { ...r.stalled } : null,
     fallback: r.fallback ? { ...r.fallback } : null,
     fallbackFails: typeof r.fallbackFails === 'number' ? r.fallbackFails : 0,
-    fallbackHeld: r.fallbackHeld === true,
+    held: r.held === true,
     windowWarned: r.windowWarned === true,
     resumed: r.resumed === true,
     // 4.2.0 之前存下的记录没有这两项：读成 null
@@ -997,7 +1058,9 @@ function cloneRec(r: Rec): Rec {
 
 /**
  * /clear 换了 session id 后，把旧记录搬到新 id 下：开关与 job 保留；回合、各层、挂着的作废说明、兜底压缩及其计数、
- * 续接标记清零（新对话的模型对旧对话里的作废一无所知，说明不能带过去），job 的 ctxGiven 也清掉（新对话还没拿到）。
+ * 续接标记、Esc 之后的挂起清零（新对话的模型对旧对话里的作废一无所知，说明不能带过去；挂起期间能跑的 /clear 只有用户亲手敲的，
+ * 那本身就是人工输入），job 的 ctxGiven、userTook 也清掉
+ * （新对话还没拿到交接，也还没处理过任何消息）。被搁置的重置（stalled）一起带过去（清掉旧对话的可能正是它），这两个标记同样清掉。
  */
 export function migrateRecord(old: Rec, now: number): Rec {
   const r = cloneRec(old)
@@ -1006,10 +1069,16 @@ export function migrateRecord(old: Rec, now: number): Rec {
   r.tell = null
   r.fallback = null
   r.fallbackFails = 0
-  r.fallbackHeld = false
+  r.held = false
   clearResumed(r)
-  // 新对话还没拿到 start_context（用户的 /clear 排在自家 /clear 前面时，中间那个对话拿到的不算）
-  if (r.job) r.job.ctxGiven = false
+  // 新对话还没拿到 start_context（用户的 /clear 排在自家 /clear 前面时，中间那个对话拿到的不算），
+  // 被清掉的那个对话里处理过的消息也不算用户接手
+  for (const j of [r.job, r.stalled]) {
+    if (!j) continue
+    j.ctxGiven = false
+    j.userTook = false
+    delete j.sameSeen
+  }
   r.t = now
   return r
 }
@@ -1116,18 +1185,36 @@ const TELL_TEXT: Record<TellReason, (s: Settings) => string> = {
   reload: () => 'AutoHandoff was restarted or reloaded before the reset',
   file_gone: () => 'the handoff file was missing, empty or moved when the reset was due',
   reset_failed: () => 'the reset command failed',
+  stalled: (s) => `the queued reset did not run within ${s.wait_minutes} minutes`,
+  interrupted: () => 'the queued reset was called off by Esc',
+  stopped: () => "the session was stopped with Esc earlier, and Claude Code runs no reset until the user's next input",
 }
 
 export function tellText(reason: TellReason, s: Settings): string {
   return TELL_TEXT[reason](s)
 }
 
-// 这两段是 command.run 被拒时的实测错误文字：都表示用户刚按过 Esc，视同否决，静默作废
-const VETO_MESSAGES = ['the session was stopped', 'removed from the queue']
+// 这两段是 command.run 被拒时的实测错误文字：都表示用户按过 Esc，视同否决，不重试。
+//   removed from the queue：Esc 打断了排在这条命令前面的回合，命令被移出队列（人就在跟前）；
+//   the session was stopped（and nobody has sent input since）：此前按过 Esc、还没再输入，命令当场被拒（那次 Esc 可能是很久以前的）。
+// 与「登记那个回合本身被 Esc 打断」不同（那是 turnComplete，命令根本没发出，静默作废）：这里重置已经排了队，模型以为它马上发生，
+// 所以要告诉用户和模型；而且到用户下次输入之前引擎不再执行自发的命令，交接整个挂起（Rec.held，见 vetoed）
+const VETO_QUEUE = 'removed from the queue'
+const VETO_MESSAGES = ['the session was stopped', VETO_QUEUE]
 
 function isVeto(message: string): boolean {
   return VETO_MESSAGES.some((m) => message.includes(m))
 }
+
+/** 挂起期间拒绝登记的说明（接在「Not registered: 」后面）：原因和何时恢复 */
+export const HELD_TEXT =
+  "the user stopped the session with Esc, and Claude Code runs no reset for AutoHandoff until the user's next message or command. " +
+  'Carry on without handing off; AutoHandoff reminds you again after that.'
+
+/** 挂起期间送出作废说明时追加的一句：这段时间别再写交接、别再登记（cancelled 模板里那句「再登记时……」要到恢复后才适用） */
+export const HELD_NOTE =
+  "AutoHandoff is paused until the user's next message or command, because Claude Code runs no reset before that. " +
+  'Do not update or register a handoff file until a new AutoHandoff reminder asks for it.'
 
 function statusOf(r: Rec): string | undefined {
   const j = r.job
@@ -1138,6 +1225,7 @@ function statusOf(r: Rec): string | undefined {
     return 'resuming from the handoff file'
   }
   if (r.fallback) return 'compacting (no handoff registered)'
+  if (r.held) return 'paused until your next input (stopped with Esc)'
   return undefined
 }
 
@@ -1173,22 +1261,99 @@ function cancelQuiet(r: Rec, fx: Effect[], why: string): void {
 function cancelTold(r: Rec, s: Settings, fx: Effect[], tell: TellReason, notice: 'toast' | 'both'): void {
   if (!r.job) return
   r.job = null
-  r.tell = tell
-  if (r.levels.urge) r.levels.urge = false
-  else r.levels.remind = false
+  tellModel(r, tell)
   const text = `AutoHandoff: handoff cancelled (${tellText(tell, s)})`
   fx.push({ type: 'log', text: `handoff cancelled: ${tellText(tell, s)}`, debug: true })
   if (notice === 'both') fx.push({ type: 'notify', text })
   fx.push({ type: 'toast', text })
 }
 
+/** 下一条消息告诉模型登记已作废；最高的已提示层退回未提示，下次检查时完整提醒重送 */
+function tellModel(r: Rec, tell: TellReason): void {
+  r.tell = tell
+  if (r.levels.urge) r.levels.urge = false
+  else r.levels.remind = false
+}
+
+/**
+ * 自家已排队的重置被 Esc 否决（resetFailed 带否决文字）。从这时到用户下次输入，引擎不执行自发的命令：整个交接挂起（held）。
+ * 这个对话已拿到交接（用户的 /clear 或一次压缩先跑完）：没有丢什么，新对话的模型也没登记过，静默收尾；
+ * 否则模型还以为登记有效、回合一结束就重置（排在重置前面的消息附的说明也是这么说的）：告诉用户，并在下一条消息告诉模型一次。
+ * 不自动重新排队：是用户按的 Esc，重排也会被拒。命令当场被拒（stopped）时那次 Esc 可能是几小时前的、人不在跟前，所以加通知
+ */
+function vetoed(r: Rec, s: Settings, fx: Effect[], tell: 'interrupted' | 'stopped', why: string): void {
+  r.held = true
+  if (r.job?.ctxGiven) cancelQuiet(r, fx, `the reset was called off (${why})`)
+  else {
+    fx.push({ type: 'log', text: `the reset was called off (${why})`, debug: true })
+    cancelTold(r, s, fx, tell, tell === 'stopped' ? 'both' : 'toast')
+  }
+}
+
+/**
+ * 人在场：人工消息（composer/bridge）或用户亲手敲的命令。连环交接守卫解除（PLAN §0 第 22 条 (b)），Esc 之后的挂起也到此为止
+ * （引擎从用户的这次输入起重新执行自发的命令，实测亲手敲一条命令也算）。两者用同一个判据，只在这里改
+ */
+function userInput(r: Rec): void {
+  clearResumed(r)
+  r.held = false
+}
+
 /**
  * 重置命令已交给 `$.command.run`（clearing/compacting）就撤不回来了（只有 Esc 能否决）：
  * 这阶段用户的命令、关开关、teammate 标记、热重载都不再作废 job，让它带着交接走完（PLAN §0 第 20 条）。
- * 作废只在命令自己的结果（失败、超时）或进程结束时发生。
+ * 作废只在命令自己的结果（失败、被否决）或进程结束时发生；久无结果只是搁置（stall），不丢交接。
  */
 function resetQueued(r: Rec): boolean {
   return r.job?.stage === 'clearing' || r.job?.stage === 'compacting'
+}
+
+/** 重置排队期间见到回合在跑（turn.start、工具调用、Stop）：排队的命令这时轮不到执行，「没有结果」停止计时，已空闲的时间记进累计 */
+function turnSeen(r: Rec, now: number): void {
+  const j = r.job
+  if (!j || !resetQueued(r) || j.idleAt === null) return
+  j.idleSpent += Math.max(0, now - j.idleAt)
+  j.idleAt = null
+}
+
+/** 重置排队期间对话（又）空闲了：从这一刻接着计时，计时器挂到累计空闲满 wait_minutes 的时刻 */
+function idleFrom(j: Job, s: Settings, now: number, fx: Effect[]): void {
+  j.idleAt = now
+  fx.push({ type: 'timer', ms: Math.max(0, s.wait_minutes * 60_000 - j.idleSpent) })
+}
+
+/**
+ * 已排队的重置在对话累计空闲 wait_minutes 后仍没有结果（回调丢了；热重载后命令被否决或失败，旧模块报不回来）：
+ * 不再让它挡着本对话——提醒、登记、兜底压缩恢复——但命令撤不回，job 挪到 stalled 留着，
+ * 之后它万一还是执行了，照常给交接并续接（revive）。交接没有丢，所以给用户的话不说「作废」，只说搁置（toast 加通知：人多半不在跟前）。
+ * 模型那边：它以为回合一结束就重置，要在下一条消息告诉它登记不算数了、提醒重来；但这个对话已拿到交接时（ctxGiven：用户的 /clear
+ * 或一次压缩先跑完）不说——用户 /clear 出来的对话里模型没登记过，告诉它「你的登记作废了」只会引它再交接一次（与 Esc 否决同一处理）
+ */
+function stall(r: Rec, s: Settings, fx: Effect[]): void {
+  const j = r.job
+  if (!j) return
+  r.job = null
+  r.stalled = j
+  if (!j.ctxGiven) tellModel(r, 'stalled')
+  const text = `AutoHandoff: the queued /${j.action} did not run within ${s.wait_minutes} minutes and was set aside; if it still runs, the conversation continues from the handoff file.`
+  fx.push({
+    type: 'log',
+    text: `/${j.action} (request ${j.seq}) set aside: ${tellText('stalled', s)}; if it still runs, the conversation continues from the handoff file`,
+    debug: true,
+  })
+  fx.push({ type: 'notify', text })
+  fx.push({ type: 'toast', text })
+}
+
+/** 被搁置的重置终究执行了：放回 job，照常走完；还没送出的那句作废说明不再送。 */
+function revive(r: Rec, fx: Effect[]): Job | null {
+  const j = r.stalled
+  if (!j || r.job) return null
+  r.job = j
+  r.stalled = null
+  if (r.tell === 'stalled') r.tell = null
+  fx.push({ type: 'log', text: `/${j.action} (request ${j.seq}) ran after all; continuing from the handoff file`, debug: true })
+  return j
 }
 
 export const QUEUED_TOAST = 'AutoHandoff: the reset is already queued and cannot be withdrawn; the conversation will continue from the handoff file.'
@@ -1293,10 +1458,9 @@ function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): voi
   j.stage = 'resuming'
   j.resetAt = now
   if (j.userTook) {
-    // 用户已接手：不续接，也不挡登记
+    // 用户已接手（这个对话已拿到交接，userTook 只在那之后置位）：不续接，也不挡登记
     clearResumed(r)
-    if (j.ctxGiven) finish(r, fx, 'the user wrote during the reset; resume message skipped')
-    else fx.push({ type: 'timer', ms: RESUME_STUCK_MS })
+    finish(r, fx, 'the user wrote during the reset; resume message skipped')
     return
   }
   // 续接开启的对话在解除之前不受理登记（PLAN §0 第 22、31 条）。增量基准此时通常读不到
@@ -1304,6 +1468,8 @@ function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): voi
   r.resumed = true
   r.resumedAt = now
   r.resumedTokens = null
+  // 自家的重置执行了：引擎这时接受自发的命令，挂起（如果有）不再成立
+  r.held = false
   fx.push({ type: 'resume', seq: j.seq ?? 0, text: resumeText(cfg, j.file, j.action) })
   fx.push({ type: 'timer', ms: RESUME_STUCK_MS })
 }
@@ -1346,11 +1512,13 @@ function remindInto(r: Rec, env: Env, tokens: number | undefined, fx: Effect[], 
   const { cfg } = env
   const s = cfg.settings
   if (r.tell) {
-    fx.push({ type: 'context', text: renderPrompt(cfg, 'cancelled', promptVars(cfg, tokens, tellText(r.tell, s))) })
+    const text = renderPrompt(cfg, 'cancelled', promptVars(cfg, tokens, tellText(r.tell, s)))
+    fx.push({ type: 'context', text: r.held ? `${text}\n\n${HELD_NOTE}` : text })
     r.tell = null
     return
   }
-  if (r.job || r.fallback) return
+  // 挂起期间（Esc 之后、用户再输入之前）不提醒：登记了也重置不了
+  if (r.job || r.fallback || r.held) return
   const d = decideLevel(tokens, r.levels, s)
   r.levels = d.levels
   // 用量回落到 remind_at 以下（压缩过）：下一轮交接用新路径
@@ -1376,19 +1544,26 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       // 进程重启时排队的命令随旧进程没了，和登记中的 job 一样作废（PLAN §0 第 24 条）
       r.turn = null
       r.fallback = null
+      // Esc 之后的挂起不带过来：新进程、/resume 切回的对话里引擎并没有停着；热重载分不出来，也清掉——
+      // 引擎其实还停着的话，下一次重置被拒时会再挂起一次（多一轮登记，不会一直循环），反过来留着却可能让一个没人打字的对话永远不提醒
+      r.held = false
+      if (r.stalled) {
+        // 被搁置的重置同理：重启时命令已不存在；热重载后旧模块的回调不会再来，改由 SessionStart 认领
+        if (ev.queuedHere === false) r.stalled = null
+        else r.stalled.orphan = true
+      }
       const j = r.job
       if (j?.stage === 'resuming') finish(r, fx, 'restarted while resuming')
       else if (j && resetQueued(r) && ev.queuedHere === false) {
         fx.push({ type: 'log', text: `restarted: /${j.action} (request ${j.seq}) was queued by a process that has ended`, debug: true })
         cancelTold(r, s, fx, 'reload', 'toast')
       } else if (j && resetQueued(r)) {
-        const left = j.issuedAt === null ? 0 : j.issuedAt + s.wait_minutes * 60_000 - now
-        if (left <= 0) cancelQuiet(r, fx, `restarted, and no result from /${j.action} within ${s.wait_minutes} minutes`)
-        else {
-          j.orphan = true
-          fx.push({ type: 'timer', ms: left })
-          fx.push({ type: 'log', text: `restarted or reloaded while /${j.action} was queued (request ${j.seq}); the next conversation still gets the handoff`, debug: true })
-        }
+        // 排了多久都不作废（命令撤不回）。计时器随重载没了，重挂；回合状态不明，先当作空闲、从此刻起重新累计：
+        // 回合其实还在跑的话，它的下一次工具调用或 Stop 会把计时停掉（turnSeen）
+        j.orphan = true
+        j.idleSpent = 0
+        idleFrom(j, s, now, fx)
+        fx.push({ type: 'log', text: `restarted or reloaded while /${j.action} was queued (request ${j.seq}); the next conversation still gets the handoff`, debug: true })
       } else if (j) cancelTold(r, s, fx, 'reload', 'toast')
       return
     }
@@ -1409,8 +1584,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         // teammate 进程从不收到人工输入：收到了就说明之前的判断不对
         r.human = true
         r.teammate = false
-        r.fallbackHeld = false
-        clearResumed(r)
+        userInput(r)
       }
       if (o.cls === 'own') return
       if (o.cls === 'meta') {
@@ -1423,13 +1597,22 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         if (o.cls === 'user') cancelTold(r, s, fx, o.human ? 'new_message' : 'new_input', 'toast')
         else fx.push({ type: 'context', text: renderPrompt(cfg, 'pending_note', promptVars(cfg, ev.tokens)) })
       } else if (j && (j.stage === 'clearing' || j.stage === 'compacting')) {
-        if (o.cls === 'user') {
-          // 与排队中的重置竞争：放行，消息落到新对话，之后不再提交续接
+        if (o.cls !== 'user') {
+          // 代理类消息排在自家重置前面、在旧对话里开了一个回合：告诉模型马上要重置，别开新工作
+          fx.push({ type: 'context', text: renderPrompt(cfg, 'reset_note', promptVars(cfg, ev.tokens)) })
+        } else if (j.ctxGiven) {
+          // 重置已经发生、这个对话已拿到交接，只是自家命令的结果还没回来：消息由重置后的对话处理，用户接手，不再提交续接
           j.userTook = true
           fx.push({ type: 'log', text: 'a user message arrived during the reset; the resume message will be skipped', debug: true })
         } else {
-          // 代理类消息排在自家重置前面、在旧对话里开了一个回合：告诉模型马上要重置，别开新工作
-          fx.push({ type: 'context', text: renderPrompt(cfg, 'reset_note', promptVars(cfg, ev.tokens)) })
+          // 回合结束前就在排队的消息（Remote Control 发来的、别的插件或定时任务提交的）排在自家重置前面，引擎先在旧对话里
+          // 为它开一个回合，答完才重置：不算用户接手，重置后照常续接；告诉模型答完就重置，要留给新对话的内容补进交接文件
+          fx.push({ type: 'context', text: resetUserNoteText(cfg, j.file, j.action, ev.tokens) })
+          fx.push({
+            type: 'log',
+            text: `a user message arrived before the queued /${j.action} (request ${j.seq}); it is answered in this conversation, and the resume message follows the reset`,
+            debug: true,
+          })
         }
       }
       if (!effectiveOn(r, s)) {
@@ -1443,13 +1626,15 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     case 'userCommand': {
       r.human = true
       r.teammate = false
-      // 用户亲手敲的命令说明人在场，与人工消息一样解除连环交接守卫（PLAN §0 第 22 条 (b)）；
+      // 用户亲手敲的命令说明人在场，与人工消息一样解除连环交接守卫（PLAN §0 第 22 条 (b)）和 Esc 之后的挂起；
       // 用户的 /compact 也因此先解除、后压缩，压缩后用量回落不会让守卫重新挡住
-      clearResumed(r)
+      userInput(r)
       if (ev.command === 'clear' || ev.command === 'compact' || ev.command === 'resume') {
         if (resetQueued(r)) keepQueued(r, fx, `the user ran /${ev.command}`, ev.command === 'resume' ? resumeQueuedToast(r.job!.action) : QUEUED_TOAST)
         else cancelQuiet(r, fx, `the user ran /${ev.command}`)
       }
+      // 用户自己重置对话：接下来的 SessionStart 是用户这次的，被搁置的重置不再认领
+      if (ev.command === 'clear' || ev.command === 'compact') r.stalled = null
       return
     }
     case 'toggle': {
@@ -1468,8 +1653,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         fx.push({ type: 'log', text: 'Usage: /autohandoff [on|off|status] (no argument toggles)' })
         return
       }
-      // 亲手开关（不含 status：查看状态不改变正在查看的守卫）与其它亲手敲的命令一样解除连环交接守卫
-      if (turnOn !== null && ev.typed === true) clearResumed(r)
+      // 亲手开关（不含 status：查看状态不改变正在查看的守卫和挂起）与其它亲手敲的命令一样解除连环交接守卫和挂起
+      if (turnOn !== null && ev.typed === true) userInput(r)
       if (turnOn === true) {
         r.on = true
         warnWindow(r, s, ev.window, fx)
@@ -1499,10 +1684,13 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     }
     case 'turnStart': {
       r.turn = { id: ev.turnId, stopSeen: false, blocked: false }
-      if (r.job?.stage === 'resuming' && r.job.userTook) finish(r, fx, 'the user continued after the reset')
+      turnSeen(r, now)
       return
     }
     case 'postTool': {
+      // 没听到这个回合的 turn.start（热重载落在回合中间）：工具调用说明回合在跑，补上回合标记
+      if (!r.turn) r.turn = { id: null, stopSeen: false, blocked: false }
+      turnSeen(r, now)
       if (!effectiveOn(r, s)) {
         r.tell = null
         return
@@ -1514,7 +1702,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     case 'stop': {
       if (!r.turn) r.turn = { id: null, stopSeen: false, blocked: false }
       r.turn.stopSeen = true
-      if (!effectiveOn(r, s) || !s.urge_block || ev.active || r.turn.blocked || r.job || r.fallback || ev.tokens === undefined) return
+      turnSeen(r, now)
+      if (!effectiveOn(r, s) || !s.urge_block || ev.active || r.turn.blocked || r.job || r.fallback || r.held || ev.tokens === undefined) return
       // 没有工具调用的回合里用量可能一步跨过 urge_at，PostToolUse 没机会置位：这里按同样的规则补上，block 本身就是那次 urge
       const d = decideLevel(ev.tokens, r.levels, s)
       if (!d.levels.urge) return
@@ -1536,6 +1725,19 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (ev.tokens !== undefined && ev.tokens < s.remind_at) clearLevels(r)
       const aborted = ev.isAborted || ev.reason === 'aborted'
       const j = r.job
+      if (j && resetQueued(r)) {
+        if (aborted && j.orphan) {
+          // 热重载后旧模块报不回否决。回合被 Esc 打断时引擎把排在后面的命令一并移出队列（实测，与 resetFailed 的否决文字
+          // 是同一件事）：按否决处理，不让用户接下来的每条消息都被告知「登记仍有效、回合结束就重置」。
+          // 这是推断：命令万一还在、之后执行了，留在 stalled 里的这份照常认领续接（交接不丢）
+          vetoed(r, s, fx, 'interrupted', `the turn ahead of request ${j.seq} was interrupted after a reload`)
+          r.stalled = j
+          return
+        }
+        // 排在重置前面的消息引出的回合结束了：对话又空闲，排队的命令这就该执行；「没有结果」接着计时
+        idleFrom(j, s, now, fx)
+        return
+      }
       if (j?.stage === 'armed') {
         if (!effectiveOn(r, s)) cancelQuiet(r, fx, 'AutoHandoff is off at the end of the turn')
         else if (aborted) cancelQuiet(r, fx, 'the turn was interrupted')
@@ -1548,10 +1750,9 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         else {
           j.stage = j.action === 'clear' ? 'clearing' : 'compacting'
           j.seq = nextSeq(r)
-          j.issuedAt = now
           const key = jobKey(j)
           fx.push(j.action === 'clear' ? { type: 'clear', seq: j.seq, job: key } : { type: 'compact', seq: j.seq, args: compactArgs(cfg, j.action), job: key })
-          fx.push({ type: 'timer', ms: s.wait_minutes * 60_000 })
+          idleFrom(j, s, now, fx)
           fx.push({ type: 'log', text: `turn ended; running /${j.action} (request ${j.seq})`, debug: true })
         }
         return
@@ -1559,7 +1760,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       const wantFallback =
         !j &&
         !r.fallback &&
-        !r.fallbackHeld &&
+        !r.held &&
         r.fallbackFails < FALLBACK_MAX_FAILS &&
         effectiveOn(r, s) &&
         ev.reason === 'answer' &&
@@ -1567,6 +1768,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         stopSeen &&
         reachedCompactAt(ev.tokens, s)
       if (wantFallback) {
+        // 自己又发出一条命令：被搁置的那次不再认领（免得把这次压缩的 SessionStart 当成它的）
+        r.stalled = null
         r.fallback = { seq: nextSeq(r), since: now }
         fx.push({ type: 'compact', seq: r.fallback.seq, args: compactArgs(cfg, 'compact') })
         fx.push({ type: 'timer', ms: s.wait_minutes * 60_000 })
@@ -1590,6 +1793,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (!effectiveOn(r, s)) return deny('AutoHandoff is off for this conversation.')
       if (r.job && r.job.stage !== 'armed') return deny('a reset is already in progress.')
       if (r.fallback) return deny('a compaction is in progress.')
+      // Esc 之后、用户再输入之前引擎不执行自发的重置：登记了也只会被拒，这段时间不受理
+      if (r.held) return deny(HELD_TEXT)
       // 连环交接守卫：用量的两条解除条件（越过 remind_at、增量够了）已由 trackResume 按这次的用量算过，
       // 基准还没拿到时这次的用量就是基准（增量 0）；读不到用量时仍拒绝
       if (r.resumed) return deny(resumeGuardText(r, ev.tokens, s, now))
@@ -1603,11 +1808,14 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         action: s.action,
         registeredAt: now,
         seq: null,
-        issuedAt: null,
+        idleAt: null,
+        idleSpent: 0,
         userTook: false,
         ctxGiven: false,
         resetAt: null,
       }
+      // 新的登记取代被搁置的那次
+      r.stalled = null
       r.tell = null
       // 「本回合见没见到 Stop」只算登记之后的（之前的 Stop 可能是自家的 urge block）
       if (r.turn) r.turn.stopSeen = false
@@ -1621,11 +1829,13 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (r.fallback?.seq === ev.seq) {
         r.fallback = null
         r.fallbackFails = 0
+        r.held = false
         clearLevels(r)
         fx.push({ type: 'log', text: 'compaction at compact_at done', debug: true })
         return
       }
-      const j = r.job
+      // 被搁置的那条命令终究执行了：照常续接
+      const j = r.stalled?.seq === ev.seq ? revive(r, fx) : r.job
       if (!j || (j.stage !== 'clearing' && j.stage !== 'compacting') || j.seq !== ev.seq) {
         fx.push({ type: 'log', text: `reset request ${ev.seq} finished, but it is no longer the current one; ignored`, debug: true })
         return
@@ -1639,8 +1849,8 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         r.fallback = null
         fx.push({ type: 'log', text: `compaction at compact_at did not run: ${ev.message}`, debug: true })
         if (veto) {
-          // 用户按了 Esc：等用户下一条消息之后再试
-          r.fallbackHeld = true
+          // 用户按过 Esc：到用户下次输入之前引擎不执行自发的命令，挂起（没有登记可作废，不出声）
+          r.held = true
         } else {
           r.fallbackFails += 1
           const gaveUp = r.fallbackFails >= FALLBACK_MAX_FAILS
@@ -1651,12 +1861,19 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         }
         return
       }
+      if (r.stalled?.seq === ev.seq) {
+        // 被搁置的那条命令有了结果，而且是没执行：认领到此为止（搁置时已告诉过模型和用户）
+        fx.push({ type: 'log', text: `reset request ${ev.seq}, given up earlier, did not run (${clip(ev.message, 120)})`, debug: true })
+        r.stalled = null
+        if (veto) r.held = true
+        return
+      }
       const j = r.job
       if (!j || (j.stage !== 'clearing' && j.stage !== 'compacting') || j.seq !== ev.seq) {
         fx.push({ type: 'log', text: `reset request ${ev.seq} failed, but it is no longer the current one; ignored`, debug: true })
         return
       }
-      if (veto) cancelQuiet(r, fx, `the reset was called off (${ev.message})`)
+      if (veto) vetoed(r, s, fx, ev.message.includes(VETO_QUEUE) ? 'interrupted' : 'stopped', ev.message)
       else if (j.stage === 'compacting' && j.ctxGiven) {
         // 自家 /compact 之前用户的 /clear 或 /compact 已经跑完，这个对话已拿到交接（start_context）：自家这次失败也照常续接
         fx.push({ type: 'log', text: `/compact (request ${j.seq}) failed (${clip(ev.message, 120)}), but this conversation already has the handoff; resuming`, debug: true })
@@ -1666,8 +1883,14 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     }
     case 'sessionStart': {
       if (ev.source !== 'clear' && ev.source !== 'compact') return
+      // 回合进行中的压缩只可能是 Claude Code 自己的（上下文快满了）：排队的命令——自家的、用户敲的——都要等对话空闲才执行。
+      // 回合还在继续，回合标记留着
+      const midTurn = ev.source === 'compact' && r.turn !== null
       clearLevels(r)
-      r.turn = null
+      if (!midTurn) r.turn = null
+      // 被搁置的孤儿（热重载后旧模块的 resetDone 不会来）：与它同种的重置到了，就是它，放回来照常走下面的孤儿路径；
+      // 回合中途 CC 自己的压缩不是它（否则会拿一份过时的交接文件去续接）
+      if (r.stalled?.orphan && ev.source === r.stalled.action && !midTurn) revive(r, fx)
       const j = r.job
       if (!j) return
       if (j.stage === 'armed') {
@@ -1675,8 +1898,9 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         if (ev.source === 'clear') cancelQuiet(r, fx, 'the conversation was cleared by someone else')
         return
       }
-      if (resetQueued(r) && ev.source === 'compact' && j.action === 'clear') {
-        // 自家 /clear 排队时用户的 /compact 先跑了：旧对话被压缩、之后还会被清，不是新对话，接着等
+      if (resetQueued(r) && ev.source === 'compact' && (j.action === 'clear' || midTurn)) {
+        // 不是要拿交接的对话，接着等，不给交接：自家 /clear 排队时的压缩（用户的 /compact 先跑了，或 CC 自己压缩：旧对话被压缩、
+        // 之后还会被清）；自家 /compact 排队时回合中途 CC 自己的那次（自家那次要等这个回合结束；孤儿 job 也不把它当成自家的）
         fx.push({ type: 'log', text: `a /${ev.source} not run by AutoHandoff finished while /${j.action} is queued; still waiting for it`, debug: true })
         return
       }
@@ -1689,13 +1913,23 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         return
       }
       // 自家那种重置（排队中）或续接阶段里的任何重置：都是要拿交接的对话
+      if (resetQueued(r)) {
+        if (j.sameSeen && j.userTook) {
+          // 排队期间第二次见到同种的重置：上一次不是自家的（用户的 /compact 排在前面先跑了），那之后出队的消息是在自家重置之前、
+          // 在旧对话里处理掉的，不是「接手了重置后的对话」，自家重置之后照常续接（第 32 条）。自家这次之后、结果回来之前再到的消息
+          // 仍照常记。用户的 /clear 开出的新对话里的消息不在此列：那次确定不是自家的，接手是确定的，自家 /compact 之后也不续接
+          j.userTook = false
+          fx.push({ type: 'log', text: `a second /${ev.source} ran while /${j.action} (request ${j.seq}) is queued, so the earlier one was not ours; the message in between does not count as taking over`, debug: true })
+        }
+        j.sameSeen = true
+      }
       fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
       j.ctxGiven = true
       if (j.orphan && resetQueued(r)) {
         // 热重载后旧模块的 resetDone 不一定会来：由这里完成；它要是晚到了，按「不是当前请求」忽略
         fx.push({ type: 'log', text: `reset request ${j.seq} finished after a restart or reload; continuing from the handoff file`, debug: true })
         afterReset(r, j, cfg, now, fx)
-      } else if (j.stage === 'resuming' && j.userTook) finish(r, fx, 'the user wrote during the reset; resume message skipped')
+      }
       return
     }
     case 'resumeDone': {
@@ -1716,6 +1950,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
     case 'sessionEnd': {
       if (ev.reason === 'clear') return
       r.fallback = null
+      r.stalled = null
       cancelQuiet(r, fx, `the session ended (${ev.reason})`)
       return
     }
@@ -1724,9 +1959,10 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       const j = r.job
       if (j?.stage === 'armed' && now - j.registeredAt >= wait) {
         cancelTold(r, s, fx, 'timeout', 'both')
-      } else if ((j?.stage === 'clearing' || j?.stage === 'compacting') && j.issuedAt !== null && now - j.issuedAt >= wait) {
-        // 兜底出口：promise 一直不 settle（接线漏了 .catch 之类）时不让本对话永久卡在重置中
-        cancelQuiet(r, fx, `no result from /${j.action} within ${s.wait_minutes} minutes; giving up on request ${j.seq}`)
+      } else if (j && resetQueued(r) && j.idleAt !== null && j.idleSpent + (now - j.idleAt) >= wait) {
+        // 排队的命令空闲时就执行。累计空闲了 wait_minutes 仍没有结果：不让本对话永久卡在重置中，但也不丢交接（搁置）。
+        // 有回合在跑（idleAt 为 null）时命令还没机会执行，不算没有结果；回合结束时接着计时
+        stall(r, s, fx)
       } else if (j?.stage === 'resuming' && j.resetAt !== null && now - j.resetAt >= RESUME_STUCK_MS) {
         finish(r, fx, 'no resume result in time')
       }
@@ -1777,9 +2013,14 @@ export function formatStatus(r: Rec, cfg: Config, x: StatusExtra, now: number): 
     const sent = r.levels.urge ? ' Second reminder sent.' : r.levels.remind ? ' First reminder sent.' : ''
     lines.push(`Handoff: none registered.${sent}${r.note === null ? '' : ` Handoff file to write: "${r.note}".`}`)
   }
+  if (r.stalled) lines.push(`An earlier /${r.stalled.action} (request ${r.stalled.seq}) was queued but has not run; if it still runs, the conversation continues from "${r.stalled.file}".`)
   if (r.resumed) lines.push(resumeStatusLine(r, x.tokens, s, now))
+  if (r.held) {
+    lines.push(
+      'Paused: a reset was refused because the session had been stopped with Esc, and Claude Code runs none until your next message or command. Reminders, registering and the compaction at compact_at wait until then.',
+    )
+  }
   if (r.fallbackFails >= FALLBACK_MAX_FAILS) lines.push(`Compaction at compact_at: given up after ${FALLBACK_MAX_FAILS} failures in this conversation.`)
-  else if (r.fallbackHeld) lines.push('Compaction at compact_at: called off by you; it will be tried again after your next message.')
   if (x.configPath) lines.push(`Configuration: ${x.configPath}`)
   const problems = x.problems ?? []
   if (problems.length) {

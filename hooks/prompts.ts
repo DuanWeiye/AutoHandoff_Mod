@@ -1,7 +1,8 @@
 // AutoHandoff 的内置默认提示词（英文）。用户可在 ~/.claude/autohandoff.md 的同名 `## <键名>` 节里覆盖。
 // 占位符写成 {name}，各键能用哪些见 core.ts 的 PROMPT_VARS；不在白名单里的名字原样保留。
 // 路径不进任何模板：start_context 与 resume 后面由代码追加一句固定的、带引号的路径说明；
-// remind、remind_short、urge、urge_block 后面由代码追加本轮要写的交接文件路径（core.ts 的 noteLine，PLAN §0 第 30 条）。
+// remind、remind_short、urge、urge_block 后面由代码追加本轮要写的交接文件路径（core.ts 的 noteLine，PLAN §0 第 30 条）；
+// reset_note_user 后面由代码追加已登记的交接文件路径（core.ts 的 registeredFileLine，PLAN §0 第 32 条）。
 
 export const PROMPT_KEYS = [
   'remind',
@@ -11,6 +12,7 @@ export const PROMPT_KEYS = [
   'cancelled',
   'pending_note',
   'reset_note',
+  'reset_note_user',
   'start_context',
   'resume',
   'compact_focus',
@@ -32,6 +34,8 @@ export const PROMPT_NOTES: Record<PromptKey, string> = {
     'Added to a message from a subagent, a background task or another session that arrives while a handoff is registered (it does not cancel the handoff).',
   reset_note:
     'Added to a message from a subagent, a background task or another session that arrives after the turn ended and the reset is already queued.',
+  reset_note_user:
+    'Added to any other message (yours, a scheduled prompt, another plugin\'s prompt, a channel message, an unknown source: everything that is not from a subagent, a background task or another session) that was waiting in the queue when the registered turn ended, for example one you sent through Remote Control while the model was working. Claude Code runs it before the queued reset, so it is answered in the conversation that is about to be reset. AutoHandoff appends the registered handoff file\'s path itself.',
   start_context:
     'Added to the model\'s context when the reset conversation starts. AutoHandoff appends the handoff file\'s path itself.',
   resume:
@@ -65,6 +69,8 @@ Stop now, in the middle of the step if necessary, and do not start anything else
   pending_note: `[AutoHandoff] A handoff is registered, and the conversation will be reset with {action} when this turn ends; this message did not cancel it. If it changes anything recorded in the handoff file (for example a subagent's result), update the file before the turn ends and call the {tool} tool again to refresh the registration.`,
 
   reset_note: `[AutoHandoff] The conversation is about to be reset with {action} and continued from the registered handoff file; this message arrived in between. Keep this turn short and do not start new work. If this message changes anything recorded in the handoff file (for example a subagent's result), update the file now; the next conversation reads it after the reset.`,
+
+  reset_note_user: `[AutoHandoff] The handoff you registered is still in effect: when this turn ends, the conversation is reset with {action} and continued from the handoff file named below. This message was already waiting when the previous turn ended, so it is answered here, in the conversation that is about to be reset. Answer it as you normally would, but keep this turn short and do not start new work. If it asks for work, changes the plan or settles a question the handoff file lists as open, add that to the handoff file now, so that the next conversation acts on it, and say in your reply that it will be done after the reset; the next conversation continues from that file, not from this exchange.{handoff_note} Edit the file in place: do not write another one and do not call the {tool} tool again, the registration stands.`,
 
   start_context: `[AutoHandoff] This conversation was just reset by AutoHandoff ({action}) after the model wrote a handoff file in the previous conversation. That file is the complete handoff: read it first, and read other project documents only when you need specific details from them. Subagents or background tasks started there may still report here; the handoff file says what they are and what to do with their results. Continue the work the handoff file describes. Do not hand off again right away: hand off again only when a new AutoHandoff reminder asks for it, or when the user's or the project's instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). If the user asks for something else, follow the user.`,
 

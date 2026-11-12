@@ -12,6 +12,7 @@ const CONFIG = `${CC_DIR}/autohandoff.md`
 const AGENT = 'a904d9323568546da'
 const T1 = 'f0b6c7a2-6d1e-4c2a-9a51-1f3e0c9b7d10'
 const T2 = '3a9e1d44-0c5b-4f7e-8b2d-6c1a9f0e2b77'
+const T3 = '7e4b0c19-2d5a-4f38-b6c1-9a0d3e5f7b28'
 const COMPOSER = { kind: 'composer' } as const
 
 // 用户把阈值压低、开着 default_on 的配置（只写 settings 节，提示词用内置）
@@ -742,6 +743,83 @@ test('the user\'s /clear typed during the registered turn: two clears in a row, 
   expect(stored(x, OLD).job).toBeNull()
 })
 
+test('a Remote Control message sent while the registered turn ran: Claude Code runs it before the queued /clear, in the old conversation, with a note; the new conversation is still resumed (1 clear, 1 resume)', async ($, on) => {
+  // 2026-11-12 实例与 e2e 实测的顺序（CC 2.1.322）：回合结束 → turn.complete（自家 /clear 入队）→ 引擎取出早已在排队的消息
+  // （prompt.submit 这时才到）→ 旧对话为它跑一个回合 → /clear 执行 → 新对话
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  w.tokens = 44_600
+  await say($, 'While you are in there: does the cache key include the tenant id, or only the request path?', { kind: 'bridge' })
+  const got = w.delivered.at(-1)!
+  expect(got.context.length).toBe(1)
+  expect(got.context[0]).toStartWith('[AutoHandoff] The handoff you registered is still in effect: when this turn ends, the conversation is reset with /clear')
+  expect(got.context[0]).toEndWith(`Registered handoff file: "${HANDOVER}".`)
+  expect(stored(x, OLD).job.stage).toBe('clearing')
+  expect(stored(x, OLD).job.userTook).toBe(false)
+  expect(w.toasts).toEqual([])
+  // 旧对话里的这个回合：模型把要留给新对话的内容补进交接文件（登记后文件变了不影响已排队的重置），回合正常结束
+  await turnStart($, T2)
+  x.writeHandoff(HANDOVER, 7_310)
+  w.tokens = 46_100
+  expect((await tool($)).additionalContext).toBeUndefined()
+  expect((await stop($)).block).toBeUndefined()
+  await complete($, T2)
+  await clock.settle()
+  // 没有第二次重置；状态行一直是重置中
+  expect(w.commands.length).toBe(1)
+  expect(w.statuses.at(-1)).toBe('resetting the conversation (/clear)')
+  // /clear 执行：promise 先 resolve，再到 SessionStart(clear)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  cmd.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.asUser).toBe(true)
+  expect(w.submits[0]!.text).toStartWith('[AutoHandoff: resume] The context was just reset by AutoHandoff (/clear).')
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  await clock.advance(180)
+  const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  expect(ss.additionalContext?.length).toBe(1)
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  await turnStart($, T3)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+  // 新对话带连环交接守卫（人在旧对话里说过话不解除）
+  expect(stored(x, NEW).resumed).toBe(true)
+  expect(w.submits.length).toBe(1)
+  expect(w.debug.filter((d) => d.startsWith('handoff cancelled'))).toEqual([])
+  expect(w.debug).toContain('a user message arrived before the queued /clear (request 1); it is answered in this conversation, and the resume message follows the reset')
+  expect(w.debug).toContain('handoff finished: resumed')
+})
+
+test('action compact with a message queued ahead of the /compact: answered before the compaction with the note; the compacted conversation gets the start context and the resume message', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('action: clear', 'action: compact') })
+  const { w, clock } = x
+  await armedTurn($, x)
+  await stop($)
+  await complete($, T1)
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['compact'])
+  await say($, 'Also keep the old cache keys readable for one release.', { kind: 'bridge' })
+  expect(w.delivered.at(-1)!.context[0]).toContain('the conversation is reset with /compact and continued from the handoff file named below')
+  await turnStart($, T2)
+  await stop($)
+  await complete($, T2)
+  await clock.settle()
+  expect(w.commands.length).toBe(1)
+  // 压缩中途 SessionStart(compact)，压缩完 promise 才 resolve
+  const ss = await $.classic.SessionStart({ source: 'compact', session_id: OLD })
+  expect(ss.additionalContext![0]).toContain('(/compact)')
+  w.commands[0]!.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain('(/compact)')
+  expect(stored(x, OLD).job.stage).toBe('resuming')
+})
+
 test('/autohandoff off while the /clear is queued: it still resumes, and AutoHandoff is off in the new conversation', async ($, on) => {
   const x = world(on)
   const { w, clock } = x
@@ -788,6 +866,149 @@ test('a hot reload while the /clear is queued: the new module resumes from Sessi
   w.submits[0]!.release()
   await clock.settle()
   expect(stored(x, NEW).job).toBeNull()
+})
+
+test('action compact, and the turn that runs ahead of the queued /compact ends just before wait_minutes is up: the compaction is under way when the timer fires, and the handoff is not dropped', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('action: clear', 'action: compact') })
+  const { w, clock } = x
+  await armedTurn($, x)
+  await stop($)
+  await complete($, T1)
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['compact'])
+  // 回合结束前就在排队的消息让压缩前的对话又干了将近一小时（wait_minutes 是 60）
+  await say($, 'Before you stop: does the cache survive a restart of the worker, or is it rebuilt?', { kind: 'bridge' })
+  await turnStart($, T2)
+  await clock.advance(59 * MIN + 50_000)
+  w.tokens = 71_300
+  await stop($)
+  await complete($, T2)
+  await clock.settle()
+  // /compact 开始执行（十几秒）；发出时挂的 60 分钟计时在这期间到点
+  await clock.advance(12_000)
+  expect(stored(x, OLD).job.stage).toBe('compacting')
+  expect(w.toasts).toEqual([])
+  const ss = await $.classic.SessionStart({ source: 'compact', session_id: OLD })
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  w.commands[0]!.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(w.debug.filter((d) => d.startsWith('handoff cancelled'))).toEqual([])
+})
+
+test('a queued /clear whose result never comes back: after wait_minutes of an idle conversation it is set aside (toast, notification, the model told); when it runs after all, the new conversation is still resumed', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await clock.advance(60 * MIN)
+  const said = 'AutoHandoff: the queued /clear did not run within 60 minutes and was set aside; if it still runs, the conversation continues from the handoff file.'
+  expect(w.toasts).toEqual([said])
+  expect(w.notifies).toEqual([said])
+  expect(w.statuses.at(-1)).toBeUndefined()
+  expect(stored(x, OLD).job).toBeNull()
+  expect(stored(x, OLD).stalled.file).toBe(HANDOVER)
+  await slash($, 'status')
+  expect(w.logs).toContain(`An earlier /clear (request 1) was queued but has not run; if it still runs, the conversation continues from "${HANDOVER}".`)
+  // 命令终究执行了：记录连同被搁置的重置搬到新 sid，照常续接并给交接；旧 sid 的记录里不再留着它
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  cmd.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  await clock.advance(180)
+  const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(stored(x, NEW).job.stage).toBe('resuming')
+  expect(stored(x, NEW).stalled).toBeNull()
+  expect(stored(x, OLD).stalled).toBeNull()
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+})
+
+test('a hot reload during the turn that runs ahead of the queued /clear, then Esc: the old module cannot report that the /clear was dropped, so the interrupted turn itself counts as the veto; the user\'s next messages are not told "still registered", and after a later reload-and-clear by the user nothing is resumed', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await clearQueued($, x)
+  await say($, 'Before you stop: does the cache survive a restart of the worker, or is it rebuilt?', { kind: 'bridge' })
+  await turnStart($, T2)
+  // 回合进行中插件更新、模块热重载；回合还在跑（工具调用照常）
+  await start($)
+  expect(stored(x, OLD).job.orphan).toBe(true)
+  await clock.advance(5 * MIN)
+  w.tokens = 47_800
+  await tool($)
+  // 用户按 Esc 打断这个回合：引擎把排队的 /clear 一起移出队列，旧模块的回调报不回来（这里不让它有结果）
+  await complete($, T2, { isAborted: true, reason: 'aborted' })
+  await clock.settle()
+  // 当场按否决处理（不等空闲计时）：不再显示重置中，告诉用户；命令万一还在，留在 stalled 里的那份照常认领
+  expect(w.toasts).toEqual(['AutoHandoff: handoff cancelled (the queued reset was called off by Esc)'])
+  expect(w.statuses.at(-1)).toBe('paused until your next input (stopped with Esc)')
+  expect(stored(x, OLD).job).toBeNull()
+  expect(stored(x, OLD).stalled.orphan).toBe(true)
+  // 用户接着说话：这条消息告诉模型登记已作废（不是「登记仍有效，回合结束就重置，不要开始新工作」），挂起也到此为止
+  await say($, 'ok, go on with the refactor')
+  expect(w.delivered.at(-1)!.context[0]).toContain('Your registered handoff was cancelled (the queued reset was called off by Esc)')
+  expect(w.delivered.at(-1)!.context.join('\n')).not.toContain('still in effect')
+  expect(w.statuses.at(-1)).toBeUndefined()
+  // 过了一小时也没有第二次通知
+  await clock.advance(61 * MIN)
+  expect(w.toasts.length).toBe(1)
+  // 又一次热重载之后用户自己 /clear：被搁置的那次已经丢掉，新对话不给交接、不续接
+  await start($)
+  const ss = await userClear($, w)
+  await clock.settle()
+  expect(ss.additionalContext).toBeUndefined()
+  expect(w.submits).toEqual([])
+  expect(stored(x, NEW).stalled).toBeNull()
+})
+
+test('a hot reload while the /clear is queued, the command is then lost without a word (the old module cannot report it), and the user keeps working in the conversation: the idle minutes between turns add up to wait_minutes, so it is not held in "resetting" for as long as the user stays', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await clearQueued($, x)
+  // 插件更新、模块热重载；排队的 /clear 之后没有执行，也没有任何结果回来（这里不让它有结果）
+  await start($)
+  expect(stored(x, OLD).job.orphan).toBe(true)
+  // 用户每隔九分钟发一条消息，每个回合一分钟：两次输入的间隔从不到 wait_minutes
+  const round = async (text: string, turnId: string): Promise<readonly string[]> => {
+    await clock.advance(9 * MIN)
+    await say($, text)
+    const context = w.delivered.at(-1)!.context
+    await turnStart($, turnId)
+    await tool($)
+    await clock.advance(1 * MIN)
+    await stop($)
+    await complete($, turnId)
+    await clock.settle()
+    return context
+  }
+  const asks = [
+    'Does the cache survive a restart of the worker?',
+    'Which tests cover the eviction path?',
+    'Show me the diff of src/cache.py once more.',
+    'Is the tenant id part of the cache key?',
+    'What is still failing in tests/test_cache.py?',
+    'Rename CacheEntry.ttl to ttl_seconds everywhere.',
+  ]
+  for (const [i, text] of asks.entries()) {
+    const context = await round(text, `turn-${i}`)
+    // 这段时间消息仍被告知「登记仍有效」：命令还在不在，新模块无从知道
+    expect(context[0]).toContain('The handoff you registered is still in effect')
+    expect(stored(x, OLD).job.stage).toBe('clearing')
+  }
+  expect(w.toasts).toEqual([])
+  // 回合之间的空闲累计到 60 分钟（6 × 9 分钟之后再过 6 分钟）：搁置，状态行清掉，告诉用户；下一条消息告诉模型，不再说「登记仍有效」
+  const context = await round('And update the docstring of get().', 'turn-last')
+  expect(w.toasts).toEqual(['AutoHandoff: the queued /clear did not run within 60 minutes and was set aside; if it still runs, the conversation continues from the handoff file.'])
+  expect(stored(x, OLD).job).toBeNull()
+  expect(stored(x, OLD).stalled.orphan).toBe(true)
+  expect(context[0]).toContain('Your registered handoff was cancelled (the queued reset did not run within 60 minutes)')
+  expect(w.statuses.at(-1)).toBeUndefined()
 })
 
 test('session.receive: a team-lead delivery to one of this session\'s agents (agentId) is ignored; one to the main conversation of a fresh process marks it as a teammate', async ($, on) => {

@@ -2,6 +2,8 @@
 import { expect, test } from 'claude-code/testing'
 import {
   FALLBACK_MAX_FAILS,
+  HELD_NOTE,
+  HELD_TEXT,
   QUEUED_TOAST,
   RESUME_STUCK_MS,
   TOOL_FULL_NAME,
@@ -298,17 +300,133 @@ test('a refusal cancels with a toast; a vanished or unchecked handoff file cance
   expect(contexts(next.all)[0]).toContain('cancelled (the handoff file was missing, empty or moved when the reset was due)')
 })
 
-test('a rejected reset command: Esc vetoes are silent, other failures are reported', () => {
+test('a rejected reset command: an Esc veto of the queued reset is shown and the model is told, and AutoHandoff pauses until the user\'s next input; other failures are reported as before', () => {
   const { rec, seq } = clearing()
-  for (const message of [VETO, 'the command was removed from the queue before it ran']) {
-    const a = run(rec, [{ kind: 'resetFailed', seq, message }])
-    expect(a.rec.job).toBe(null)
-    expect(a.rec.tell).toBe(null)
-    expect(ofType(a.all, 'toast')).toEqual([])
-  }
+  // Esc 打断了排在 /clear 前面的回合，命令被移出队列：人就在跟前，只 toast，不发通知；也不重新排队
+  const a = run(rec, [{ kind: 'resetFailed', seq, message: 'the command was removed from the queue before it ran' }])
+  expect(a.rec.job).toBe(null)
+  expect(a.rec.tell).toBe('interrupted')
+  expect(a.rec.held).toBe(true)
+  expect(ofType(a.all, 'toast')).toEqual([{ type: 'toast', text: 'AutoHandoff: handoff cancelled (the queued reset was called off by Esc)' }])
+  expect(ofType(a.all, 'notify')).toEqual([])
+  expect(ofType(a.all, 'clear')).toEqual([])
+  expect(ofType(a.all, 'status')).toEqual([{ type: 'status', text: 'paused until your next input (stopped with Esc)' }])
+  // 此前按过 Esc、还没再输入，/clear 一发出就被拒：那次 Esc 可能是几小时前的，人不在跟前，toast 加通知，说法也不同
+  const s = run(rec, [{ kind: 'resetFailed', seq, message: VETO }])
+  const said = "AutoHandoff: handoff cancelled (the session was stopped with Esc earlier, and Claude Code runs no reset until the user's next input)"
+  expect(s.rec.job).toBe(null)
+  expect(s.rec.tell).toBe('stopped')
+  expect(s.rec.held).toBe(true)
+  expect(ofType(s.all, 'toast')).toEqual([{ type: 'toast', text: said }])
+  expect(ofType(s.all, 'notify')).toEqual([{ type: 'notify', text: said }])
+  expect(ofType(s.all, 'clear')).toEqual([])
+  // 别的失败不是否决：不挂起
   const b = run(rec, [{ kind: 'resetFailed', seq, message: 'autohandoff: $.command.run: unknown command "clear"' }])
   expect(b.rec.tell).toBe('reset_failed')
+  expect(b.rec.held).toBe(false)
   expect(ofType(b.all, 'toast').length).toBe(1)
+})
+
+test('Esc, then nobody types for hours while background agents keep reporting: the first refused reset is announced once, after that no reminder, no registration and no reset until the user\'s next input', () => {
+  // 用户早先按 Esc 停过一个回合（与交接无关）后离开。用量已过 remind_at、提醒送过；后台子代理的报告陆续到达，各开一个回合
+  const TASK = { kind: 'task-notification' }
+  const T3 = '9c2f6a1e-7b3d-4e8f-a1c2-5d6e7f8a9b0c'
+  const note = { dirs: [REPO], sid: '5f1c2a9e-3b7d-4c11-9e0a-2d4f6b8c1e33', windows: false }
+  const start = onRecord({ levels: { remind: true, urge: false } })
+  // 第一条报告：短提醒 → 模型写交接、登记 → 回合结束 → /clear 一发出就被引擎拒绝
+  const first = run(
+    start,
+    [
+      { kind: 'submit', origin: TASK, tokens: 318_400 },
+      { kind: 'turnStart', turnId: T1 },
+      { kind: 'postTool', tokens: 321_000 },
+      REG,
+      { kind: 'stop', active: false, tokens: 323_000 },
+      { ...DONE, tokens: 323_000 },
+    ],
+    defaultConfig(),
+    note,
+  )
+  expect(contexts(first.steps[0]!.fx)[0]).toStartWith('[AutoHandoff] Context usage is about 318k tokens')
+  const seq = lastSeq(first.all)
+  const refused = run(first.rec, [{ kind: 'resetFailed', seq, message: VETO }])
+  expect(refused.rec.held).toBe(true)
+  expect(ofType(refused.all, 'toast').length).toBe(1)
+  expect(ofType(refused.all, 'notify').length).toBe(1)
+  // 第二条报告：作废说明只送这一次，带一句「先别再交接」；完整提醒不重送；模型若仍去登记，被拒并得知原因和何时恢复；回合结束什么也不发
+  const second = run(
+    refused.rec,
+    [
+      { kind: 'submit', origin: TASK, tokens: 323_500 },
+      { kind: 'turnStart', turnId: T2 },
+      { kind: 'postTool', tokens: 326_000 },
+      REG,
+      { kind: 'stop', active: false, tokens: 327_000 },
+      { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 327_000, file: FILE_OK },
+    ],
+    defaultConfig(),
+    note,
+  )
+  expect(contexts(second.steps[0]!.fx)).toEqual([
+    "[AutoHandoff] Your registered handoff was cancelled (the session was stopped with Esc earlier, and Claude Code runs no reset until the user's next input). Deal with that first. If you register again, in this turn or later, first update the handoff file with everything new since you wrote it, above all what the user has just asked for or answered, so that the next conversation has it (next steps are the work itself, never \"hand off again\"); then call the mcp__autohandoff__register_handoff tool again.\n\n" +
+      HELD_NOTE,
+  ])
+  expect(contexts(second.steps[2]!.fx)).toEqual([])
+  expect(second.steps[3]!.accepted).toBe(false)
+  expect(second.steps[3]!.reply).toBe(`Not registered: ${HELD_TEXT}`)
+  expect(second.rec.job).toBe(null)
+  expect(ofType(second.all, 'clear')).toEqual([])
+  expect(ofType(second.all, 'toast')).toEqual([])
+  // 第三条、别的插件提交的一条（用户类、不是人打的）、过了 urge_at、过了 compact_at：都不附任何内容，不 block，不发兜底压缩
+  const quiet = run(
+    second.rec,
+    [
+      { kind: 'submit', origin: TASK, tokens: 327_500 },
+      ...oldTurn(T3, 329_000),
+      { kind: 'submit', origin: { kind: 'plugin', name: 'scheduler' }, tokens: 329_500 },
+      { kind: 'turnStart', turnId: T1 },
+      { kind: 'postTool', tokens: 455_000 },
+      { kind: 'stop', active: false, tokens: 655_000 },
+      { kind: 'turnComplete', turnId: T1, reason: 'answer', isAborted: false, tokens: 655_000 },
+    ],
+    defaultConfig(),
+    note,
+  )
+  expect(quiet.all.filter((f) => f.type !== 'log')).toEqual([])
+  expect(quiet.rec.held).toBe(true)
+  expect(quiet.rec.fallback).toBe(null)
+  // /autohandoff status 说明在等什么；查看状态本身不解除
+  const st = run(quiet.rec, [{ kind: 'toggle', args: 'status', typed: true, tokens: 655_000 }])
+  expect(ofType(st.all, 'log')[0]!.text).toContain('Paused: a reset was refused because the session had been stopped with Esc, and Claude Code runs none until your next message or command.')
+  expect(st.rec.held).toBe(true)
+  // 用户回来发了一句话：挂起解除，这条消息就带完整提醒（用量早过了 urge_at），登记受理，回合结束照常重置
+  const back = run(
+    second.rec,
+    [
+      { kind: 'submit', origin: COMPOSER, tokens: 327_500 },
+      { kind: 'turnStart', turnId: T3 },
+      { kind: 'postTool', tokens: 329_000 },
+      REG,
+      { kind: 'stop', active: false, tokens: 330_000 },
+      { kind: 'turnComplete', turnId: T3, reason: 'answer', isAborted: false, tokens: 330_000, file: FILE_OK },
+    ],
+    defaultConfig(),
+    note,
+  )
+  expect(back.steps[0]!.rec.held).toBe(false)
+  expect(ofType(back.steps[0]!.fx, 'status')).toEqual([{ type: 'status', text: undefined }])
+  expect(contexts(back.steps[0]!.fx)[0]).toContain('past the first threshold of 300k')
+  expect(back.steps[3]!.accepted).toBe(true)
+  expect(ofType(back.all, 'clear').length).toBe(1)
+  // 亲手敲一条命令同样解除（引擎也从这时起重新执行自发的命令）；代理消息、引擎 meta、不是亲手敲的 /autohandoff 不解除
+  expect(run(second.rec, [{ kind: 'userCommand', command: 'model' }]).rec.held).toBe(false)
+  expect(run(second.rec, [{ kind: 'toggle', args: 'on', typed: true }]).rec.held).toBe(false)
+  expect(run(second.rec, [{ kind: 'toggle', args: 'on' }]).rec.held).toBe(true)
+  expect(run(second.rec, [{ kind: 'submit', origin: { kind: 'peer-send-message' }, tokens: 328_000 }]).rec.held).toBe(true)
+  expect(run(second.rec, [{ kind: 'submit', origin: { kind: 'unclassified' }, isMeta: true, tokens: 328_000 }]).rec.held).toBe(true)
+  // 去留：用户自己 /clear 出来的新对话、进程重启或热重载、/resume 切回来的对话都不带挂起
+  expect(migrateRecord(second.rec, NOW + MIN).held).toBe(false)
+  expect(run(second.rec, [{ kind: 'start' }]).rec.held).toBe(false)
 })
 
 test('a dropped resume message is reported with the handoff path', () => {
@@ -475,15 +593,519 @@ test('a reload or restart with a registered handoff cancels it and tells the mod
   expect(b.rec.tell).toBe(null)
 })
 
-test('a user message racing the queued /clear: let through, no resume message, start context still given', () => {
+const BRIDGE = { kind: 'bridge' }
+/** reset_note_user 的内置文案（action 与预算随配置变），后面跟已登记的交接文件路径 */
+const userNote = (action: string, file = HANDOVER) =>
+  `[AutoHandoff] The handoff you registered is still in effect: when this turn ends, the conversation is reset with /${action} and continued from the handoff file named below. This message was already waiting when the previous turn ended, so it is answered here, in the conversation that is about to be reset. Answer it as you normally would, but keep this turn short and do not start new work. If it asks for work, changes the plan or settles a question the handoff file lists as open, add that to the handoff file now, so that the next conversation acts on it, and say in your reply that it will be done after the reset; the next conversation continues from that file, not from this exchange. Keep it within about 15k tokens, since the next conversation reads all of it; AutoHandoff does not register a handoff file above 20k. Edit the file in place: do not write another one and do not call the ${TOOL_FULL_NAME} tool again, the registration stands.\n\nRegistered handoff file: "${file}".`
+/** 旧对话里为排队消息跑的一个回合（有工具调用，正常结束） */
+const oldTurn = (turnId: string, tokens: number): Ev[] => [
+  { kind: 'turnStart', turnId },
+  { kind: 'postTool', tokens },
+  { kind: 'stop', active: false, tokens },
+  { kind: 'turnComplete', turnId, reason: 'answer', isAborted: false, tokens },
+]
+
+test('a message sent through Remote Control while the model worked is queued ahead of the /clear: answered in the old conversation with a note, and the resume message still follows the reset', () => {
+  // 2026-11-12 实例（CC 2.1.322）：用户在回合中从手机发了一句话，它一直排到回合结束；回合一结束引擎先取出它（prompt.submit 这时才到，
+  // 自家的 /clear 已排在它后面），在旧对话里跑完一个回合才执行 /clear
   const { rec, seq } = clearing()
-  const a = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_400 }, { kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }])
-  expect(ofType(a.all, 'resume')).toEqual([])
-  expect(contexts(a.steps[2]!.fx)[0]).toContain(`"${HANDOVER}"`)
-  expect(a.rec.job).toBe(null)
-  // 代理类消息不算用户接手
-  const b = run(rec, [{ kind: 'submit', origin: { kind: 'task-notification' } }, { kind: 'resetDone', seq }])
+  const a = run(rec, [{ kind: 'submit', origin: BRIDGE, tokens: 318_400 }, ...oldTurn(T2, 321_700)])
+  expect(contexts(a.steps[0]!.fx)).toEqual([userNote('clear')])
+  expect(ofType(a.steps[0]!.fx, 'log').map((f) => f.text)).toEqual([
+    'a user message arrived before the queued /clear (request 1); it is answered in this conversation, and the resume message follows the reset',
+  ])
+  // 这个回合里什么都不再发生：不提醒、不 block、不再发重置；登记被拒（说明里也说了不必再登记）
+  expect(contexts(a.all).length).toBe(1)
+  expect(ofType(a.all, 'block')).toEqual([])
+  expect(ofType(a.all, 'clear')).toEqual([])
+  expect(ofType(a.all, 'toast')).toEqual([])
+  expect(a.rec.job?.stage).toBe('clearing')
+  expect(a.rec.job?.userTook).toBe(false)
+  expect(run(a.rec, [REG]).steps[0]!.reply).toBe('Not registered: a reset is already in progress.')
+  // /clear 执行：promise 先 resolve（记录已搬到新 sid），再到 SessionStart(clear)。续接照常提交，新对话带连环交接守卫
+  const b = run(migrateRecord(a.rec, NOW + 30_000), [
+    [{ kind: 'resetDone', seq }, NOW + 30_000],
+    [{ kind: 'sessionStart', source: 'clear' }, NOW + 30_200],
+  ])
+  const resume = ofType(b.all, 'resume')
+  expect(resume.length).toBe(1)
+  expect(resume[0]!.seq).toBe(seq)
+  expect(resume[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(contexts(b.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(b.rec.job?.stage).toBe('resuming')
+  // 人在旧对话里说过话不解除新对话的守卫（与重置排队期间敲的命令同理，PLAN §0 第 22、32 条）
+  expect([b.rec.resumed, b.rec.resumedAt]).toEqual([true, NOW + 30_000])
+  expect(run(b.rec, [{ kind: 'resumeDone', seq }]).rec.job).toBe(null)
+  // 另一种事件顺序（SessionStart(clear) 先到）结果相同
+  const c = run(migrateRecord(a.rec, NOW + 30_000), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'resetDone', seq }])
+  expect(ofType(c.all, 'resume').length).toBe(1)
+  expect(contexts(c.all).length).toBe(1)
+})
+
+test('several messages queued ahead of the reset (Remote Control, a scheduled trigger): each gets its turn and the note in the old conversation; one reset, one resume', () => {
+  const { rec, seq } = clearing()
+  const a = run(rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    ...oldTurn(T2, 320_100),
+    // 定时任务的 prompt 也是「用户类」来源：同样附说明，不算用户接手
+    { kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 320_100 },
+    ...oldTurn('9c2f6a1e-7b3d-4e8f-a1c2-5d6e7f8a9b0c', 323_900),
+    // 后台任务的通知是代理类：附 reset_note
+    { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 323_900 },
+  ])
+  expect(contexts(a.steps[0]!.fx)).toEqual([userNote('clear')])
+  expect(contexts(a.steps[5]!.fx)).toEqual([userNote('clear')])
+  expect(contexts(a.steps[10]!.fx)[0]).toStartWith('[AutoHandoff] The conversation is about to be reset with /clear')
+  expect(contexts(a.all).length).toBe(3)
+  expect(ofType(a.all, 'clear')).toEqual([])
+  expect(a.rec.job?.stage).toBe('clearing')
+  const b = run(migrateRecord(a.rec, NOW + 90_000), [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }, { kind: 'resumeDone', seq }])
   expect(ofType(b.all, 'resume').length).toBe(1)
+  expect(b.rec.job).toBe(null)
+})
+
+test('every user-class source queued ahead of the reset is treated alike, typed by a person or not: note in the old conversation, no takeover, resume after the reset', () => {
+  // 判断的是「消息落在哪个对话」，不是「是不是人工输入」：定时任务、Telegram 之类的 channel、别的插件、协调会话下发的消息、
+  // Slack 提醒、SDK 主机的回合、来源不明的输入，在 clearing/compacting 阶段都不得让续接被跳过
+  const origins = [
+    { kind: 'composer' },
+    { kind: 'bridge' },
+    { kind: 'scheduled-trigger' },
+    { kind: 'channel', server: 'plugin:telegram:telegram' },
+    { kind: 'plugin', name: 'daily-digest' },
+    { kind: 'coordinator' },
+    { kind: 'projects-relay' },
+    { kind: 'slack-ping' },
+    { kind: 'sdk' },
+    { kind: 'unclassified' },
+  ]
+  for (const cfg of [defaultConfig(), CFG_COMPACT]) {
+    const action = cfg.settings.action
+    for (const origin of origins) {
+      const { rec, seq } = clearing(cfg)
+      const a = run(rec, [{ kind: 'submit', origin, tokens: 318_400 }, ...oldTurn(T2, 320_300)], cfg)
+      expect(contexts(a.all)).toEqual([userNote(action)])
+      expect(a.rec.job?.userTook).toBe(false)
+      const after = action === 'clear' ? migrateRecord(a.rec, NOW + 20_000) : a.rec
+      const b = run(after, [{ kind: 'sessionStart', source: action }, { kind: 'resetDone', seq }], cfg)
+      expect(ofType(b.all, 'resume').length).toBe(1)
+      expect(b.rec.job?.stage).toBe('resuming')
+      expect(b.rec.resumed).toBe(true)
+    }
+  }
+})
+
+test('the queued message\'s turn in the old conversation is interrupted with Esc: Claude Code drops the queued /clear with it; the user sees a toast, the model is told with the next message and reminded again, nothing is resumed or queued again', () => {
+  const { rec, seq } = clearing()
+  const a = run(rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    { kind: 'postTool', tokens: 318_900 },
+    // Esc：这个回合没有 Stop；登记早已不是 armed，回合结束本身什么也不做
+    { kind: 'turnComplete', turnId: T2, reason: 'aborted', isAborted: true, tokens: 319_000 },
+  ])
+  // 模型在这个回合里被告知「登记仍有效，答完就重置」
+  expect(contexts(a.steps[0]!.fx)).toEqual([userNote('clear')])
+  expect(a.rec.job?.stage).toBe('clearing')
+  // 排队的命令随 Esc 被移出队列：交接作废，但不能悄悄地——用户以为马上重置，模型以为登记有效
+  const b = run(a.rec, [{ kind: 'resetFailed', seq, message: 'autohandoff: $.command.run: the command was removed from the queue before it ran' }])
+  expect(b.rec.job).toBe(null)
+  expect(b.rec.stalled).toBe(null)
+  expect(b.rec.tell).toBe('interrupted')
+  expect(b.rec.held).toBe(true)
+  expect(ofType(b.all, 'toast')).toEqual([{ type: 'toast', text: 'AutoHandoff: handoff cancelled (the queued reset was called off by Esc)' }])
+  expect(ofType(b.all, 'status')).toEqual([{ type: 'status', text: 'paused until your next input (stopped with Esc)' }])
+  expect(ofType(b.all, 'resume')).toEqual([])
+  expect(ofType(b.all, 'clear')).toEqual([])
+  // 用户的下一条消息（挂起到此为止）：告诉模型登记已作废（不再是那句「登记仍有效」，也不带「先别再交接」），这条消息不解释为新的登记；
+  // 之后第一次检查把完整提醒再送一遍（原先送过的那层退回未送），模型可以重新登记，回合结束照常重置
+  const c = run(b.rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 319_000 },
+    { kind: 'turnStart', turnId: T1 },
+    { kind: 'postTool', tokens: 319_600 },
+    REG,
+    { kind: 'stop', active: false, tokens: 321_000 },
+    { ...DONE, tokens: 321_000 },
+  ])
+  expect(contexts(c.steps[0]!.fx)).toEqual([
+    '[AutoHandoff] Your registered handoff was cancelled (the queued reset was called off by Esc). Deal with that first. If you register again, in this turn or later, first update the handoff file with everything new since you wrote it, above all what the user has just asked for or answered, so that the next conversation has it (next steps are the work itself, never "hand off again"); then call the mcp__autohandoff__register_handoff tool again.',
+  ])
+  expect(contexts(c.steps[2]!.fx)[0]).toContain('past the first threshold of 300k')
+  expect(c.steps[3]!.accepted).toBe(true)
+  expect(ofType(c.all, 'clear').length).toBe(1)
+  expect(c.rec.job?.stage).toBe('clearing')
+
+  // 登记那个回合本身被 Esc 打断是另一回事（命令没发出，用户自己停的）：照旧静默，下一条消息只带短提醒
+  const own = run(armed().rec, [{ kind: 'turnComplete', turnId: T1, reason: 'aborted', isAborted: true, tokens: 310_000 }])
+  expect(own.rec.job).toBe(null)
+  expect(own.rec.tell).toBe(null)
+  expect(ofType(own.all, 'toast')).toEqual([])
+  expect(contexts(run(own.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 310_000 }]).all)[0]).toStartWith('[AutoHandoff] Context usage is about 310k tokens')
+})
+
+test('a user message in the reset conversation before the reset result comes back: the user has taken over, no resume message and no chain guard', () => {
+  // SessionStart(clear) 先到（新对话已拿到交接）、promise 还没 resolve 的窗口里用户发了消息：它由新对话处理
+  const { rec, seq } = clearing()
+  const a = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: COMPOSER, tokens: 9_000 }, { kind: 'resetDone', seq }])
+  expect(contexts(a.steps[0]!.fx)[0]).toContain(`"${HANDOVER}"`)
+  // 不附「即将重置」的说明：重置已经发生
+  expect(contexts(a.steps[1]!.fx)).toEqual([])
+  expect(a.steps[1]!.rec.job?.userTook).toBe(true)
+  expect(ofType(a.all, 'resume')).toEqual([])
+  expect(a.rec.job).toBe(null)
+  expect(a.rec.resumed).toBe(false)
+  expect(ofType(a.steps[2]!.fx, 'log').map((f) => f.text)).toEqual(['handoff finished: the user wrote during the reset; resume message skipped'])
+  // 代理类消息不算用户接手
+  const b = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: { kind: 'task-notification' } }, { kind: 'resetDone', seq }])
+  expect(ofType(b.all, 'resume').length).toBe(1)
+})
+
+test('the user\'s own /clear runs first and a queued message is answered in that in-between conversation: our /clear wipes it, so the last conversation is still resumed', () => {
+  const { rec, seq } = clearing()
+  // 用户的 /clear 先出队：中间这个对话拿到了交接，排队的消息在这里处理（这时看上去像用户接手）
+  const mid = run(migrateRecord(rec, NOW + 1_000), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: BRIDGE, tokens: 9_000 }, ...oldTurn(T2, 14_000)])
+  expect(mid.rec.job?.stage).toBe('clearing')
+  expect(mid.rec.job?.userTook).toBe(true)
+  // 自家的 /clear 随后把它清掉：搬迁时「用户接手」作废，最后这个对话照常续接
+  const last = run(migrateRecord(mid.rec, NOW + 20_000), [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }])
+  expect(ofType(last.all, 'resume').length).toBe(1)
+  expect(contexts(last.steps[1]!.fx)[0]).toContain(`"${HANDOVER}"`)
+  expect(last.rec.job?.stage).toBe('resuming')
+})
+
+test('action compact, two messages queued ahead of our /compact, and a compaction that is not ours runs in between (Claude Code compacts in the middle of the first message\'s turn, or the user\'s own /compact goes first): the second message is not the user taking over, and the resume still follows our compaction', () => {
+  const cfg = CFG_COMPACT
+  const { rec, seq } = clearing(cfg)
+  const T3 = '9c2f6a1e-7b3d-4e8f-a1c2-5d6e7f8a9b0c'
+  const SCHEDULED = { kind: 'scheduled-trigger' }
+  // 回合结束前排着两条消息：Remote Control 发来的一条、定时任务的一条。第一条的回合里上下文满了，CC 自动压缩
+  // （回合中途的 SessionStart(compact)）：排队的命令要等对话空闲才执行，所以这次不是自家的，不给交接，接着等
+  const first = run(
+    rec,
+    [
+      { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+      { kind: 'turnStart', turnId: T2 },
+      { kind: 'postTool', tokens: 356_000 },
+      { kind: 'sessionStart', source: 'compact' },
+      { kind: 'postTool', tokens: 48_000 },
+      { kind: 'stop', active: false, tokens: 52_000 },
+      { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 52_000 },
+    ],
+    cfg,
+  )
+  expect(contexts(first.steps[0]!.fx)).toEqual([userNote('compact')])
+  expect(contexts(first.steps[3]!.fx)).toEqual([])
+  expect(ofType(first.steps[3]!.fx, 'log').map((f) => f.text)).toEqual(['a /compact not run by AutoHandoff finished while /compact is queued; still waiting for it'])
+  expect(first.rec.job?.stage).toBe('compacting')
+  expect(first.rec.job?.ctxGiven).toBe(false)
+  // 第二条出队，在压缩过的这个对话里处理；自家的 /compact 还排在它后面，所以它和第一条一样被告知「登记仍有效，答完就重置」
+  const second = run(first.rec, [{ kind: 'submit', origin: SCHEDULED, tokens: 52_000 }, ...oldTurn(T3, 57_000)], cfg)
+  expect(contexts(second.steps[0]!.fx)).toEqual([userNote('compact')])
+  expect(second.rec.job?.userTook).toBe(false)
+  expect(second.rec.job?.stage).toBe('compacting')
+  expect(ofType(second.all, 'compact')).toEqual([])
+  // 自家的 /compact 执行：SessionStart(compact) 再给一次交接，promise resolve 后照常续接、带守卫
+  const own = run(second.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }], cfg)
+  expect(contexts(own.steps[0]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(own.all, 'resume').length).toBe(1)
+  expect(own.rec.job?.stage).toBe('resuming')
+  expect(own.rec.resumed).toBe(true)
+
+  // 用户在第一条的回合里敲了 /compact，它比自家的先执行：结果相同
+  const user = run(
+    rec,
+    [
+      { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+      { kind: 'turnStart', turnId: T2 },
+      { kind: 'userCommand', command: 'compact' },
+      { kind: 'stop', active: false, tokens: 321_000 },
+      { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 321_000 },
+      { kind: 'sessionStart', source: 'compact' },
+      { kind: 'submit', origin: SCHEDULED },
+      ...oldTurn(T3, 44_000),
+      { kind: 'sessionStart', source: 'compact' },
+      { kind: 'resetDone', seq },
+    ],
+    cfg,
+  )
+  expect(ofType(user.all, 'resume').length).toBe(1)
+  expect(user.rec.resumed).toBe(true)
+
+  // 自家这次压缩的 SessionStart 之后、结果回来之前才到的消息，才是重置后的对话里的消息：仍算用户接手，不续接
+  const took = run(second.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: COMPOSER }, { kind: 'resetDone', seq }], cfg)
+  expect(ofType(took.all, 'resume')).toEqual([])
+  expect(took.rec.job).toBe(null)
+  expect(took.rec.resumed).toBe(false)
+
+  // action=clear：回合中途的压缩不是新对话（不给交接），第二条消息照样附说明；/clear 之后续接
+  const c = clearing()
+  const cl = run(c.rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    { kind: 'sessionStart', source: 'compact' },
+    { kind: 'stop', active: false, tokens: 52_000 },
+    { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 52_000 },
+    { kind: 'submit', origin: SCHEDULED, tokens: 52_000 },
+    ...oldTurn(T3, 57_000),
+  ])
+  expect(contexts(cl.steps[2]!.fx)).toEqual([])
+  expect(contexts(cl.steps[5]!.fx)).toEqual([userNote('clear')])
+  const clEnd = run(migrateRecord(cl.rec, NOW + 90_000), [{ kind: 'resetDone', seq: c.seq }, { kind: 'sessionStart', source: 'clear' }])
+  expect(ofType(clEnd.all, 'resume').length).toBe(1)
+  expect(contexts(clEnd.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+})
+
+test('the queued reset waits behind a long turn in the old conversation: "no result" is counted only while the conversation is idle, from the moment it went idle', () => {
+  const { rec, seq } = clearing()
+  // 排队的消息让旧对话又干了三个多小时（wait_minutes 是 60）：/clear 还没机会执行，不是没有结果
+  const turn = run(rec, [{ kind: 'submit', origin: BRIDGE, tokens: 318_400 }, { kind: 'turnStart', turnId: T2 }])
+  const long = run(turn.rec, [
+    [{ kind: 'tick' }, NOW + WAIT],
+    [{ kind: 'postTool', tokens: 352_000 }, NOW + 2 * WAIT],
+    [{ kind: 'tick' }, NOW + 3 * WAIT],
+  ])
+  expect(long.rec.job?.stage).toBe('clearing')
+  expect(long.rec.stalled).toBe(null)
+  expect(ofType(long.all, 'toast')).toEqual([])
+  // 回合结束：对话又空闲，从这一刻重新计时；/clear 执行，照常续接
+  const end = NOW + 3 * WAIT + 5 * MIN
+  const done = run(long.rec, [
+    [{ kind: 'stop', active: false, tokens: 371_000 }, end],
+    [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 371_000 }, end],
+  ])
+  expect(ofType(done.steps[1]!.fx, 'timer')).toEqual([{ type: 'timer', ms: WAIT }])
+  const c = run(migrateRecord(done.rec, end + 300), [[{ kind: 'resetDone', seq }, end + 300], [{ kind: 'sessionStart', source: 'clear' }, end + 500]])
+  expect(ofType(c.all, 'resume').length).toBe(1)
+  expect(contexts(c.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+
+  // 回合在 /compact 发出快满一小时的时候才结束：发出时挂的计时 5 秒后到点，这时 /compact 正在执行（压缩要十几秒），
+  // 对话才空闲了 5 秒，不算没有结果
+  const k = clearing(CFG_COMPACT)
+  const late = NOW + WAIT - 5_000
+  const e = run(
+    k.rec,
+    [
+      { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+      { kind: 'turnStart', turnId: T2 },
+      [{ kind: 'stop', active: false, tokens: 349_000 }, late],
+      [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 349_000 }, late],
+      [{ kind: 'tick' }, NOW + WAIT],
+      [{ kind: 'sessionStart', source: 'compact' }, late + 14_000],
+      [{ kind: 'resetDone', seq: k.seq }, late + 14_500],
+    ],
+    CFG_COMPACT,
+  )
+  expect(e.steps[4]!.rec.job?.stage).toBe('compacting')
+  expect(ofType(e.all, 'toast')).toEqual([])
+  expect(contexts(e.steps[5]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(e.all, 'resume').length).toBe(1)
+  expect(e.rec.job?.stage).toBe('resuming')
+})
+
+test('a reload in the middle of the turn that runs ahead of the queued /clear: however long that turn takes, the next conversation still gets the handoff', () => {
+  const { rec } = clearing()
+  // 排队的消息在旧对话里开了回合；回合进行中插件更新、模块热重载（回合状态和计时器都没了）
+  const reload = NOW + 10 * MIN
+  const a = run(rec, [{ kind: 'submit', origin: BRIDGE, tokens: 318_400 }, { kind: 'turnStart', turnId: T2 }, [{ kind: 'start', queuedHere: true }, reload]])
+  expect(a.rec.job?.orphan).toBe(true)
+  // 计时从重载这一刻重新挂满 wait_minutes
+  expect(ofType(a.steps[2]!.fx, 'timer')).toEqual([{ type: 'timer', ms: WAIT }])
+  const end = reload + WAIT + 20 * MIN
+  const turnEnd: (Ev | [Ev, number])[] = [
+    [{ kind: 'stop', active: false, tokens: 371_000 }, end],
+    [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 371_000 }, end],
+  ]
+  // 回合还在跑：它的下一次工具调用把计时停掉，重载时挂的计时到点不算没有结果
+  const busy = run(a.rec, [[{ kind: 'postTool', tokens: 331_000 }, reload + 2 * MIN], [{ kind: 'tick' }, reload + WAIT], ...turnEnd])
+  expect(busy.steps[1]!.rec.job?.stage).toBe('clearing')
+  expect(ofType(busy.all, 'toast')).toEqual([])
+  // 旧模块的回调来不了：/clear 执行后 SessionStart(clear) 给交接并续接
+  const ss = run(migrateRecord(busy.rec, end + 400), [[{ kind: 'sessionStart', source: 'clear' }, end + 400]])
+  expect(contexts(ss.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(ss.all, 'resume').length).toBe(1)
+
+  // 重载后那个回合一直停在权限框上（没有任何工具调用）超过 wait_minutes：看上去是空闲而没有结果，搁置并告诉用户；
+  // 但交接不丢——有人点了权限框、回合结束、/clear 执行后，新对话照常拿到交接并续接
+  const quiet = run(a.rec, [[{ kind: 'tick' }, reload + WAIT], ...turnEnd])
+  expect(quiet.steps[0]!.rec.job).toBe(null)
+  expect(quiet.steps[0]!.rec.stalled?.orphan).toBe(true)
+  expect(ofType(quiet.steps[0]!.fx, 'toast').length).toBe(1)
+  expect(ofType(quiet.all, 'clear')).toEqual([])
+  const quietSs = run(migrateRecord(quiet.rec, end + 400), [[{ kind: 'sessionStart', source: 'clear' }, end + 400]])
+  expect(contexts(quietSs.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(quietSs.all, 'resume').length).toBe(1)
+  expect(quietSs.rec.job?.stage).toBe('resuming')
+  expect(quietSs.rec.stalled).toBe(null)
+
+  // 重载落在 /clear 排队一个多小时之后（那个回合很长）：照样留作孤儿，不因为「早就超时」放弃
+  const lateReload = run(rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    [{ kind: 'start', queuedHere: true }, NOW + WAIT + 5 * MIN],
+    ...turnEnd,
+  ])
+  expect(lateReload.rec.job?.orphan).toBe(true)
+  expect(ofType(lateReload.all, 'toast')).toEqual([])
+  expect(ofType(run(migrateRecord(lateReload.rec, end + 400), [[{ kind: 'sessionStart', source: 'clear' }, end + 400]]).all, 'resume').length).toBe(1)
+})
+
+test('after a hot reload nobody reports what became of the queued reset: an interrupted turn counts as the veto, Claude Code\'s own compaction in the middle of a turn is never taken for the queued /compact, and a queued command that runs after all still resumes', () => {
+  // ── 回合被 Esc 打断（action=clear）：排队消息的回合里热重载，随后用户按 Esc。引擎把 /clear 移出队列，旧模块报不回来 ──
+  const { rec } = clearing()
+  const reload = NOW + 10 * MIN
+  const esc = run(rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    [{ kind: 'start', queuedHere: true }, reload],
+    [{ kind: 'postTool', tokens: 321_000 }, reload + MIN],
+    [{ kind: 'turnComplete', turnId: T2, reason: 'aborted', isAborted: true, tokens: 321_500 }, reload + 2 * MIN],
+  ])
+  const last = esc.steps.at(-1)!
+  expect(esc.rec.job).toBe(null)
+  expect(esc.rec.tell).toBe('interrupted')
+  expect(esc.rec.held).toBe(true)
+  expect(ofType(last.fx, 'toast')).toEqual([{ type: 'toast', text: 'AutoHandoff: handoff cancelled (the queued reset was called off by Esc)' }])
+  expect(ofType(last.fx, 'status')).toEqual([{ type: 'status', text: 'paused until your next input (stopped with Esc)' }])
+  // 用户接着对话：第一条消息被告知登记已作废，之后的消息不再附「登记仍有效，回合结束就重置，不要开始新工作」
+  const talk = run(esc.rec, [
+    [{ kind: 'submit', origin: COMPOSER, tokens: 321_500 }, reload + 3 * MIN],
+    ...oldTurn(T1, 324_000).map((ev): [Ev, number] => [ev, reload + 4 * MIN]),
+    [{ kind: 'submit', origin: COMPOSER, tokens: 324_000 }, reload + 9 * MIN],
+  ])
+  expect(contexts(talk.steps[0]!.fx)[0]).toContain('Your registered handoff was cancelled (the queued reset was called off by Esc)')
+  expect(contexts(talk.all).join('\n')).not.toContain('still in effect')
+  expect(talk.rec.job).toBe(null)
+  // 用户想从头来、自己 /clear：是普通的 clear，不给交接、不续接
+  const own = run(migrateRecord(run(talk.rec, [{ kind: 'userCommand', command: 'clear' }]).rec, reload + 10 * MIN), [{ kind: 'sessionStart', source: 'clear' }])
+  expect(contexts(own.all)).toEqual([])
+  expect(ofType(own.all, 'resume')).toEqual([])
+  // 「打断 = 命令已不在队列里」是推断。万一命令还在、之后执行了：留着的那份照常认领，新对话拿到交接并续接，挂起也不再成立
+  expect(esc.rec.stalled?.orphan).toBe(true)
+  const ran = run(migrateRecord(esc.rec, reload + 3 * MIN), [[{ kind: 'sessionStart', source: 'clear' }, reload + 3 * MIN]])
+  expect(contexts(ran.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(ran.all, 'resume').length).toBe(1)
+  expect(ran.rec.held).toBe(false)
+  // 没有热重载时不做这个推断：引擎自己会报 resetFailed
+  const plain = run(rec, [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    { kind: 'turnComplete', turnId: T2, reason: 'aborted', isAborted: true, tokens: 319_000 },
+  ])
+  expect(plain.rec.job?.stage).toBe('clearing')
+  expect(ofType(plain.all, 'toast')).toEqual([])
+
+  // ── action=compact，/compact 排队后热重载；排队消息的回合里上下文满了，CC 自己压缩（回合中途的 SessionStart(compact)）──
+  const k = clearing(CFG_COMPACT)
+  const mid = run(
+    k.rec,
+    [
+      { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+      { kind: 'turnStart', turnId: T2 },
+      [{ kind: 'start', queuedHere: true }, reload],
+      // 重载后回合标记没了，回合里的下一次工具调用把它补上
+      [{ kind: 'postTool', tokens: 372_000 }, reload + MIN],
+      [{ kind: 'sessionStart', source: 'compact' }, reload + 2 * MIN],
+      [{ kind: 'postTool', tokens: 51_000 }, reload + 3 * MIN],
+      [{ kind: 'stop', active: false, tokens: 53_000 }, reload + 4 * MIN],
+      [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 53_000 }, reload + 4 * MIN],
+    ],
+    CFG_COMPACT,
+  )
+  // 回合中途那次不是排队的 /compact：不给交接、不续接，job 还在等
+  expect(contexts(mid.steps[4]!.fx)).toEqual([])
+  expect(ofType(mid.all, 'resume')).toEqual([])
+  expect(mid.rec.job?.stage).toBe('compacting')
+  // 回合结束后自家的 /compact 执行（对话空闲时的 SessionStart(compact)）：孤儿在这里拿到交接并续接
+  const ownK = run(mid.rec, [[{ kind: 'sessionStart', source: 'compact' }, reload + 4 * MIN + 14_000]], CFG_COMPACT)
+  expect(contexts(ownK.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(ownK.all, 'resume').length).toBe(1)
+
+  // ── 同样的配置，孤儿被搁置之后（命令没有执行、模型也没有重新登记），很久以后的一个回合里 CC 自己压缩 ──
+  const idle = run(k.rec, [[{ kind: 'start', queuedHere: true }, reload], [{ kind: 'tick' }, reload + WAIT]], CFG_COMPACT)
+  expect(idle.rec.stalled?.orphan).toBe(true)
+  const later = reload + 5 * WAIT
+  const auto = run(
+    idle.rec,
+    [
+      [{ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 330_000 }, later],
+      [{ kind: 'turnStart', turnId: T2 }, later],
+      [{ kind: 'postTool', tokens: 395_000 }, later + MIN],
+      [{ kind: 'sessionStart', source: 'compact' }, later + 2 * MIN],
+      [{ kind: 'postTool', tokens: 58_000 }, later + 3 * MIN],
+      [{ kind: 'stop', active: false, tokens: 60_000 }, later + 4 * MIN],
+      [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 60_000 }, later + 4 * MIN],
+    ],
+    CFG_COMPACT,
+  )
+  // 不拿几小时前的交接文件去续接
+  expect(contexts(auto.steps[3]!.fx)).toEqual([])
+  expect(ofType(auto.all, 'resume')).toEqual([])
+  expect(auto.rec.job).toBe(null)
+  // 被搁置的那条 /compact 若在对话空闲时终究执行了，照常认领
+  const lateRun = run(auto.rec, [[{ kind: 'sessionStart', source: 'compact' }, later + 10 * MIN]], CFG_COMPACT)
+  expect(ofType(lateRun.all, 'resume').length).toBe(1)
+})
+
+test('"no result" for a queued reset adds up the idle time between turns: a user who keeps working after a reload is not told "still registered" for ever, and a chain of queued messages does not use the time up', () => {
+  // 热重载后排队的 /compact 没有执行（比如压缩失败），旧模块报不回来。用户每十分钟发一条消息，回合一分钟
+  const k = clearing(CFG_COMPACT)
+  const reload = NOW + 5 * MIN
+  let rec = run(k.rec, [[{ kind: 'start', queuedHere: true }, reload]], CFG_COMPACT).rec
+  let t = reload
+  /** 回合结束时挂的计时还剩多久（毫秒）；到点时送 tick */
+  let due: number | null = WAIT
+  const notes: string[] = []
+  let stalledAt: number | null = null
+  for (let i = 0; i < 12 && stalledAt === null; i++) {
+    const gap = 9 * MIN
+    if (due !== null && due <= gap) {
+      const tick = run(rec, [[{ kind: 'tick' }, t + due]], CFG_COMPACT)
+      rec = tick.rec
+      if (rec.stalled) stalledAt = t + due - reload
+    }
+    t += gap
+    const turn = run(
+      rec,
+      [
+        [{ kind: 'submit', origin: COMPOSER, tokens: 319_000 + i * 2_000 }, t],
+        [{ kind: 'turnStart', turnId: T2 }, t],
+        [{ kind: 'postTool', tokens: 320_000 + i * 2_000 }, t + 30_000],
+        [{ kind: 'stop', active: false, tokens: 320_500 + i * 2_000 }, t + MIN],
+        [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 320_500 + i * 2_000 }, t + MIN],
+      ],
+      CFG_COMPACT,
+    )
+    notes.push(contexts(turn.steps[0]!.fx)[0] ?? '')
+    rec = turn.rec
+    t += MIN
+    due = ofType(turn.steps[4]!.fx, 'timer')[0]?.ms ?? null
+  }
+  // 空闲累计满 60 分钟（6 段 9 分钟加 6 分钟）就搁置；之前的 6 条消息附的是「登记仍有效」，之后那条被告知作废
+  expect(stalledAt).toBe(6 * 10 * MIN + 6 * MIN)
+  expect(notes.slice(0, 6).every((n) => n.startsWith('[AutoHandoff] The handoff you registered is still in effect'))).toBe(true)
+  expect(notes[6]).toContain('Your registered handoff was cancelled (the queued reset did not run within 60 minutes)')
+  expect(rec.job).toBe(null)
+
+  // 命令确实还在队列里时空闲累计不起来：回合结束前排了三条消息，每条在旧对话里跑二十多分钟，回合之间只隔几十毫秒
+  const q = clearing()
+  let r = q.rec
+  let at = NOW
+  for (let i = 0; i < 3; i++) {
+    const turn = run(r, [
+      [{ kind: 'submit', origin: BRIDGE, tokens: 318_400 }, at + 30],
+      [{ kind: 'turnStart', turnId: T2 }, at + 40],
+      [{ kind: 'tick' }, at + 25 * MIN],
+      [{ kind: 'stop', active: false, tokens: 330_000 }, at + 25 * MIN],
+      [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 330_000 }, at + 25 * MIN],
+    ])
+    r = turn.rec
+    at += 25 * MIN
+    expect(ofType(turn.steps[4]!.fx, 'timer')).toEqual([{ type: 'timer', ms: WAIT - 40 * (i + 1) }])
+  }
+  expect(r.job?.stage).toBe('clearing')
+  expect(r.stalled).toBe(null)
+  const done = run(migrateRecord(r, at + 300), [[{ kind: 'resetDone', seq: q.seq }, at + 300], [{ kind: 'sessionStart', source: 'clear' }, at + 500]])
+  expect(ofType(done.all, 'resume').length).toBe(1)
 })
 
 test('a user message during the resuming stage: the model sees nothing extra, the resume result still closes the job', () => {
@@ -577,7 +1199,7 @@ test('compact_at: after an Esc veto it waits for the next human message; after r
   const v = compacting()
   const vetoed = run(v.rec, [{ kind: 'resetFailed', seq: v.seq, message: VETO }])
   expect(vetoed.rec.fallback).toBe(null)
-  expect(vetoed.rec.fallbackHeld).toBe(true)
+  expect(vetoed.rec.held).toBe(true)
   expect(ofType(vetoed.all, 'toast')).toEqual([])
   const agentTurn = run(vetoed.rec, [
     { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 660_000 },
@@ -586,7 +1208,9 @@ test('compact_at: after an Esc veto it waits for the next human message; after r
     { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 662_000 },
   ])
   expect(ofType(agentTurn.all, 'compact')).toEqual([])
-  expect(ofType(run(agentTurn.rec, [{ kind: 'toggle', args: 'status', tokens: 662_000 }]).all, 'log')[0]!.text).toContain('called off by you; it will be tried again after your next message')
+  // 这段时间也不提醒（登记了同样重置不了）
+  expect(contexts(agentTurn.all)).toEqual([])
+  expect(ofType(run(agentTurn.rec, [{ kind: 'toggle', args: 'status', tokens: 662_000 }]).all, 'log')[0]!.text).toContain('Reminders, registering and the compaction at compact_at wait until then.')
   const humanTurn = run(agentTurn.rec, [
     { kind: 'submit', origin: COMPOSER, tokens: 662_000 },
     { kind: 'turnStart', turnId: T2 },
@@ -620,7 +1244,7 @@ test('compact_at: after an Esc veto it waits for the next human message; after r
   expect(run(again.rec, [{ kind: 'resetDone', seq: again.seq }]).rec.fallbackFails).toBe(0)
 })
 
-test('wait_minutes: the timer cancels a registration whose turn never ended, and a reset that never settles', () => {
+test('wait_minutes: the timer cancels a registration whose turn never ended; a queued reset with no result is set aside, the user and the model are told, and the handoff is not lost if it runs after all', () => {
   const a = armed()
   expect(run(a.rec, [[{ kind: 'tick' }, NOW + WAIT - MIN]]).rec.job?.stage).toBe('armed')
   const b = run(a.rec, [[{ kind: 'tick' }, NOW + WAIT]])
@@ -629,19 +1253,87 @@ test('wait_minutes: the timer cancels a registration whose turn never ended, and
   expect(ofType(b.all, 'notify')).toEqual([{ type: 'notify', text: 'AutoHandoff: handoff cancelled (the turn did not end within 60 minutes of registering)' }])
   expect(ofType(b.all, 'toast')).toEqual([{ type: 'toast', text: 'AutoHandoff: handoff cancelled (the turn did not end within 60 minutes of registering)' }])
 
-  // clear 排队了却一直没有结果（接线漏了 .catch 之类）：从发出时刻算 wait_minutes 后静默放弃，不告诉模型
+  // /clear 排队了、对话空闲，却一直没有结果（回调丢了；或热重载后命令被否决，旧模块报不回来）：空闲满 wait_minutes 后搁置
   const issuedLate = run(armed().rec, [[{ kind: 'stop', active: false }, NOW + 50 * MIN], [DONE, NOW + 50 * MIN]])
   expect(issuedLate.rec.job?.stage).toBe('clearing')
   // 登记后 60 分钟的 tick（armed 的计时器）到了：clear 才发出 10 分钟，不动
   expect(run(issuedLate.rec, [[{ kind: 'tick' }, NOW + WAIT]]).rec.job?.stage).toBe('clearing')
-  const stuck = run(issuedLate.rec, [[{ kind: 'tick' }, NOW + 50 * MIN + WAIT]])
+  const at = NOW + 50 * MIN + WAIT
+  const stuck = run(issuedLate.rec, [[{ kind: 'tick' }, at]])
+  // 不再挡着本对话：job 清空、状态行清掉，告诉用户（toast 加通知）和模型；原来的 job 留在 stalled 里
   expect(stuck.rec.job).toBe(null)
-  expect(stuck.rec.tell).toBe(null)
-  expect(ofType(stuck.all, 'toast')).toEqual([])
-  expect(ofType(stuck.all, 'log')[0]!.text).toBe('handoff cancelled: no result from /clear within 60 minutes; giving up on request 1')
+  expect(stuck.rec.stalled?.seq).toBe(1)
+  expect(stuck.rec.stalled?.file).toBe(HANDOVER)
+  expect(stuck.rec.tell).toBe('stalled')
+  // 给用户的话说的是搁置，不是作废：交接没有丢
+  const said = 'AutoHandoff: the queued /clear did not run within 60 minutes and was set aside; if it still runs, the conversation continues from the handoff file.'
+  expect(ofType(stuck.all, 'toast')).toEqual([{ type: 'toast', text: said }])
+  expect(ofType(stuck.all, 'notify')).toEqual([{ type: 'notify', text: said }])
   expect(ofType(stuck.all, 'status')).toEqual([{ type: 'status', text: undefined }])
-  // 之后登记又能受理
-  expect(run(stuck.rec, [[REG, NOW + 50 * MIN + WAIT]]).rec.job?.stage).toBe('armed')
+  expect(ofType(stuck.all, 'log').map((f) => f.text)).toEqual([
+    '/clear (request 1) set aside: the queued reset did not run within 60 minutes; if it still runs, the conversation continues from the handoff file',
+  ])
+  expect(ofType(run(stuck.rec, [{ kind: 'toggle', args: 'status', tokens: 318_400 }]).all, 'log')[0]!.text).toContain(
+    `An earlier /clear (request 1) was queued but has not run; if it still runs, the conversation continues from "${HANDOVER}".`,
+  )
+  // 下一条消息告诉模型；之后完整提醒重来，登记又能受理（新的登记取代被搁置的那次）
+  const next = run(stuck.rec, [
+    [{ kind: 'submit', origin: COMPOSER, tokens: 318_400 }, at + MIN],
+    [{ kind: 'turnStart', turnId: T2 }, at + MIN],
+    [{ kind: 'postTool', tokens: 319_000 }, at + MIN],
+    [REG, at + 2 * MIN],
+  ])
+  expect(contexts(next.steps[0]!.fx)[0]).toContain('cancelled (the queued reset did not run within 60 minutes)')
+  expect(contexts(next.steps[2]!.fx)[0]).toContain('past the first threshold of 300k')
+  expect(next.rec.job?.stage).toBe('armed')
+  expect(next.rec.stalled).toBe(null)
+
+  // 搁置之后那条 /clear 终究执行了（promise 这时才 resolve，记录已搬到新 sid）：照常续接，SessionStart(clear) 给交接
+  const ran = run(migrateRecord(stuck.rec, at + 5 * MIN), [
+    [{ kind: 'resetDone', seq: 1 }, at + 5 * MIN],
+    [{ kind: 'sessionStart', source: 'clear' }, at + 5 * MIN + 200],
+  ])
+  expect(ofType(ran.all, 'resume').length).toBe(1)
+  expect(contexts(ran.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ran.rec.job?.stage).toBe('resuming')
+  expect(ran.rec.stalled).toBe(null)
+  // /compact 同理（同一个对话，不搬迁）：还没送出的那句作废说明不再送
+  const k = clearing(CFG_COMPACT)
+  const kStuck = run(k.rec, [[{ kind: 'tick' }, NOW + WAIT]], CFG_COMPACT)
+  expect(kStuck.rec.tell).toBe('stalled')
+  const kRan = run(kStuck.rec, [[{ kind: 'resetDone', seq: k.seq }, NOW + WAIT + MIN], [{ kind: 'submit', origin: COMPOSER, tokens: 41_000 }, NOW + WAIT + 2 * MIN]], CFG_COMPACT)
+  expect(ofType(kRan.all, 'resume').length).toBe(1)
+  expect(kRan.rec.tell).toBe(null)
+  expect(contexts(kRan.steps[1]!.fx)).toEqual([])
+
+  // 搁置之后才报回来「没执行」（被否决或失败）：认领到此为止，不再通知一遍
+  const failed = run(stuck.rec, [{ kind: 'resetFailed', seq: 1, message: 'the command was removed from the queue before it ran' }])
+  expect(failed.rec.stalled).toBe(null)
+  expect(failed.rec.tell).toBe('stalled')
+  expect(ofType(failed.all, 'toast')).toEqual([])
+  // 用户自己 /clear：新对话是用户的，不给交接、不续接
+  const own = migrateRecord(run(stuck.rec, [{ kind: 'userCommand', command: 'clear' }]).rec, at + MIN)
+  expect(own.stalled).toBe(null)
+  const ownSs = run(own, [{ kind: 'sessionStart', source: 'clear' }])
+  expect(contexts(ownSs.all)).toEqual([])
+  expect(ofType(ownSs.all, 'resume')).toEqual([])
+  // 会话结束、进程重启（命令随旧进程没了）：丢掉
+  expect(run(stuck.rec, [{ kind: 'sessionEnd', reason: 'prompt_input_exit' }]).rec.stalled).toBe(null)
+  expect(run(stuck.rec, [{ kind: 'start', queuedHere: false }]).rec.stalled).toBe(null)
+  // 热重载：旧模块的 resetDone 不会来了，改由同种重置的 SessionStart 认领；CC 自动压缩的 SessionStart(compact) 不是它
+  const reloaded = run(stuck.rec, [{ kind: 'start', queuedHere: true }])
+  expect(reloaded.rec.stalled?.orphan).toBe(true)
+  const other = run(reloaded.rec, [{ kind: 'sessionStart', source: 'compact' }])
+  expect(contexts(other.all)).toEqual([])
+  expect(other.rec.stalled?.orphan).toBe(true)
+  const claimed = run(migrateRecord(reloaded.rec, at + 5 * MIN), [[{ kind: 'sessionStart', source: 'clear' }, at + 5 * MIN]])
+  expect(contexts(claimed.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(claimed.all, 'resume').length).toBe(1)
+  // 模型一直不理重来的提醒，用量到了 compact_at：兜底压缩是自己新发出的命令，被搁置的那次不再认领
+  const ignored: Rec = { ...stuck.rec, tell: null, levels: { remind: true, urge: true } }
+  const fbAfter = run(ignored, bigTurn(652_000, T2).map((ev): [Ev, number] => [ev, at + 30 * MIN]))
+  expect(fbAfter.rec.fallback).not.toBe(null)
+  expect(fbAfter.rec.stalled).toBe(null)
 
   // 兜底压缩同样有出口
   const fb = compacting()
@@ -655,6 +1347,64 @@ test('wait_minutes: the timer cancels a registration whose turn never ended, and
   const r = run(rec, [{ kind: 'resetDone', seq }, [{ kind: 'tick' }, NOW + RESUME_STUCK_MS]])
   expect(r.rec.job).toBe(null)
   expect(r.rec.tell).toBe(null)
+})
+
+test('a queued reset set aside in a conversation that already has the handoff: the user is told, the model is not (it never registered there), and a later run of the command still resumes', () => {
+  // 自家的重置排队时用户自己的 /clear 先跑完：新对话当场拿到交接。随后插件更新、模块热重载，
+  // 自家那条命令没有执行（比如被否决），旧模块报不回来；对话空闲满 wait_minutes
+  for (const cfg of [CFG_COMPACT, defaultConfig()]) {
+    const action = cfg.settings.action
+    const q = clearing(cfg)
+    const mid = run(
+      migrateRecord(run(q.rec, [{ kind: 'userCommand', command: 'clear' }], cfg).rec, NOW + 2_000),
+      [
+        [{ kind: 'sessionStart', source: 'clear' }, NOW + 2_200],
+        [{ kind: 'start', queuedHere: true }, NOW + 5 * MIN],
+      ],
+      cfg,
+    )
+    expect(contexts(mid.steps[0]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+    expect(mid.rec.job?.stage).toBe(action === 'clear' ? 'clearing' : 'compacting')
+    expect(mid.rec.job?.ctxGiven).toBe(true)
+    const at = NOW + 5 * MIN + WAIT
+    const stuck = run(mid.rec, [[{ kind: 'tick' }, at]], cfg)
+    expect(stuck.rec.job).toBe(null)
+    expect(stuck.rec.stalled?.seq).toBe(q.seq)
+    const said = `AutoHandoff: the queued /${action} did not run within 60 minutes and was set aside; if it still runs, the conversation continues from the handoff file.`
+    expect(ofType(stuck.all, 'toast')).toEqual([{ type: 'toast', text: said }])
+    expect(ofType(stuck.all, 'notify')).toEqual([{ type: 'notify', text: said }])
+    // 这个对话的模型没登记过：不告诉它「你的登记作废了」，下一条消息什么也不附（用量也远没到提醒线）
+    expect(stuck.rec.tell).toBe(null)
+    const next = run(stuck.rec, [[{ kind: 'submit', origin: COMPOSER, tokens: 47_000 }, at + MIN], [{ kind: 'turnStart', turnId: T2 }, at + MIN], [{ kind: 'postTool', tokens: 49_000 }, at + MIN]], cfg)
+    expect(contexts(next.all)).toEqual([])
+    // 那条命令后来还是执行了（对话空闲时）：孤儿由同种重置的 SessionStart 认领，照常续接
+    const ran = run(action === 'clear' ? migrateRecord(stuck.rec, at + 10 * MIN) : stuck.rec, [[{ kind: 'sessionStart', source: action }, at + 10 * MIN]], cfg)
+    expect(ofType(ran.all, 'resume').length).toBe(1)
+    expect(ran.rec.stalled).toBe(null)
+  }
+
+  // 被搁置的 /clear 终究执行、记录搬到新 sid：被清掉的那个对话里的「已拿到交接」「用户已接手」不带过去，新对话照常续接。
+  // 经过：用户的 /clear 先跑完，在中间那个对话里发了消息（已拿到交接 → 记用户接手）；自家 /clear 的结果一直不来，空闲满一小时被搁置；
+  // 之后它执行了
+  const c = clearing()
+  const m = run(migrateRecord(run(c.rec, [{ kind: 'userCommand', command: 'clear' }]).rec, NOW + 2_000), [
+    [{ kind: 'sessionStart', source: 'clear' }, NOW + 2_200],
+    [{ kind: 'submit', origin: COMPOSER, tokens: 44_000 }, NOW + MIN],
+    [{ kind: 'turnStart', turnId: T2 }, NOW + MIN],
+    [{ kind: 'stop', active: false, tokens: 45_000 }, NOW + 2 * MIN],
+    [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 45_000 }, NOW + 2 * MIN],
+    [{ kind: 'tick' }, NOW + 2 * MIN + WAIT],
+  ])
+  expect(m.rec.stalled?.userTook).toBe(true)
+  expect(m.rec.stalled?.ctxGiven).toBe(true)
+  expect(m.rec.tell).toBe(null)
+  const late = NOW + 2 * MIN + WAIT + 30 * MIN
+  const moved = migrateRecord(m.rec, late)
+  expect([moved.stalled?.userTook, moved.stalled?.ctxGiven]).toEqual([false, false])
+  const fin = run(moved, [[{ kind: 'resetDone', seq: c.seq }, late], [{ kind: 'sessionStart', source: 'clear' }, late + 200]])
+  expect(ofType(fin.all, 'resume').length).toBe(1)
+  expect(contexts(fin.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(fin.rec.job?.stage).toBe('resuming')
 })
 
 test('session end (not /clear) cancels; CC auto-compaction mid-turn keeps the registration', () => {
@@ -764,8 +1514,8 @@ test('a reload while the reset is queued: the job is kept as an orphan and the n
   expect(r.rec.job?.orphan).toBe(true)
   expect(r.rec.tell).toBe(null)
   expect(ofType(r.all, 'toast')).toEqual([])
-  // 计时器停了：按发出时刻重挂剩下的时间
-  expect(ofType(r.all, 'timer')).toEqual([{ type: 'timer', ms: WAIT - 2 * MIN }])
+  // 计时器停了：重挂，从重载这一刻起算满 wait_minutes
+  expect(ofType(r.all, 'timer')).toEqual([{ type: 'timer', ms: WAIT }])
   // 旧模块的回调没来：SessionStart(clear) 给 start_context 并提交续接
   const ss = run(migrateRecord(r.rec, NOW + 3 * MIN), [[{ kind: 'sessionStart', source: 'clear' }, NOW + 3 * MIN]])
   expect(contexts(ss.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
@@ -781,14 +1531,17 @@ test('a reload while the reset is queued: the job is kept as an orphan and the n
   const first = run(migrateRecord(r.rec, NOW), [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }])
   expect(ofType(first.all, 'resume').length).toBe(1)
   expect(contexts(first.all).length).toBe(1)
-  // 用户在重置期间说过话：不续接
-  const took = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_400 }, { kind: 'start' }, { kind: 'sessionStart', source: 'clear' }])
-  expect(ofType(took.all, 'resume')).toEqual([])
-  expect(took.rec.job).toBe(null)
-  // 重启时离发出已过 wait_minutes：放弃
+  // 排在重置前面的消息在旧对话里处理过（附了说明），之后热重载：孤儿 job 照样在 SessionStart(clear) 续接
+  const queued = run(rec, [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 318_400 }, { kind: 'start' }])
+  expect(contexts(queued.steps[0]!.fx)[0]).toContain(`Registered handoff file: "${HANDOVER}".`)
+  expect(queued.rec.job?.orphan).toBe(true)
+  const queuedSs = run(migrateRecord(queued.rec, NOW + 3 * MIN), [[{ kind: 'sessionStart', source: 'clear' }, NOW + 3 * MIN]])
+  expect(ofType(queuedSs.all, 'resume').length).toBe(1)
+  expect(queuedSs.rec.job?.stage).toBe('resuming')
+  // 重载时离发出已过 wait_minutes：命令撤不回，照样留作孤儿（搁置与否由空闲时间决定，见 wait_minutes 那条用例）
   const stale = run(rec, [[{ kind: 'start' }, NOW + WAIT]])
-  expect(stale.rec.job).toBe(null)
-  expect(ofType(stale.all, 'log')[0]!.text).toBe('handoff cancelled: restarted, and no result from /clear within 60 minutes')
+  expect(stale.rec.job?.orphan).toBe(true)
+  expect(ofType(run(migrateRecord(stale.rec, NOW + WAIT + MIN), [[{ kind: 'sessionStart', source: 'clear' }, NOW + WAIT + MIN]]).all, 'resume').length).toBe(1)
   // compact：同一个 sid，SessionStart(compact) 补上续接
   const cfg = cfgWith({ action: 'compact' })
   const c = clearing(cfg)
@@ -832,9 +1585,9 @@ function states(): Record<string, { rec: Rec; seq: number; cfg: ReturnType<typeo
   }
 }
 
-/** 一步之后的形态：job 的阶段（没有 job 为 none）、兜底压缩在不在、挂着的作废说明、重置排队期间用户是否已接手 */
+/** 一步之后的形态：job 的阶段（没有 job 为 none）、兜底压缩在不在、挂着的作废说明、用户是否已接手（在重置后的对话里发了消息）、有没有被搁置的重置 */
 function shape(r: Rec): string {
-  return `${r.job ? r.job.stage : 'none'}${r.fallback ? '+fallback' : ''}${r.tell ? ` tell:${r.tell}` : ''}${r.job?.userTook ? ' took' : ''}`
+  return `${r.job ? r.job.stage : 'none'}${r.fallback ? '+fallback' : ''}${r.tell ? ` tell:${r.tell}` : ''}${r.job?.userTook ? ' took' : ''}${r.stalled ? ' stalled' : ''}${r.held ? ' held' : ''}`
 }
 
 test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and §0 items 20, 21, 23, 24)', () => {
@@ -842,12 +1595,18 @@ test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and
   // 第 4 项（可选）：送事件前先改记录
   type Row = [string, (seq: number) => Ev | [Ev, number], Record<(typeof S)[number], string>, ((r: Rec) => Rec)?]
   const kept = { idle: 'none', armed: 'armed', clearing: 'clearing', compacting: 'compacting', resuming: 'resuming', fallback: 'none+fallback' }
-  // 人工消息作废登记时，作废说明当场附在这条消息上（tell 随即清空）；排队中的重置则记下用户已接手
+  // 人工消息作废登记时，作废说明当场附在这条消息上（tell 随即清空）；排在已排队的重置前面的消息不作废也不算用户接手
+  const cancelsArmed = { ...kept, armed: 'none' }
+  // 重置后的对话已拿到交接、自家命令的结果还没回来时到的消息：记下用户已接手
   const tookOver = { ...kept, armed: 'none', clearing: 'clearing took', compacting: 'compacting took' }
+  const handoffGiven = (r: Rec): Rec => (r.job ? { ...r, job: { ...r.job, ctxGiven: true } } : r)
   const rows: Row[] = [
     // 消息：人工、来源不明、引擎 meta、代理、自家
-    ['human message', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), tookOver],
-    ['unclassified message without isMeta', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), tookOver],
+    ['human message', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), cancelsArmed],
+    ['unclassified message without isMeta', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), cancelsArmed],
+    ['human message, handoff already given to this conversation', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), tookOver, handoffGiven],
+    ['unclassified message without isMeta, handoff already given', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), tookOver, handoffGiven],
+    ['task notification, handoff already given', () => ({ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 320_000 }), kept, handoffGiven],
     ['engine meta message (unclassified + isMeta)', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, isMeta: true, tokens: 320_000 }), kept],
     ['task notification', () => ({ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 320_000 }), kept],
     ['own resume message', () => ({ kind: 'submit', origin: { kind: 'plugin', name: 'autohandoff' }, tokens: 9_000 }), kept],
@@ -878,10 +1637,22 @@ test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and
     ['turn interrupted (Esc)', () => ({ kind: 'turnComplete', turnId: T1, reason: 'aborted', isAborted: true, tokens: 320_000 }), { ...kept, armed: 'none' }],
     ['turn ended with an API error', () => ({ kind: 'turnComplete', turnId: T1, reason: 'error', isAborted: false, tokens: 320_000 }), { ...kept, armed: 'none tell:api_error' }],
     ['turn ended without Stop (tool rejected)', () => ({ kind: 'turnComplete', turnId: T1, reason: 'answer', isAborted: false, tokens: 320_000, file: FILE_OK }), { ...kept, armed: 'none' }],
-    // 计时：登记后 / 发出后 / 续接后都已超时
-    ['timer past every limit', () => [{ kind: 'tick' }, NOW + 2 * WAIT], { ...kept, armed: 'none tell:timeout', clearing: 'none', compacting: 'none', resuming: 'none', fallback: 'none' }],
+    // 计时：登记后 / 发出后（对话一直空闲）/ 续接后都已超时。已排队的重置不丢，只是搁置
+    [
+      'timer past every limit',
+      () => [{ kind: 'tick' }, NOW + 2 * WAIT],
+      { ...kept, armed: 'none tell:timeout', clearing: 'none tell:stalled stalled', compacting: 'none tell:stalled stalled', resuming: 'none', fallback: 'none' },
+    ],
     // 自家命令的结果
-    ['own reset vetoed by Esc', (seq) => ({ kind: 'resetFailed', seq, message: VETO }), { ...kept, clearing: 'none', compacting: 'none', fallback: 'none' }],
+    // 已排队的交接重置被 Esc 否决：告诉模型，并挂起到用户下次输入（兜底压缩被否决不出声，同样挂起，见 compact_at 那条用例）；
+    // 认不出的请求（不是当前的）不动
+    ['own reset vetoed by Esc', (seq) => ({ kind: 'resetFailed', seq, message: VETO }), { ...kept, clearing: 'none tell:stopped held', compacting: 'none tell:stopped held', fallback: 'none held' }],
+    [
+      'own reset dropped from the queue by Esc',
+      (seq) => ({ kind: 'resetFailed', seq, message: 'the command was removed from the queue before it ran' }),
+      { ...kept, clearing: 'none tell:interrupted held', compacting: 'none tell:interrupted held', fallback: 'none held' },
+    ],
+    ['own reset vetoed by Esc, handoff already given to this conversation', (seq) => ({ kind: 'resetFailed', seq, message: VETO }), { ...kept, clearing: 'none held', compacting: 'none held', fallback: 'none held' }, handoffGiven],
     [
       'own reset failed',
       (seq) => ({ kind: 'resetFailed', seq, message: 'autohandoff: $.command.run: Error: Not enough messages to compact' }),
@@ -983,10 +1754,14 @@ test('chain guard: a conversation just continued from a handoff refuses to regis
   expect(run(r, [{ kind: 'register', verdict: FILE_OK, tokens: 301_000 }]).steps[0]!.accepted).toBe(true)
   // compact 路径同样
   expect(resumed(CFG_COMPACT).resumed).toBe(true)
-  // 用户在重置期间发过消息（接手了）：不挡
+  // 用户在重置后的对话里、自家命令的结果回来之前发了消息（接手了）：不挡
   const { rec, seq } = clearing()
-  const took = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_400 }, { kind: 'resetDone', seq }])
+  const took = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: COMPOSER, tokens: 9_000 }, { kind: 'resetDone', seq }])
   expect([took.rec.resumed, took.rec.resumedAt, took.rec.resumedTokens]).toEqual([false, null, null])
+  // 排在重置前面、在旧对话里处理掉的人工消息不算：新对话照常续接、带守卫，人在新对话里再输入一次才解除
+  const before = run(rec, [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 318_400 }, { kind: 'resetDone', seq }])
+  expect([before.rec.resumed, before.rec.resumedAt, before.rec.resumedTokens]).toEqual([true, NOW, null])
+  expect(run(before.rec, [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 52_000 }]).rec.resumed).toBe(false)
   // 用户自己 /clear 出来的新对话不带这个标记，基准也不带过去
   expect(migrateRecord({ ...a.rec }, NOW).resumed).toBe(false)
   expect(migrateRecord({ ...a.rec }, NOW).resumedTokens).toBe(null)
@@ -1261,18 +2036,29 @@ test('compact window (action compact): a human message, an agent message, /autoh
   const cfg = CFG_COMPACT
   const { rec, seq } = clearing(cfg)
   expect(rec.job?.stage).toBe('compacting')
-  // 人工消息：放行，压缩后不提交续接（用户接手），SessionStart(compact) 照样给交接
-  const h = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_000 }, { kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }], cfg)
-  expect(contexts(h.steps[0]!.fx)).toEqual([])
-  expect(contexts(h.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
-  expect(ofType(h.all, 'resume')).toEqual([])
-  expect(h.rec.job).toBe(null)
-  expect(h.rec.resumed).toBe(false)
-  // resolve 先到、SessionStart 后到：同样只给交接、不续接
-  const h2 = run(rec, [{ kind: 'submit', origin: COMPOSER, tokens: 318_000 }, { kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'compact' }], cfg)
+  // 排在 /compact 前面的人工消息（回合中从 Remote Control 发来的）：在压缩前的对话里处理，附说明；压缩后照常续接、带守卫
+  const h = run(
+    rec,
+    [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 318_000 }, ...oldTurn(T2, 319_500), { kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }],
+    cfg,
+  )
+  expect(contexts(h.steps[0]!.fx)).toEqual([userNote('compact')])
+  expect(contexts(h.steps[5]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(ofType(h.all, 'resume').length).toBe(1)
+  expect(ofType(h.all, 'compact')).toEqual([])
+  expect(h.rec.job?.stage).toBe('resuming')
+  expect(h.rec.resumed).toBe(true)
+  // SessionStart(compact) 之后、promise resolve 之前到的人工消息：由压缩后的对话处理（用户接手），不附说明、不续接
+  const h2 = run(rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: COMPOSER }, { kind: 'resetDone', seq }], cfg)
+  expect(contexts(h2.steps[1]!.fx)).toEqual([])
   expect(ofType(h2.all, 'resume')).toEqual([])
-  expect(contexts(h2.steps[2]!.fx).length).toBe(1)
   expect(h2.rec.job).toBe(null)
+  expect(h2.rec.resumed).toBe(false)
+  // 实测的顺序（压缩窗口里敲的消息要等压缩完才交出，这时已是续接阶段）：续接已提交，消息照常处理
+  const h3 = run(rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }, { kind: 'submit', origin: COMPOSER }], cfg)
+  expect(ofType(h3.all, 'resume').length).toBe(1)
+  expect(contexts(h3.steps[2]!.fx)).toEqual([])
+  expect(h3.rec.job?.stage).toBe('resuming')
   // 代理消息：附 reset_note，压缩后照常续接
   const a = run(rec, [{ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 318_000 }, { kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }], cfg)
   expect(contexts(a.steps[0]!.fx)[0]).toContain('The conversation is about to be reset with /compact')
@@ -1308,14 +2094,41 @@ test('compact window: the user\'s /clear runs before the queued /compact; the ne
   const ok = run(ss.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }], cfg)
   expect(contexts(ok.all).length).toBe(1)
   expect(ofType(ok.all, 'resume').length).toBe(1)
+  // 用户在自己 /clear 出来的新对话里发了消息、模型答了（这个对话已拿到交接：用户已接手），之后自家的 /compact 才在这个对话上执行：
+  // 压缩完不再硬塞一条续接，也不置守卫。SessionStart(compact) 与命令结果谁先到都一样
+  const inNew = run(
+    ss.rec,
+    [
+      { kind: 'submit', origin: COMPOSER, tokens: 46_000 },
+      { kind: 'turnStart', turnId: T2 },
+      { kind: 'postTool', tokens: 52_000 },
+      { kind: 'stop', active: false, tokens: 54_000 },
+      { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 54_000 },
+    ],
+    cfg,
+  )
+  expect(contexts(inNew.steps[0]!.fx)).toEqual([])
+  expect(inNew.rec.job?.userTook).toBe(true)
+  const ssCompact: Ev = { kind: 'sessionStart', source: 'compact' }
+  const result: Ev = { kind: 'resetDone', seq }
+  for (const order of [[ssCompact, result], [result, ssCompact]]) {
+    const end = run(inNew.rec, order, cfg)
+    expect(ofType(end.all, 'resume')).toEqual([])
+    expect(end.rec.job).toBe(null)
+    expect(end.rec.resumed).toBe(false)
+  }
   // 自家 /compact 在几乎空的新对话上失败：不告诉模型「重置失败」，照常续接
   const failed = run(ss.rec, [{ kind: 'resetFailed', seq, message: 'autohandoff: $.command.run: Error: Not enough messages to compact.' }], cfg)
   expect(failed.rec.tell).toBe(null)
   expect(ofType(failed.all, 'toast')).toEqual([])
   expect(ofType(failed.all, 'resume').length).toBe(1)
   expect(failed.rec.job?.stage).toBe('resuming')
-  // 用户按 Esc 否决：静默作废（交接已经给了新对话）
-  expect(run(ss.rec, [{ kind: 'resetFailed', seq, message: VETO }], cfg).rec.job).toBe(null)
+  // 用户按 Esc 否决：静默作废（交接已经给了新对话，这里的模型没登记过什么，不必告诉它「登记作废了」）
+  const vetoed = run(ss.rec, [{ kind: 'resetFailed', seq, message: VETO }], cfg)
+  expect(vetoed.rec.job).toBe(null)
+  expect(vetoed.rec.tell).toBe(null)
+  expect(ofType(vetoed.all, 'toast')).toEqual([])
+  expect(ofType(vetoed.all, 'resume')).toEqual([])
   // 没拿到交接的对话里 /compact 失败：照旧作废并告诉模型
   expect(run(rec, [{ kind: 'resetFailed', seq, message: 'Error: prompt is too long' }], cfg).rec.tell).toBe('reset_failed')
   // 用户自己的 /compact 先跑：它的 SessionStart(compact) 已是压缩后的对话，给交接；自家的再跑完才续接，一次

@@ -75,7 +75,7 @@ To try it in one session without installing: `claude --plugin-dir <dir>`.
   the two update commands above.
 - **Your configuration file is not updated.** `~/.claude/autohandoff.md` keeps every prompt as it was when the file
   was created, and a prompt written in the file replaces the built-in one, so a new version's prompt changes do not
-  reach you by themselves (4.2.0 changed `start_context`; 4.1.0 changed `remind`, `remind_short`, `urge`, `urge_block`,
+  reach you by themselves (4.2.1 added `reset_note_user`; 4.2.0 changed `start_context`; 4.1.0 changed `remind`, `remind_short`, `urge`, `urge_block`,
   `start_context` and `resume`). Merge the new text from `hooks/prompts.ts` into the sections you have not
   customised, or delete those sections, or delete the file to get a fresh copy (note your settings first and put them
   back). New settings use their defaults until you add them; `/autohandoff status` lists the missing ones.
@@ -131,7 +131,8 @@ type (so agent team teammates, which never receive typed input, never switch on 
 handoff with its stage (or, before that, the handoff file the model has been asked to write), the configuration file
 in use and any problems in it.
 
-While a handoff is registered or a reset is running, a status line under the input box says so (Claude Code shows
+While a handoff is registered, a reset is running or AutoHandoff is paused after Esc (see Cancellation below), a
+status line under the input box says so (Claude Code shows
 plugin status lines with a ⚠ in front). Short notices appear in the top-right corner.
 
 ### What the model does
@@ -237,6 +238,9 @@ stamps on it:
 | The handoff file is gone, moved or empty when the turn ends | yes | toast |
 | AutoHandoff is reloaded or Claude Code restarts before the reset is queued | yes | toast |
 | You press Esc, or reject a tool (the turn ends without a Stop) | no: you stopped it, so it waits for you | none |
+| You press Esc after the reset is queued, and Claude Code drops the queued reset | yes, at the next message; no, if this conversation already has the handoff (your own `/clear` ran first) | toast; none in that second case |
+| The reset is refused as soon as it is issued, because you stopped the session with Esc earlier and have not typed since | yes, at the next message | toast and notification |
+| A queued reset has still not run after `wait_minutes` of idle time: it is set aside, not dropped (see below) | yes, at the next message; no, if this conversation already has the handoff | toast and notification |
 | You run `/clear`, `/compact` or `/resume`, or `/autohandoff off` | no | none |
 | Claude Code exits | no | none |
 
@@ -244,12 +248,48 @@ When the model is told, the reminder it last received counts as unsent again, so
 The cancellation note asks the model, before it registers again, to update the handoff file with whatever is new,
 above all what you just asked for.
 
-**Once the reset is queued** it cannot be withdrawn (only Esc can veto it before it runs). A message you type in that
-short window is not lost: it goes to the new conversation, and the resume message is skipped because you have taken
-over. `/clear`, `/compact`, `/resume` and `/autohandoff off` typed in that window do not cancel it either; a toast
-says the reset is queued. After `/autohandoff off` the reset still runs and resumes, and AutoHandoff stays off in the
-new conversation. An agent message that arrives in the window gets a note telling the model a reset is about to
-happen.
+**Once the reset is queued** it cannot be withdrawn (only Esc can veto it before it runs). `/clear`, `/compact`,
+`/resume` and `/autohandoff off` typed in that window do not cancel it; a toast says the reset is queued. After
+`/autohandoff off` the reset still runs and resumes, and AutoHandoff stays off in the new conversation. If you press
+Esc in that window (for example to stop a turn that runs ahead of the reset), Claude Code drops the queued reset too:
+a toast says the handoff was cancelled, the model is told at the next message, and AutoHandoff does not queue the
+reset again by itself. In a conversation that already has the handoff (your own `/clear` ran before the queued
+`/compact`) nothing is said: nothing was lost, and the model there never registered anything.
+
+**After Esc, AutoHandoff pauses until your next input.** Once Claude Code has refused a reset because you pressed
+Esc, it refuses every reset a plugin issues until you send input. Reminding the model in that time would only make
+it write and register a handoff that cannot be carried out, once for every agent report that comes in. So from the
+refusal until your next message or command (typed here or sent through Remote Control; `/autohandoff status` does
+not count) AutoHandoff sends no reminders, does not hold a turn open at `urge_at`, does not accept a handoff (the
+model is told why and when it works again) and does not compact at `compact_at`. The status line reads "paused
+until your next input (stopped with Esc)". Reports from agents and background tasks, scheduled prompts and other
+plugins' prompts do not end the pause; your next input does, and the reminder comes back with it. The same pause
+applies when the refused reset is the first you hear of it: you stopped a turn with Esc, left, and a later agent
+report led the model to hand off. That refusal is announced once, with a toast and a notification.
+
+A queued reset runs as soon as the conversation is idle, so time spent in a turn that runs ahead of it (see the next
+paragraph) is not waiting time, however long that turn takes. If the conversation has been idle for `wait_minutes`
+in total and the reset still has not reported back, AutoHandoff sets it aside instead of leaving the conversation
+"resetting" for good: a toast and a notification say that the queued command was set aside, the model is told at the
+next message that its registration no longer stands (not in a conversation that already has the handoff), and
+reminders and registration work again. The handoff is not dropped: if that reset does run later, the conversation is
+still continued from the handoff file. The set-aside reset is forgotten when a new handoff is registered, when
+AutoHandoff compacts at `compact_at`, when you run `/clear` or `/compact` yourself, and when Claude Code exits.
+
+**Messages that were waiting when the turn ended.** Some messages are not delivered into a running turn and wait in
+Claude Code's queue until it ends: one you send through Remote Control while the model is working, a scheduled
+prompt, another plugin's prompt, an agent's report. The reset is queued only when the turn ends, behind them, so
+Claude Code first gives each of them a turn in the old conversation and resets afterwards. AutoHandoff adds a note to
+such a message. A report from an agent (a subagent, a background task, another session) gets `reset_note`: keep the
+turn short and update the handoff file if the message changes it. Every other message, whether you wrote it or not
+(Remote Control, a scheduled prompt, another plugin's prompt, a channel message, an unknown source), gets
+`reset_note_user`: answer as usual but start no new work, and add whatever the next conversation must act on to the
+registered handoff file, whose path is given. The reset then runs and the resume message is sent as usual. The new
+conversation knows only what is in the handoff file. Pressing Esc during that turn drops the queued reset and cancels
+the handoff, as described above. Only a message of that second kind that is handled by a conversation which already
+has the handoff counts as the conversation having been taken over, and then the resume message is skipped: one that
+arrives after AutoHandoff's own reset has happened but before AutoHandoff has the reset's result, or one you send in
+the conversation your own `/clear` opened while AutoHandoff's `/compact` was still queued.
 
 **Reload versus restart.** When the mod is hot-reloaded (for example the plugin is updated) while a reset is queued,
 the queued command still runs and the new module sends the resume message once. When Claude Code itself was
@@ -275,8 +315,9 @@ never "hand off again".
 
 **The `compact_at` safety net.** When a main-conversation turn ends at or above `compact_at` with no handoff
 registered, AutoHandoff queues `/compact <compact_focus>`. During that compaction no reminders are added and
-registrations are refused. If you veto it with Esc, it waits for your next message before trying again; after three
-failures it stops trying in that conversation (`/autohandoff status` says so).
+registrations are refused. If you veto it with Esc, AutoHandoff pauses until your next input, as described under
+Cancellation, and tries again after that; after three failures it stops trying in that conversation
+(`/autohandoff status` says so).
 
 **Failing safe.** Every hook catches its own errors and lets the event through, so AutoHandoff never blocks your
 input. If its state cannot be saved when a reset is due, it does not reset and tells you; a registration that cannot
@@ -320,7 +361,7 @@ resume_guard_tokens: 100000
 | `compact_at` | `650000` | Compact when a turn ends here with no handoff. Must be above `urge_at`. |
 | `action` | `clear` | `clear` or `compact`: how the conversation is reset after a handoff. |
 | `fresh_minutes` | `10` | The handoff file must have been modified this recently when registered (1–1440). |
-| `wait_minutes` | `60` | Give up if the turn has not ended this long after registering (1–1440). |
+| `wait_minutes` | `60` | Give up if the turn has not ended this long after registering (1–1440). Also how long a conversation may be idle, added up across turns, with a queued reset that has not run before the reset is set aside. |
 | `urge_block` | `true` | Past `urge_at`, block the first attempt to end a turn without a handoff, once per turn. |
 | `remind_every_turn` | `true` | After the first reminder, add a short reminder to every later message until a handoff is registered. |
 | `handoff_max_tokens` | `20000` | Size limit for the handoff file, in estimated tokens. The reminders ask for about 3/4 of it; a larger file is not registered (see *Handoff file size*). `0` turns the check off; otherwise at least 2000. |
@@ -330,7 +371,7 @@ Token values accept `300000`, `300_000` or `300,000`, up to 10,000,000 (`remind_
 `handoff_max_tokens` and `resume_guard_tokens` also take `0`, see the table). If `remind_at < urge_at < compact_at`
 does not hold, all three use their defaults.
 
-**Prompts.** Ten prompts can be replaced; a section you leave out uses the built-in text (the generated file contains
+**Prompts.** Eleven prompts can be replaced; a section you leave out uses the built-in text (the generated file contains
 all of them, so you can edit in place):
 
 | Section | Used for |
@@ -342,6 +383,7 @@ all of them, so you can edit in place):
 | `cancelled` | Tells the model its registered handoff was cancelled, and why. |
 | `pending_note` | Added to an agent message that arrives while a handoff is registered. |
 | `reset_note` | Added to an agent message that arrives while the reset is queued. |
+| `reset_note_user` | Added to any other message (yours, a scheduled prompt, another plugin's, a channel's, an unknown source) that was waiting when the turn ended and is answered before the queued reset. |
 | `start_context` | Context for the model at the start of the reset conversation. |
 | `resume` | The message sent as you after the reset. |
 | `compact_focus` | Focus instructions passed to `/compact` (`action: compact` and `compact_at`). |
@@ -349,11 +391,13 @@ all of them, so you can edit in place):
 Placeholders are written `{name}`: `{used_k}` `{remind_k}` `{urge_k}` `{compact_k}` (thousands of tokens),
 `{compact_note}` (a sentence about `compact_at`), `{handoff_note}` (the sentence giving the handoff file's size budget,
 empty when `handoff_max_tokens` is 0), `{handoff_k}` `{handoff_max_k}` (the size to aim for and the limit),
-`{tool}` (the registration tool's full name), `{action}` (`/clear` or `/compact`), `{reason}` (in `cancelled` only).
+`{tool}` (the registration tool's full name), `{action}` (`/clear` or `/compact`: the `action` setting, or, in
+`reset_note_user`, `start_context` and `resume`, the command queued for the registered handoff), `{reason}` (in
+`cancelled` only).
 Each prompt accepts only the ones that make sense for it, and others are left as written. Paths are never
 placeholders: AutoHandoff appends the path of the handoff file to write to `remind`, `remind_short`, `urge` and
-`urge_block`, and the registered file's path to `start_context` and `resume` (there marked as notes from the previous
-conversation rather than instructions from you). A prompt that uses `{file}` or the old `{cmd}` falls back to the built-in text.
+`urge_block`, and the registered file's path to `reset_note_user`, `start_context` and `resume` (in the last two
+marked as notes from the previous conversation rather than instructions from you). A prompt that uses `{file}` or the old `{cmd}` falls back to the built-in text.
 
 **Environment variables.**
 
@@ -385,9 +429,16 @@ AutoHandoff never changes Claude Code's settings.
 - **A compaction that does not get below `compact_at`.** Only failed compactions are counted. If `compact_at` is set
   so low that a successful compaction still leaves usage above it, every turn ending above it compacts again. Keep
   `compact_at` well above what a compacted conversation needs.
+- **A plugin reload while a reset is queued.** After a reload AutoHandoff no longer hears what became of the queued
+  command. If you press Esc in the turn ahead of it, AutoHandoff takes the interrupted turn as the veto. If the
+  command is lost in some other way, messages you send keep being told that the reset is about to happen until the
+  idle time between turns adds up to `wait_minutes`; then it is set aside as described above.
+- **Esc and channels.** The pause after Esc ends only with input typed in the session or sent through Remote
+  Control. A message that reaches the session through a channel plugin does not end it.
 - **If the per-session state cannot be read** when Claude Code starts, a queued reset is treated as still running:
-  for up to `wait_minutes` the conversation gets no reminders and refuses registrations, and the status line keeps
-  saying it is resetting. This needs the host's in-memory state to fail and has not been observed.
+  for up to `wait_minutes` of idle time the conversation gets no reminders and refuses registrations, and the status
+  line keeps saying it is resetting; then the reset is set aside with a toast. This needs the host's in-memory state
+  to fail and has not been observed.
 - **Untested environments.** Only the terminal CLI on Linux has been tested end to end. Windows path handling is
   covered by unit tests only, and the VS Code extension,
   the desktop app and Remote Control have not been tried.
@@ -411,7 +462,7 @@ claude plugin test .         # unit and flow tests (tests/*.test.ts), no session
 | `types/autohandoff.d.ts` | Type contract for the per-session state (`$.state`). |
 | `commands/autohandoff.md` | `/autohandoff`; answered by the mod, and only reaches the model when mods are not running. |
 | `tests/` | `core.test.ts` (logic), `state.test.ts` (state machine), `flow.test.ts` (hooks against a stubbed host). |
-| `e2e/` | End-to-end driver for real sessions, plus an API fault-injection proxy. |
+| `e2e/` | End-to-end driver for real sessions, plus an API fault-injection proxy and a helper mod that queues a prompt behind a running turn. |
 
 **End-to-end tests** run real Claude Code sessions (they use your login and spend tokens):
 
@@ -422,7 +473,7 @@ python3 e2e/drive.py <work dir> --cleanup-only       # after --keep
 ```
 
 Scenarios: `clear draft dialog deny interject notify cmp slash print compact fallback ctype agentdialog reload restart
-esc apierr subreg urge userclear chain limit` (all by default). Each session runs in a separate tmux server (`SOCK`, default
+esc apierr subreg urge userclear chain limit queued queuedc escq` (all by default). Each session runs in a separate tmux server (`SOCK`, default
 `ahmod`) with `--plugin-dir` pointing at this checkout and `--settings` that disables an installed
 `autohandoff@autohandoff`; the configuration comes from the work directory through `AUTOHANDOFF_CONFIG`. Afterwards
 the driver kills the tmux server and removes exactly what the test sessions left under `~/.claude` (their project

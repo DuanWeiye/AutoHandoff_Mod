@@ -34,6 +34,7 @@ import {
   promptVars,
   reachedCompactAt,
   renderPrompt,
+  resetUserNoteText,
   resumeGuardText,
   resumeText,
   startContextText,
@@ -259,6 +260,32 @@ test('template: resume and start_context carry the quoted path after the templat
   const sc = startContextText(cfg, MEMORY_NOTE, 'compact')
   expect(sc).toContain('reset by AutoHandoff (/compact)')
   expect(sc).toContain(`"${MEMORY_NOTE}"`)
+})
+
+test('template: the note on a message queued ahead of the reset names the registered file, the queued action and the size budget', () => {
+  const cfg = defaultConfig()
+  const note = resetUserNoteText(cfg, HANDOVER, 'clear', 318_400)
+  expect(note).toStartWith('[AutoHandoff] The handoff you registered is still in effect: when this turn ends, the conversation is reset with /clear')
+  expect(note).toContain('Answer it as you normally would, but keep this turn short and do not start new work.')
+  expect(note).toContain('add that to the handoff file now')
+  expect(note).toContain(' Keep it within about 15k tokens, since the next conversation reads all of it;')
+  expect(note).toContain(`do not call the ${TOOL_FULL_NAME} tool again, the registration stands.`)
+  expect(note).toEndWith(`\n\nRegistered handoff file: "${HANDOVER}".`)
+  expect(note).not.toMatch(/\{[a-z_]+\}/)
+  // action 取已排队的那条命令的（登记后用户把配置改成 compact，排队的仍是 /clear）
+  const changed = parseConfig(USER_CONFIG).cfg
+  expect(changed.settings.action).toBe('compact')
+  expect(resetUserNoteText(changed, MEMORY_NOTE, 'clear')).toContain('is reset with /clear and continued')
+  // 大小检测关着（handoff_max_tokens: 0）时不提预算
+  const off = defaultConfig()
+  off.settings.handoff_max_tokens = 0
+  expect(resetUserNoteText(off, HANDOVER, 'compact')).toContain('not from this exchange. Edit the file in place')
+  // 用户自己改写的一节：路径照样由代码追加；不能用的占位符原样保留并在 status 里报告
+  const own = parseConfig(`${USER_CONFIG}\n## reset_note_user\n\nA reset with {action} is queued ({used_k}k). Answer briefly; put anything for later into the handoff file.{handoff_note}\n`)
+  expect(own.problems).toEqual(['## reset_note_user: {used_k} cannot be used here and is left as written'])
+  expect(resetUserNoteText(own.cfg, HANDOVER, 'compact', 318_400)).toBe(
+    `A reset with /compact is queued ({used_k}k). Answer briefly; put anything for later into the handoff file. Keep it within about 22k tokens, since the next conversation reads all of it; AutoHandoff does not register a handoff file above 30k.\n\nRegistered handoff file: "${HANDOVER}".`,
+  )
 })
 
 test('template: compact focus is a single line', () => {
@@ -522,8 +549,8 @@ test('records: store key, expiry, loading and migration across /clear', () => {
   expect(loadRecord({ on: true })).toBe(null)
   expect(loadRecord(JSON.parse(JSON.stringify(rec)))).toEqual(rec)
   // 用户手动 /clear 后搬记录：开关和序号计数保留；回合、各层、挂着的作废说明、兜底计数清零
-  const moved = migrateRecord({ ...rec, tell: 'api_error', fallbackHeld: true, turn: { id: 't-1', stopSeen: true, blocked: false } }, NOW + 1000)
-  expect(moved).toEqual({ ...rec, levels: { remind: false, urge: false }, tell: null, fallbackFails: 0, fallbackHeld: false, turn: null, t: NOW + 1000 })
+  const moved = migrateRecord({ ...rec, tell: 'api_error', held: true, turn: { id: 't-1', stopSeen: true, blocked: false } }, NOW + 1000)
+  expect(moved).toEqual({ ...rec, levels: { remind: false, urge: false }, tell: null, fallbackFails: 0, held: false, turn: null, t: NOW + 1000 })
 })
 
 test('records: a record stored by 4.1.0 (no resume time or growth base) loads with both unknown; /clear clears the guard with its base', () => {

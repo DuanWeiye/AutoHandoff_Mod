@@ -280,7 +280,7 @@ async function adopt($: Api, sid: string, now: number, hint: string | undefined)
       await $.store.set(storeKey(sid), moved)
       // 旧对话的记录只留开关（--resume 回去时恢复）；job、回合、作废说明都随对话搬走或作废
       // note 也清掉：那份文件正是新对话续接用的，--resume 回旧对话再被提醒时不能让它覆盖（会生成新路径）
-      await $.store.set(storeKey(old), { ...rec, job: null, fallback: null, turn: null, tell: null, note: null, t: now })
+      await $.store.set(storeKey(old), { ...rec, job: null, stalled: null, fallback: null, turn: null, tell: null, note: null, t: now })
       if (clearingFrom?.sid === old) clearingFrom = null
     } catch (err) {
       // 没存下：旧记录原样留着，模块变量也留着，下一个事件（SessionStart(clear) 等）再搬一次
@@ -514,8 +514,8 @@ async function onSessionStart($: Api, isInteractive: boolean): Promise<void> {
   // 以下几步失败都只是少了默认配置文件或清理，不影响 start 的作废判断
   await safely(() => ensureConfigFile($))
   await safely(() => cleanupStore($))
-  // 进程刚起、--resume 或模块热重载：挂着的 job 由 core 处理（登记中的作废；已排队的看是不是本进程发出的）
-  await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job) }))
+  // 进程刚起、--resume 或模块热重载：挂着的 job 由 core 处理（登记中的作废；已排队的、被搁置的看是不是本进程发出的）
+  await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job ?? rec.stalled) }))
 }
 
 /** 删掉 30 天没动过的对话记录 */
@@ -761,7 +761,7 @@ export const register: Register = (on) => {
           if (add.length) return { ...r, additionalContext: [...(r.additionalContext ?? []), ...add] }
         } else if (e.source === 'resume') {
           // 切回一个旧对话：它的记录里若还挂着 job，和进程启动一样处理
-          await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job) }), { sid })
+          await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job ?? rec.stalled) }), { sid })
         }
       }
     } catch (err) {
