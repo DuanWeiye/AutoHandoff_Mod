@@ -24,10 +24,15 @@ import {
   noteLine,
   isOversize,
   isAbsolutePath,
-  isExpired,
+  expiredKeys,
+  unmarkedSids,
+  fromAnotherSession,
   isUnder,
   isUnderMemory,
   loadRecord,
+  markKey,
+  MARK_PERIOD_MS,
+  RECORD_TTL_MS,
   migrateRecord,
   newRecord,
   parseConfig,
@@ -79,7 +84,7 @@ test('config: the generated default file parses back to the built-in defaults wi
 })
 
 test('config: a missing file means built-in defaults and no problems', () => {
-  expect(parseConfig(undefined)).toEqual({ cfg: defaultConfig(), problems: [] })
+  expect(parseConfig(undefined)).toEqual({ cfg: defaultConfig(), problems: [], alerts: [] })
 })
 
 test('config: a user-edited file with separators, overrides and partial prompts', () => {
@@ -316,21 +321,41 @@ test('levels: first crossing, both at once, staying, boundary and dropping back'
 
 // ───────── 来源 ─────────
 
-test('origins: user, agent and own messages', () => {
-  expect(classifyOrigin({ kind: 'composer' })).toEqual({ cls: 'user', human: true })
-  expect(classifyOrigin({ kind: 'bridge' })).toEqual({ cls: 'user', human: true })
+test('origins: user, agent and own messages; which of them are human input', () => {
+  const HUMAN = { cls: 'user', human: true }
+  const USER = { cls: 'user', human: false }
+  const AGENT = { cls: 'agent', human: false }
+  expect(classifyOrigin({ kind: 'composer' })).toEqual(HUMAN)
+  expect(classifyOrigin({ kind: 'bridge' })).toEqual(HUMAN)
+  // channel（Telegram 等）：用户本人发的，和在这个会话里打的一样算人工输入
+  expect(classifyOrigin({ kind: 'channel', name: undefined })).toEqual(HUMAN)
   for (const kind of ['sdk', 'scheduled-trigger', 'projects-relay', 'coordinator', 'unclassified', 'slack-ping']) {
-    expect(classifyOrigin({ kind })).toEqual({ cls: 'user', human: false })
+    expect(classifyOrigin({ kind })).toEqual(USER)
   }
-  expect(classifyOrigin({ kind: 'channel', name: undefined })).toEqual({ cls: 'user', human: false })
   for (const kind of ['peer', 'peer-send-message', 'task-notification', 'observer', 'observer-activity', 'auto-continuation']) {
-    expect(classifyOrigin({ kind })).toEqual({ cls: 'agent', human: false })
+    expect(classifyOrigin({ kind })).toEqual(AGENT)
   }
   expect(classifyOrigin({ kind: 'plugin', name: 'autohandoff' })).toEqual({ cls: 'own', human: false })
   // 别的插件发的、以后新出现的来源、缺字段：都按用户消息
-  expect(classifyOrigin({ kind: 'plugin', name: 'mod-probe' })).toEqual({ cls: 'user', human: false })
-  expect(classifyOrigin({ kind: 'voice-dictation' })).toEqual({ cls: 'user', human: false })
-  expect(classifyOrigin(undefined)).toEqual({ cls: 'user', human: false })
+  expect(classifyOrigin({ kind: 'plugin', name: 'mod-probe' })).toEqual(USER)
+  expect(classifyOrigin({ kind: 'voice-dictation' })).toEqual(USER)
+  expect(classifyOrigin(undefined)).toEqual(USER)
+  // 带 isMeta 的 channel 消息（实测 Telegram 的消息就带）仍按 kind 分类
+  expect(classifyOrigin({ kind: 'channel' }, true)).toEqual(HUMAN)
+})
+
+test('deliveries from another session (session.receive origins): peer kinds and a coordinating session\'s relay count, the agent-team mailbox and everything else do not', () => {
+  for (const kind of ['peer', 'peer-send-message', 'projects-relay']) expect(fromAnotherSession({ kind })).toBe(true)
+  // 别的插件经 $.session.send 发来的会话间消息带 plugin，照样算
+  expect(fromAnotherSession({ kind: 'peer', plugin: 'relay' } as { kind: string })).toBe(true)
+  // agent team 的信箱（lead、teammate）是同一个 team 里的，不算
+  expect(fromAnotherSession({ kind: 'peer', teammate: 'researcher', isVerified: true } as { kind: string })).toBe(false)
+  expect(fromAnotherSession({ kind: 'coordinator', teammate: 'team-lead', isVerified: true } as { kind: string })).toBe(false)
+  // Remote Control、任务通知、定时任务、Slack、认不出的来源都不是会话间消息；
+  // coordinator 按类型声明是主对话发给自己子代理的（或 team 信箱里 lead 的），不是别的会话发给主对话的
+  for (const kind of ['bridge', 'task-notification', 'scheduled-trigger', 'slack-ping', 'unclassified', 'coordinator']) expect(fromAnotherSession({ kind })).toBe(false)
+  expect(fromAnotherSession(undefined)).toBe(false)
+  expect(fromAnotherSession({})).toBe(false)
 })
 
 // ───────── 路径 ─────────
@@ -539,12 +564,47 @@ test('still there at reset time', () => {
 
 // ───────── 记录与杂项 ─────────
 
+test('expired records are found from the key names alone: write marks per period, no record is read', () => {
+  const DAY = 24 * 3600 * 1000
+  const A = '5f1c2a9e-3b7d-4c11-9e0a-2d4f6b8c1e33'
+  const B = '0c9d7e21-6a4f-4b82-b1d3-7e5a9c0f2d46'
+  const C = 'e3b0c442-98fc-4c14-9afb-f4c8996fb924'
+  const D = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d'
+  // 标记的期号只随时间往前走；同一期内的写入用同一个键
+  expect(markKey(A, NOW)).toBe(`t:${Math.floor(NOW / MARK_PERIOD_MS)}:${A}`)
+  expect(markKey(A, NOW + MARK_PERIOD_MS)).not.toBe(markKey(A, NOW))
+  // 一个用了七周的 store：A 六周前写过、之后没动；B 六周前开的、昨天还在用（--resume）；C 今天新开；
+  // D 的记录没有标记（那次标记没写进）；E 只剩一个六周前的标记（记录写失败）
+  const keys = [
+    storeKey(A), markKey(A, NOW - 44 * DAY), markKey(A, NOW - 42 * DAY),
+    storeKey(B), markKey(B, NOW - 42 * DAY), markKey(B, NOW - 1 * DAY),
+    storeKey(C), markKey(C, NOW),
+    storeKey(D),
+    markKey('7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a', NOW - 42 * DAY),
+    'unrelated-key',
+  ]
+  expect(expiredKeys(keys, NOW)).toEqual([storeKey(A), markKey(A, NOW - 44 * DAY), markKey(A, NOW - 42 * DAY), markKey('7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a', NOW - 42 * DAY)])
+  // 没有标记的记录不知道多久没写：不删，单独找出来（清理时补一个当期标记）；只剩标记的、别的键不算
+  expect(unmarkedSids(keys)).toEqual([D])
+  expect(unmarkedSids([...keys, markKey(D, NOW)])).toEqual([])
+  // 补上标记之后和别的记录一样：这一期结束满 30 天才删，在那之前又写过（有了更新一期的标记）就接着留
+  const marked = [storeKey(D), markKey(D, NOW)]
+  const endD = (Math.floor(NOW / MARK_PERIOD_MS) + 1) * MARK_PERIOD_MS
+  expect(expiredKeys(marked, endD + RECORD_TTL_MS - 1)).toEqual([])
+  expect(expiredKeys(marked, endD + RECORD_TTL_MS)).toEqual(marked)
+  expect(expiredKeys([...marked, markKey(D, NOW + 25 * DAY)], endD + RECORD_TTL_MS)).toEqual([])
+  // 边界：最近一期结束后满 30 天才删（最后一次写入不晚于那一期的结束），所以留存在 30 到 40 天之间
+  const period = Math.floor(NOW / MARK_PERIOD_MS)
+  const end = (period + 1) * MARK_PERIOD_MS
+  const one = [storeKey(A), markKey(A, NOW)]
+  expect(expiredKeys(one, end + RECORD_TTL_MS - 1)).toEqual([])
+  expect(expiredKeys(one, end + RECORD_TTL_MS)).toEqual(one)
+  expect(expiredKeys([], NOW)).toEqual([])
+})
+
 test('records: store key, expiry, loading and migration across /clear', () => {
   expect(storeKey('5f1c2a9e-3b7d-4c11-9e0a-2d4f6b8c1e33')).toBe('s:5f1c2a9e-3b7d-4c11-9e0a-2d4f6b8c1e33')
   const rec = { ...newRecord(NOW), on: true, human: true, levels: { remind: true, urge: true }, seq: 4, fallbackFails: 2 }
-  expect(isExpired(rec, NOW + 29 * 24 * 3600 * 1000)).toBe(false)
-  expect(isExpired(rec, NOW + 31 * 24 * 3600 * 1000)).toBe(true)
-  expect(isExpired(undefined, NOW)).toBe(true)
   expect(loadRecord('garbage')).toBe(null)
   expect(loadRecord({ on: true })).toBe(null)
   expect(loadRecord(JSON.parse(JSON.stringify(rec)))).toEqual(rec)
@@ -590,12 +650,12 @@ test('chain guard reply: how long ago, how much the context grew, and when regis
   const r = { resumedAt: NOW - 47 * MIN, resumedTokens: 38_400 }
   expect(resumeGuardText(r, 121_300, s, NOW)).toBe(
     'this conversation was continued from a handoff file 47 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user or another Claude session sends a message.',
   )
   // 几小时之前续接、读不到用量
   expect(resumeGuardText(r, undefined, s, NOW + 3 * 60 * MIN)).toBe(
     'this conversation was continued from a handoff file about 4 hours ago, and its context usage cannot be read right now. ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user or another Claude session sends a message.',
   )
   // 刚续接、基准就是这次的用量
   expect(resumeGuardText({ resumedAt: NOW - 20_000, resumedTokens: 41_000 }, 41_000, s, NOW)).toStartWith(
@@ -604,7 +664,7 @@ test('chain guard reply: how long ago, how much the context grew, and when regis
   // resume_guard_tokens 为 0：不提增量
   expect(resumeGuardText(r, 250_000, { ...s, resume_guard_tokens: 0 }, NOW - 46 * MIN)).toBe(
     'this conversation was continued from a handoff file 1 minute ago and its context (250k) is below 400k. ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 400k or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 400k, or the user or another Claude session sends a message.',
   )
   // 续接时刻不知道（4.1.0 存下的记录）：不说多久以前
   expect(resumeGuardText({ resumedAt: null, resumedTokens: null }, undefined, s, NOW)).toStartWith(
@@ -656,7 +716,7 @@ test('config: resume_guard_tokens accepts 0 (growth condition off) and 10000 up 
   expect(least.cfg.settings.resume_guard_tokens).toBe(10_000)
   expect(least.problems).toEqual([])
   expect(resumeGuardText({ resumedAt: NOW - 2 * MIN, resumedTokens: 41_000 }, 45_000, least.cfg.settings, NOW)).toContain(
-    'grown only 4k since (45k now). Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 10k since the resume, passes 300k, or the user sends a message.',
+    'grown only 4k since (45k now). Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 10k since the resume, passes 300k, or the user or another Claude session sends a message.',
   )
   // 比下限小：多半是写错了（守卫形同虚设），回落默认
   const tiny = withGuard('500')
@@ -666,19 +726,19 @@ test('config: resume_guard_tokens accepts 0 (growth condition off) and 10000 up 
   const big = withGuard('500,000')
   expect(big.cfg.settings.resume_guard_tokens).toBe(0)
   expect(big.problems).toEqual([
-    'resume_guard_tokens (500000) is not below remind_at (300000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you type a message or a command in it; set it to 0, or to at least 10000 and below remind_at, to clear this',
+    'resume_guard_tokens (500000) is not below remind_at (300000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at, you send a message or type a command in it, or another Claude session sends it a message; set it to 0, or to at least 10000 and below remind_at, to clear this',
   ])
   expect(withGuard('300000').cfg.settings.resume_guard_tokens).toBe(0)
   expect(withGuard('299999').cfg.settings.resume_guard_tokens).toBe(299_999)
   expect(resumeGuardText({ resumedAt: NOW - 5 * MIN, resumedTokens: 41_000 }, 52_000, big.cfg.settings, NOW)).toBe(
     'this conversation was continued from a handoff file 5 minutes ago and its context (52k) is below 300k. ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 300k or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 300k, or the user or another Claude session sends a message.',
   )
   // 小窗口模型把 remind_at 调到 80k、这一项没动（默认 100k）：同样按 0 处理并说明
   const lowRemind = parseConfig(defaultConfigText().replace('remind_at: 300000', 'remind_at: 80000'))
   expect(lowRemind.cfg.settings.resume_guard_tokens).toBe(0)
   expect(lowRemind.problems).toEqual([
-    'resume_guard_tokens (100000) is not below remind_at (80000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you type a message or a command in it; set it to 0, or to at least 10000 and below remind_at, to clear this',
+    'resume_guard_tokens (100000) is not below remind_at (80000), so it has no effect; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at, you send a message or type a command in it, or another Claude session sends it a message; set it to 0, or to at least 10000 and below remind_at, to clear this',
   ])
   // 同一份配置里本项还写小了（500）：回落的默认值也不小于 remind_at，只报一条（不先报回落、再报按 0 处理）
   const lowBoth = parseConfig(
@@ -686,7 +746,7 @@ test('config: resume_guard_tokens accepts 0 (growth condition off) and 10000 up 
   )
   expect(lowBoth.cfg.settings.resume_guard_tokens).toBe(0)
   expect(lowBoth.problems).toEqual([
-    'resume_guard_tokens should be 0 (off) or at least 10000, got 500, and the default (100000) is not below remind_at (80000); treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you type a message or a command in it; set it to 0, or to at least 10000 and below remind_at, to clear this',
+    'resume_guard_tokens should be 0 (off) or at least 10000, got 500, and the default (100000) is not below remind_at (80000); treated as 0: a resumed conversation accepts a handoff once its context passes remind_at, you send a message or type a command in it, or another Claude session sends it a message; set it to 0, or to at least 10000 and below remind_at, to clear this',
   ])
   // 照提示改成 remind_at 以下的合法值，问题就消掉
   expect(

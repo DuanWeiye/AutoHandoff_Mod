@@ -18,18 +18,21 @@ import {
   configFilePath,
   defaultConfigText,
   estimateReadTokens,
+  expiredKeys,
+  fromAnotherSession,
   homeDir,
   isAbsolutePath,
   jobKey,
-  isExpired,
   loadRecord,
   looksWindows,
+  markKey,
   migrateRecord,
   newRecord,
   parseConfig,
   storeKey,
   toAbsolute,
   transition,
+  unmarkedSids,
   usableRoots,
   versionAtLeast,
   type Effect,
@@ -67,12 +70,37 @@ let clearingFrom: { sid: string; t: number } | null = null
 let noteBase: { cwd: string; dirs: string[]; windows: boolean } | null = null
 /** AUTOHANDOFF_CONFIG 是相对路径的提示已记过 */
 let relativeConfigWarned = false
+/**
+ * 最近一次读成功的配置（文件不存在也算读成功）。之后读文件出错时沿用它，不回落内置默认：
+ * 一回落 default_on 就成了 false、阈值回到默认，行为悄悄变了。session.start 时清掉
+ */
+let lastConfig: LoadedConfig | null = null
+/**
+ * 已经 toast 过的配置内容问题（逐条）：同一条只说一次。文件读成功而某一条不在了就拿掉，之后又写错会再说。session.start 时清掉
+ */
+const configAlerted = new Set<string>()
+/**
+ * 已经 toast 过的「配置文件读不了」（逐条，按文字）：每个模块实例只说一次，读成功之后也不拿掉——文件时读得到、时读不到
+ * （网络位置）时，每翻转一次就弹一次没有用处。session.start 时清掉
+ */
+const configReadAlerted = new Set<string>()
+/** store 读不出来、已经告诉过用户（读得出来之后清掉） */
+let storeDown = false
+/** 本模块实例已写过的写入期标记（core.markKey 的键）：每个对话每一期只写一次 */
+const marked = new Set<string>()
 /** 记录的读-改-写串行执行（`$.store` 的 get/set 不是原子的；同一进程里的事件会交错） */
 let chain: Promise<unknown> = Promise.resolve()
 
 /** clearingFrom 多久内有效（实测 session.end(clear) 之后几百毫秒内就到 SessionStart(clear) 和 resolve） */
 const CLEAR_LINK_MS = 2 * 60 * 1000
 const TOAST_MS = 12_000
+/** 读记录失败后隔这么久再试（另一个进程正在写 store 文件、锁一时拿不到）；都失败才算读不出来 */
+const READ_RETRY_MS = [50, 200]
+/**
+ * 只来一次的事件（自家重置的结果、续接的结果、定时器）碰上 store 读不出来：隔这么久再送一次，都不行才放弃（见 deliver）。
+ * 连同每次送进去时的 READ_RETRY_MS，一共等约 9 秒
+ */
+const REDELIVER_MS = [500, 1000, 2000, 5000]
 
 // 登记工具的说明（模型读）。路径规则与 core.checkPathText / checkHandoffStat 一致。
 const TOOL_DESCRIPTION =
@@ -214,24 +242,58 @@ interface LoadedConfig {
   path: string | undefined
 }
 
+/**
+ * 读配置（每次要用时重读）。文件读不了（网络位置、别的插件的 fs hook 拒绝、读到一半出错）时沿用最近一次读成功的，
+ * 本模块实例还没读成功过才用内置默认。「写了却没生效」的问题和读不了都当场 toast（alertConfig）。
+ */
 async function readConfig($: Api): Promise<LoadedConfig> {
   const { path, problem: pathProblem } = await configPath($)
-  if (!path) {
-    const parsed = parseConfig(undefined)
-    if (pathProblem) parsed.problems.unshift(pathProblem)
-    return { parsed, path }
+  let parsed: ParsedConfig
+  let readProblem: string | undefined
+  if (!path) parsed = parseConfig(undefined)
+  else {
+    try {
+      parsed = parseConfig((await $.fs.exists(path)) ? String(await $.fs.read(path)) : undefined)
+      lastConfig = { parsed, path }
+    } catch (err) {
+      const kept = lastConfig?.path === path ? lastConfig.parsed : undefined
+      readProblem = `could not read ${path} (${errText(err)}); ${kept ? 'the configuration read last is kept' : 'built-in defaults used'}`
+      const base = kept ?? parseConfig(undefined)
+      // alerts 只放文件内容的问题（这里是沿用的那份的）；读不了单独交给 alertConfig
+      parsed = { cfg: base.cfg, problems: [readProblem, ...base.problems], alerts: base.alerts }
+    }
   }
-  let text: string | undefined
-  let problem: string | undefined
-  try {
-    if (await $.fs.exists(path)) text = String(await $.fs.read(path))
-  } catch (err) {
-    problem = `could not read ${path} (${errText(err)}); built-in defaults used`
-  }
-  const parsed = parseConfig(text)
-  if (problem) parsed.problems.unshift(problem)
-  if (pathProblem) parsed.problems.unshift(pathProblem)
+  if (pathProblem) parsed = { cfg: parsed.cfg, problems: [pathProblem, ...parsed.problems], alerts: [pathProblem, ...parsed.alerts] }
+  alertConfig($, parsed.alerts, readProblem)
   return { parsed, path }
+}
+
+/**
+ * 配置里有写了却没生效的内容、或文件读不了：还没说过的 toast 一次（几条并成一个 toast），细节在 /autohandoff status。
+ * 内容问题和读不了分开记：读不了的那次 alerts 来自沿用的上一份配置，不能据此判断哪条「改对了」，
+ * 否则文件间歇读不出来时，同一处写错会随着每次翻转再弹一遍
+ */
+function alertConfig($: Api, alerts: readonly string[], readProblem: string | undefined): void {
+  const fresh: string[] = []
+  if (readProblem === undefined) {
+    for (const a of configAlerted) if (!alerts.includes(a)) configAlerted.delete(a)
+  } else if (!configReadAlerted.has(readProblem)) {
+    configReadAlerted.add(readProblem)
+    fresh.push(readProblem)
+  }
+  for (const a of alerts) {
+    if (configAlerted.has(a)) continue
+    configAlerted.add(a)
+    fresh.push(a)
+  }
+  const first = fresh[0]
+  if (first === undefined) return
+  const more = fresh.length > 1 ? ` (and ${fresh.length - 1} more)` : ''
+  try {
+    $.ui.toast(`AutoHandoff configuration: ${first}${more}. /autohandoff status lists the details.`, { timeoutMs: TOAST_MS })
+  } catch {
+    // 没有界面
+  }
 }
 
 /** 配置文件不存在时写一次带注释的默认文件（唯一的 `$.fs.write`，PLAN §0 第 17 条） */
@@ -250,8 +312,34 @@ async function ensureConfigFile($: Api): Promise<void> {
 
 // ───────────────────────── 记录：读写、/clear 后的搬迁 ─────────────────────────
 
+/** 读记录；读失败（另一个进程正在写、锁竞争）隔一会儿再试，都失败才抛错（dispatch 统一处理） */
 async function loadRec($: Api, sid: string): Promise<Rec | null> {
-  return loadRecord(await $.store.get(storeKey(sid)))
+  for (let i = 0; ; i++) {
+    try {
+      return loadRecord(await $.store.get(storeKey(sid)))
+    } catch (err) {
+      const wait = READ_RETRY_MS[i]
+      if (wait === undefined) throw err
+      await $.clock.sleep(wait)
+    }
+  }
+}
+
+/**
+ * 写记录。先保证这一期的写入期标记在（过期清理只看键名，见 core.markKey）：标记写不进只记 debug，下次写入再补，
+ * 这个对话不再写的话由下次启动时的清理补（cleanupStore）。反过来先写记录、标记没跟上，旧标记到期时会把一份还在用的记录删掉
+ */
+async function saveRec($: Api, sid: string, rec: Rec, now: number): Promise<void> {
+  const mark = markKey(sid, now)
+  if (!marked.has(mark)) {
+    try {
+      await $.store.set(mark, 1)
+      marked.add(mark)
+    } catch (err) {
+      debug($, `could not save the write mark of session ${sid}: ${errText(err)}`)
+    }
+  }
+  await $.store.set(storeKey(sid), rec)
 }
 
 function sameRec(a: Rec, b: Rec): boolean {
@@ -277,10 +365,10 @@ async function adopt($: Api, sid: string, now: number, hint: string | undefined)
     if (!rec) continue
     const moved = migrateRecord(rec, now)
     try {
-      await $.store.set(storeKey(sid), moved)
+      await saveRec($, sid, moved, now)
       // 旧对话的记录只留开关（--resume 回去时恢复）；job、回合、作废说明都随对话搬走或作废
       // note 也清掉：那份文件正是新对话续接用的，--resume 回旧对话再被提醒时不能让它覆盖（会生成新路径）
-      await $.store.set(storeKey(old), { ...rec, job: null, stalled: null, fallback: null, turn: null, tell: null, note: null, t: now })
+      await saveRec($, old, { ...rec, job: null, stalled: null, fallback: null, turn: null, tell: null, note: null, t: now }, now)
       if (clearingFrom?.sid === old) clearingFrom = null
     } catch (err) {
       // 没存下：旧记录原样留着，模块变量也留着，下一个事件（SessionStart(clear) 等）再搬一次
@@ -345,6 +433,9 @@ interface DispatchOptions {
   config?: LoadedConfig
 }
 
+/** dispatch 的结果；unread 为真表示 store 读不出来、这个事件没有处理 */
+type Outcome = Step & { unread?: true }
+
 /**
  * 送一个事件进 core：串行地 读记录 → transition → 写回（只在有变化时写），然后执行副作用。
  * make 拿到当前记录再生成事件（turnComplete 要先看有没有 armed 的 job 才复查文件）。
@@ -354,15 +445,25 @@ interface DispatchOptions {
  *     记录停在原状态（armed 的登记照常由下一条消息、回合结束或超时处理），toast 告诉用户没有重置。
  *     交接 job 的重置还要先在 `$.state` 记下标识（noteQueued），写不进同样按这条处理，而且记录不写回（停在 armed）。
  *   - 其它步骤：副作用照常执行（重置已经发生时，续接比状态记全更要紧）。
+ *
+ * 读 store 失败时（重试后仍读不出来）：这个事件无从处理（不知道有没有登记、登记的是哪份文件），跳过，并 toast 加通知一次——
+ * 回合结束时碰上的话，模型已经停下等重置，而登记还原样留在 store 里（之后由下一条消息、wait_minutes 超时处理）。
+ * hook 里的事件跳过就算了（不能让 hook 等着）；不在 hook 里、又只来一次的事件由 deliver 隔一会儿再送。
  */
-async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: DispatchOptions = {}): Promise<Step> {
+async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: DispatchOptions = {}): Promise<Outcome> {
   const config = o.config ?? (await readConfig($))
   const cfg = config.parsed.cfg
-  const { step, sid } = await serial(async () => {
+  const { step, sid } = await serial(async (): Promise<{ step: Outcome; sid: string }> => {
     const now = await $.clock.now()
     const sid = o.sid ?? (await $.session.id())
-    let rec = await loadRec($, sid)
-    if (!rec && o.adopt) rec = await adopt($, sid, now, o.from)
+    let rec: Rec | null
+    try {
+      rec = await loadRec($, sid)
+      if (!rec && o.adopt) rec = await adopt($, sid, now, o.from)
+    } catch (err) {
+      return { step: unreadable($, err), sid }
+    }
+    storeDown = false
     const fresh = rec === null
     const base = rec ?? newRecord(now)
     const ev = await make(base)
@@ -374,9 +475,12 @@ async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: Dispatc
     // 没有记录且转移后仍是空白记录（开关未动、没收到过人工输入……）就不写，免得每个会话都在 store 里留一份
     const blank = fresh && sameRec(step.rec, newRecord(now))
     const notReset = (why: string, what: string): void => {
+      // 模型已经停下等重置，没人在场时 toast 一闪就没了：另发通知
+      const text = `AutoHandoff could not save its state (${why}), so the conversation was not reset.`
       step.fx = [
         { type: 'log', text: `${ev.kind}: reset not issued because ${what} could not be saved`, debug: true },
-        { type: 'toast', text: `AutoHandoff could not save its state (${why}), so the conversation was not reset.` },
+        { type: 'notify', text },
+        { type: 'toast', text },
       ]
     }
     const job = resetJobOf(step)
@@ -392,7 +496,7 @@ async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: Dispatc
     }
     if (!blank && (fresh || !sameRec(step.rec, base))) {
       try {
-        await $.store.set(storeKey(sid), step.rec)
+        await saveRec($, sid, step.rec, now)
       } catch (err) {
         const why = errText(err)
         debug($, `could not save the record of session ${sid} (${ev.kind}): ${why}`)
@@ -412,6 +516,32 @@ async function dispatch($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: Dispatc
   })
   runEffects($, step.fx, sid)
   return step
+}
+
+/** store 读不出来时这一步的结果：什么都不做，第一次碰到时告诉用户（登记工具的调用回「没登记」） */
+function unreadable($: Api, err: unknown): Outcome {
+  const why = errText(err)
+  const fx: Effect[] = [{ type: 'log', text: `event skipped: the saved state could not be read (${why})`, debug: true }]
+  if (!storeDown) {
+    storeDown = true
+    const text = `AutoHandoff could not read its saved state (${why}); a handoff registered in this conversation may not run until this clears.`
+    fx.push({ type: 'notify', text }, { type: 'toast', text })
+  }
+  return { rec: newRecord(0), fx, accepted: false, reply: `Not registered: AutoHandoff could not read its saved state (${why}).`, unread: true }
+}
+
+/**
+ * 送一个不在 hook 里产生、只来一次的事件：自家 /clear、/compact 的结果，续接提交的结果，定时器到点。
+ * 这类事件被跳过就再也不会来——重置已经执行、却没人续接，新对话停在原地——所以 store 一时读不出来时隔一会儿再送
+ * （REDELIVER_MS），不占 hook 的时间。每次都是一次完整的 dispatch：两次之间别的事件照常处理，先后顺序由 core 按状态认
+ */
+async function deliver($: Api, make: (rec: Rec) => Ev | Promise<Ev>, o: DispatchOptions = {}): Promise<void> {
+  for (let i = 0; ; i++) {
+    const step = await dispatch($, make, o)
+    const wait = REDELIVER_MS[i]
+    if (!step.unread || wait === undefined) return
+    await $.clock.sleep(wait)
+  }
 }
 
 // ───────────────────────── 副作用 ─────────────────────────
@@ -449,7 +579,7 @@ function runEffects($: Api, fx: readonly Effect[], sid: string): void {
           break
         case 'timer':
           $.clock.after(f.ms, () => {
-            void dispatch($, () => ({ kind: 'tick' })).catch((err) => fail($, 'tick', err))
+            void deliver($, () => ({ kind: 'tick' })).catch((err) => fail($, 'tick', err))
           })
           break
       }
@@ -473,10 +603,10 @@ function issueReset($: Api, sid: string, seq: number, args: { command: 'clear' |
     }
     if (error === undefined) {
       // clear 已完成，`$.session.id()` 已是新 sid：记录还没搬就从 sid 搬过来
-      await dispatch($, () => ({ kind: 'resetDone', seq }), { adopt: true, from: sid })
+      await deliver($, () => ({ kind: 'resetDone', seq }), { adopt: true, from: sid })
     } else {
       debug($, `/${args.command} (request ${seq}) was rejected: ${error}`)
-      await dispatch($, () => ({ kind: 'resetFailed', seq, message: error }), { adopt: true, from: sid })
+      await deliver($, () => ({ kind: 'resetFailed', seq, message: error }), { adopt: true, from: sid })
     }
   })().catch((err) => fail($, `/${args.command} callback`, err))
 }
@@ -491,7 +621,7 @@ function issueResume($: Api, sid: string, seq: number, text: string): void {
     } catch (err) {
       drop = errText(err) || 'unknown error'
     }
-    await dispatch($, () => ({ kind: 'resumeDone', seq, drop }), { adopt: true, from: sid })
+    await deliver($, () => ({ kind: 'resumeDone', seq, drop }), { adopt: true, from: sid })
   })().catch((err) => fail($, 'resume callback', err))
 }
 
@@ -501,6 +631,9 @@ async function onSessionStart($: Api, isInteractive: boolean): Promise<void> {
   interactive = isInteractive
   gate = null
   noteBase = null
+  lastConfig = null
+  configAlerted.clear()
+  configReadAlerted.clear()
   if (!(await enabled($))) {
     debug($, `inactive: ${gateWhy()}`)
     return
@@ -518,11 +651,18 @@ async function onSessionStart($: Api, isInteractive: boolean): Promise<void> {
   await dispatch($, async (rec) => ({ kind: 'start', queuedHere: await queuedHere($, rec.job ?? rec.stalled) }))
 }
 
-/** 删掉 30 天没动过的对话记录 */
+/**
+ * 删掉 30 天没写过的对话记录。只读一次键名（core.expiredKeys），不逐条读记录。
+ * 没有任何标记的记录（标记没写进、对话之后也没再写过）各补一个当期标记，之后和别的记录一样到期（core.unmarkedSids）
+ */
 async function cleanupStore($: Api): Promise<void> {
   const now = await $.clock.now()
-  for (const k of await $.store.keys()) {
-    if (k.startsWith('s:') && isExpired((await $.store.get(k)) as { t?: unknown } | undefined, now)) await $.store.delete(k)
+  const keys = await $.store.keys()
+  for (const k of expiredKeys(keys, now)) await $.store.delete(k)
+  for (const sid of unmarkedSids(keys)) {
+    const mark = markKey(sid, now)
+    await $.store.set(mark, 1)
+    marked.add(mark)
   }
 }
 
@@ -630,11 +770,18 @@ export const register: Register = (on) => {
   })
 
   // agent team 的 teammate 进程最先收到的是 team-lead 的消息（它从不收到人工输入）。
-  // 只看投给主对话的（agentId 为空）：进程内 teammate 模式下，lead 进程也会收到投给 teammate 循环的、带 agentId 的这类事件
+  // 只看投给主对话的（agentId 为空）：进程内 teammate 模式下，lead 进程也会收到投给 teammate 循环的、带 agentId 的这类事件。
+  // 别的会话发来的消息（会话间消息、协调会话的下发）也在这里认：解除连环交接守卫（core.fromAnotherSession 的说明）
   on('session.receive', async ($, e, next) => {
     try {
-      const origin = e.origin as unknown as { teammate?: unknown }
-      if (e.agentId === undefined && origin.teammate === 'team-lead' && (await enabled($))) await dispatch($, () => ({ kind: 'teammate' }))
+      const origin = e.origin as unknown as { kind?: unknown; teammate?: unknown }
+      if (e.agentId === undefined && (await enabled($))) {
+        if (origin.teammate === 'team-lead') await dispatch($, () => ({ kind: 'teammate' }))
+        else if (fromAnotherSession(origin)) {
+          debug($, `delivery: origin ${String(origin.kind)}`)
+          await dispatch($, () => ({ kind: 'peerMessage', origin: String(origin.kind) }))
+        }
+      }
     } catch (err) {
       fail($, 'session.receive', err)
     }

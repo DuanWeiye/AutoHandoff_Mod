@@ -29,6 +29,8 @@ export const MAX_PATH_LENGTH = 512
 export const MAX_HANDOFF_BYTES = 1024 * 1024
 /** store 里多久没写的对话记录可以删掉 */
 export const RECORD_TTL_MS = 30 * 24 * 3600 * 1000
+/** 记录的写入期标记（markKey）按这么长一段分期：过期的记录最多多留一期 */
+export const MARK_PERIOD_MS = 10 * 24 * 3600 * 1000
 /** 重置完成后多久还没收到续接结果，就当续接阶段结束（只为不让状态卡住） */
 export const RESUME_STUCK_MS = 2 * 60 * 1000
 
@@ -125,7 +127,7 @@ const SETTING_NOTES: Record<keyof Settings, string> = {
   handoff_max_tokens:
     'Size limit for the handoff file, in estimated tokens (Claude Code\'s Read tool stops at 25000 per read). The reminders ask the model to keep the file to about three quarters of this, and a file above it is not registered: the model is asked to shorten it and register again. 0 turns the check and that sentence off; otherwise at least 2000. The estimate counts tokens, not lines; the Read tool also stops at 2000 lines per read, which matters only for a file of very short lines.',
   resume_guard_tokens:
-    'A conversation that AutoHandoff has just continued from a handoff file does not accept a new handoff until its context has grown by this many tokens since the resume, its context passes remind_at, or you type a message or a command in it (/autohandoff status does not count). This stops a reset loop in which the new conversation hands off again as soon as it has read the handoff file. The growth is counted from the first usage reading after the resume, which comes before the handoff file is read, so it includes the 20-60k tokens a resumed conversation usually spends reading the handoff file and project documents. 0 turns the growth condition off, leaving only remind_at and your input; otherwise at least 10000. A value at or above remind_at has the same effect as 0.',
+    'A conversation that AutoHandoff has just continued from a handoff file does not accept a new handoff until its context has grown by this many tokens since the resume, its context passes remind_at, you send it a message (typed, through Remote Control or through a channel such as Telegram) or type a command in it (/autohandoff status does not count), or another Claude session sends it a message (its own subagents and task notifications do not count). This stops a reset loop in which the new conversation hands off again as soon as it has read the handoff file. The growth is counted from the first usage reading after the resume, which comes before the handoff file is read, so it includes the 20-60k tokens a resumed conversation usually spends reading the handoff file and project documents. 0 turns the growth condition off, leaving remind_at and messages from you or another session; otherwise at least 10000. A value at or above remind_at has the same effect as 0.',
 }
 
 export function defaultConfig(): Config {
@@ -136,6 +138,11 @@ export interface ParsedConfig {
   cfg: Config
   /** 给 /autohandoff status 看的问题列表（缺键、错值、未知节……） */
   problems: string[]
+  /**
+   * problems 里「文件里写了、却没照着生效」的那些（错值、认不出的键或节、没闭合的注释、用不了的提示词……）：
+   * 用户以为改了，实际用的是别的值，要当场告诉他（register.ts 发 toast）。没写的键、缺的节按说明用内置默认，不在其中
+   */
+  alerts: string[]
 }
 
 const H2 = /^##(?!#)[ \t]*(.*?)[ \t]*#*[ \t]*$/
@@ -150,13 +157,19 @@ const KEYLIKE = /^[a-z][a-z0-9_]*$/
 export function parseConfig(text: string | undefined): ParsedConfig {
   const cfg = defaultConfig()
   const problems: string[] = []
-  if (text === undefined) return { cfg, problems }
+  const alerts: string[] = []
+  // 写了却没生效的问题两边都记
+  const alert = (problem: string): void => {
+    problems.push(problem)
+    alerts.push(problem)
+  }
+  if (text === undefined) return { cfg, problems, alerts }
 
   let src = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
   // 注释换成同样多的换行，行号才对得上
   src = src.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ''))
   if (src.includes('<!--')) {
-    problems.push('an HTML comment ("<!--") is never closed; the rest of the file after it is ignored')
+    alert('an HTML comment ("<!--") is never closed; the rest of the file after it is ignored')
     src = src.slice(0, src.indexOf('<!--'))
   }
 
@@ -172,7 +185,7 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     if (h) {
       const title = (h[1] ?? '').trim().toLowerCase()
       if (title === 'settings' || isPromptKey(title)) {
-        if (seen.has(title)) problems.push(`section "## ${title}" appears more than once; the last one is used`)
+        if (seen.has(title)) alert(`section "## ${title}" appears more than once; the last one is used`)
         seen.add(title)
         cur = { name: title as Section['name'], start: i + 1 }
         if (title === 'settings') settingLines.length = 0
@@ -183,7 +196,7 @@ export function parseConfig(text: string | undefined): ParsedConfig {
         // 提示词节里的其它 `##` 标题算正文；像键名的多半是写错了，提醒一下
         if (KEYLIKE.test(title)) problems.push(`"## ${title}" (line ${i + 1}) is not a known section; it is kept as part of "## ${cur.name}"`)
       } else {
-        problems.push(`"## ${title}" (line ${i + 1}) is not a known section; it is ignored`)
+        alert(`"## ${title}" (line ${i + 1}) is not a known section; it is ignored`)
         cur = { name: null, start: i + 1 }
         continue
       }
@@ -199,19 +212,19 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     if (t === '') continue
     const m = SETTING_LINE.exec(t)
     if (!m) {
-      problems.push(`settings line ${no} is not "key: value"; ignored: ${clip(t)}`)
+      alert(`settings line ${no} is not "key: value"; ignored: ${clip(t)}`)
       continue
     }
     const key = (m[1] ?? '').toLowerCase()
     if (!isSettingKey(key)) {
-      problems.push(`unknown setting "${key}" (line ${no}) ignored`)
+      alert(`unknown setting "${key}" (line ${no}) ignored`)
       continue
     }
     const raw = unquote((m[2] ?? '').trim())
     const v = parseSetting(key, raw)
     given.add(key)
     if (!v.ok) {
-      problems.push(`${key} ${v.why}; using the default (${String(DEFAULT_SETTINGS[key])})`)
+      alert(`${key} ${v.why}; using the default (${String(DEFAULT_SETTINGS[key])})`)
       continue
     }
     ;(cfg.settings as unknown as Record<string, unknown>)[key] = v.value
@@ -224,7 +237,7 @@ export function parseConfig(text: string | undefined): ParsedConfig {
   }
   const s = cfg.settings
   if (!(s.remind_at < s.urge_at && s.urge_at < s.compact_at)) {
-    problems.push(
+    alert(
       `need remind_at < urge_at < compact_at (got ${s.remind_at} / ${s.urge_at} / ${s.compact_at}); using the defaults for all three`,
     )
     s.remind_at = DEFAULT_SETTINGS.remind_at
@@ -232,7 +245,7 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     s.compact_at = DEFAULT_SETTINGS.compact_at
   }
   if (s.handoff_max_tokens !== 0 && s.handoff_max_tokens < HANDOFF_MAX_MIN) {
-    problems.push(
+    alert(
       `handoff_max_tokens should be 0 (off) or at least ${HANDOFF_MAX_MIN}, got ${s.handoff_max_tokens}; using the default (${DEFAULT_SETTINGS.handoff_max_tokens})`,
     )
     s.handoff_max_tokens = DEFAULT_SETTINGS.handoff_max_tokens
@@ -248,12 +261,13 @@ export function parseConfig(text: string | undefined): ParsedConfig {
       const why = tooSmall
         ? `should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${got}, and the default (${value}) is not below remind_at (${s.remind_at})`
         : `(${got}) is not below remind_at (${s.remind_at}), so it has no effect`
-      problems.push(
-        `resume_guard_tokens ${why}; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at or you type a message or a command in it; ${fix}`,
+      // 写小了的是写错；只是不小于 remind_at 的效果与 0 相同（设置说明里写了），不算没照着生效
+      ;(tooSmall ? alert : (p: string) => problems.push(p))(
+        `resume_guard_tokens ${why}; treated as 0: a resumed conversation accepts a handoff once its context passes remind_at, you send a message or type a command in it, or another Claude session sends it a message; ${fix}`,
       )
       s.resume_guard_tokens = 0
     } else if (tooSmall) {
-      problems.push(`resume_guard_tokens should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${got}; using the default (${value})`)
+      alert(`resume_guard_tokens should be 0 (off) or at least ${RESUME_GUARD_MIN}, got ${got}; using the default (${value})`)
       s.resume_guard_tokens = value
     }
   }
@@ -266,13 +280,13 @@ export function parseConfig(text: string | undefined): ParsedConfig {
     const textOf = body.join('\n').trim()
     const why = checkTemplate(key, textOf)
     if (why.error) {
-      problems.push(`## ${key}: ${why.error}; the built-in text is used`)
+      alert(`## ${key}: ${why.error}; the built-in text is used`)
       continue
     }
     for (const w of why.warnings) problems.push(`## ${key}: ${w}`)
     cfg.prompts[key] = textOf
   }
-  return { cfg, problems }
+  return { cfg, problems, alerts }
 }
 
 function isSettingKey(k: string): k is keyof Settings {
@@ -661,15 +675,24 @@ export type OriginClass = 'user' | 'agent' | 'meta' | 'own'
 
 // 代理类来源（白名单）；其它一律按用户消息处理，包括以后新出现的 kind
 const AGENT_KINDS = new Set(['peer', 'peer-send-message', 'task-notification', 'observer', 'observer-activity', 'auto-continuation'])
-// 人工来源：第一次出现后 default_on 才生效（agent team 的 teammate 进程从不收到这类输入）
-const HUMAN_KINDS = new Set(['composer', 'bridge'])
+// 人工输入：用户本人发的消息——在这个会话的输入框里打的、从 Remote Control 发的、经 channel（Telegram 等，MCP 服务器转来的）发的。
+// 凡是以「是不是人工输入」为判据的地方都只看这一个集合（PLAN §0 第 36 条）：第一次出现后 default_on 才生效、teammate 标记撤掉
+// （agent team 的 teammate 进程从不收到这类输入），连环交接守卫和 Esc 之后的挂起解除，作废说明里说成「用户的新消息」。
+// 斜杠命令是不是亲手敲的不在这里判断（register.ts 按 command.run 的 origin，只认 composer、bridge）
+const HUMAN_KINDS = new Set(['composer', 'bridge', 'channel'])
 
 export interface OriginLike {
   kind?: string
   name?: string
 }
 
-export function classifyOrigin(origin: OriginLike | undefined, isMeta = false): { cls: OriginClass; human: boolean } {
+export interface OriginInfo {
+  cls: OriginClass
+  /** 人工输入（composer、bridge、channel） */
+  human: boolean
+}
+
+export function classifyOrigin(origin: OriginLike | undefined, isMeta = false): OriginInfo {
   const kind = origin?.kind
   if (kind === 'plugin' && origin?.name === PLUGIN_NAME) return { cls: 'own', human: false }
   if (kind !== undefined && AGENT_KINDS.has(kind)) return { cls: 'agent', human: false }
@@ -677,6 +700,24 @@ export function classifyOrigin(origin: OriginLike | undefined, isMeta = false): 
   // 没有 isMeta 的 unclassified（来源认不出的输入）仍按用户消息作废（fail-closed）
   if (isMeta && kind === 'unclassified') return { cls: 'meta', human: false }
   return { cls: 'user', human: kind !== undefined && HUMAN_KINDS.has(kind) }
+}
+
+// 别的会话发给本会话主对话的消息，按 session.receive 的 origin.kind（d.ts SessionReceiveOrigin）：
+//   peer：另一个 Claude 会话的消息（同一台机器上经会话间 socket 发来的，2.1.322 上机见过）；
+//   peer-send-message：另一个会话的 SendMessage 投递；projects-relay：协调会话给它的线程写的下发（这两种经 bridge 到，没有上机见过）。
+// coordinator 不在其中：按 d.ts，它是主对话发给自己的子代理（收方带 agentId），或 agent team 信箱里 lead 的投递（带 teammate），
+// 都不会以「投给主对话、不带 teammate」的形式出现。
+// 不在 prompt.submit 上按 kind 判断：那里的 `peer` 也盖着本会话自己的后台子代理发回的消息（引擎不给发送方），
+// 而子代理发给主对话的消息——最终汇报、运行中途的 SendMessage——都不触发主对话的 session.receive
+// （2.1.322 上机核对过，e2e handback；PLAN §0 第 35 条）。
+const SESSION_KINDS = new Set(['peer', 'peer-send-message', 'projects-relay'])
+
+/**
+ * session.receive 的这次投递是不是别的会话发来的。带 teammate 的是 agent team 的信箱（同一个 team 里的 lead、teammate），不算；
+ * 调用方另外只看投给主对话的（agentId 为空）
+ */
+export function fromAnotherSession(origin: { kind?: unknown; teammate?: unknown } | undefined): boolean {
+  return origin !== undefined && origin.teammate === undefined && typeof origin.kind === 'string' && SESSION_KINDS.has(origin.kind)
 }
 
 // ───────────────────────── 6. 路径规则 ─────────────────────────
@@ -883,19 +924,9 @@ export interface Job {
    */
   idleSpent: number
   /**
-   * 用户接手：重置已经发生、这个对话已拿到交接（ctxGiven）之后，自家命令的结果回来之前，用户类消息就到了，
-   * 它由重置后的对话处理，所以不再提交续接。排在自家重置前面、在旧对话里处理掉的消息不算（PLAN §0 第 32 条）。
-   * 只在 ctxGiven 为真时置位。ctxGiven 有两种来历：确定不是自家的重置（自家 /compact 排队时用户的 /clear 先跑完，新对话当场拿到交接），
-   * 那之后的消息确实是接手，一直算数；或一次与自家同种、分不清是谁的重置（sameSeen），那之后的消息只是暂记——排队期间再见到一次
-   * 同种的重置，就知道上一次不是自家的、消息在自家重置之前，清掉（sessionStart）。/clear 换 sid 时在 migrateRecord 里清掉
+   * 这个对话已拿到交接：SessionStart 已附上 start_context（自家那次重置的，或自家 /compact 排队时用户先跑完的 /clear、/compact 的）。
+   * 自家命令的结果回来之前，这样的对话里到的消息什么都不附；续接在结果回来时照常提交（PLAN §0 第 38 条）。/clear 换 sid 时在 migrateRecord 里清掉
    */
-  userTook: boolean
-  /**
-   * 自家命令排队期间，对话空闲时见到过一次与它同种的重置（SessionStart 的 source 与 action 相同）：可能就是自家那次（结果随后就到），
-   * 也可能是用户先跑的同种命令。只用来判断暂记的 userTook 何时清掉；随 /clear 搬迁清掉
-   */
-  sameSeen?: true
-  /** 新对话的 SessionStart 已附上 start_context */
   ctxGiven: boolean
   /** 重置完成的时刻 */
   resetAt: number | null
@@ -943,7 +974,7 @@ export interface Rec {
   v: 1
   /** 用户显式设置的开关；null 表示跟随 default_on */
   on: boolean | null
-  /** 本对话收到过人工输入（composer/bridge），default_on 从此生效 */
+  /** 本对话收到过人工输入（composer、bridge、channel 的消息，或亲手敲的命令），default_on 从此生效 */
   human: boolean
   /** 本进程是 agent team 的 teammate：从不动作（收到人工输入或 /autohandoff 就撤销） */
   teammate: boolean
@@ -966,14 +997,14 @@ export interface Rec {
   /**
    * 挂起：自家发的命令（重置、兜底压缩）被引擎以「用户按过 Esc」为由拒绝过。到用户下次输入之前引擎都不执行自发的命令，
    * 所以这段时间不提醒、不 Stop block、不受理登记、不发兜底压缩（否则每来一条代理消息就白走一遍「提醒 → 登记 → 被拒」）。
-   * 人工消息或用户亲手敲的命令解除（userInput，与连环交接守卫同一个判据）；/clear 搬迁、session.start（进程重启、热重载、/resume 切回）时清掉
+   * 用户本人的消息（含 channel）或亲手敲的命令解除（userInput，与连环交接守卫同一个判据）；/clear 搬迁、session.start（进程重启、热重载、/resume 切回）时清掉
    */
   held: boolean
   /** 已提示过「模型窗口小于 remind_at」 */
   windowWarned: boolean
   /**
-   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、上下文比续接时多出的还不到 resume_guard_tokens、也没收到人工消息或用户亲手敲的命令：
-   * 不受理登记（挡连环交接，PLAN §0 第 22、31 条）
+   * 本对话刚由 AutoHandoff 续接开启，还没越过 remind_at、上下文比续接时多出的还不到 resume_guard_tokens、也没收到用户本人的消息、
+   * 用户亲手敲的命令或别的会话的消息：不受理登记（挡连环交接，PLAN §0 第 22、31、35、36 条）
    */
   resumed: boolean
   /** 续接完成（afterReset）的时刻，拒绝登记时告诉模型续接了多久；resumed 为假时为 null */
@@ -1019,8 +1050,60 @@ export function storeKey(sessionId: string): string {
   return `s:${sessionId}`
 }
 
-export function isExpired(rec: { t?: unknown } | undefined, now: number): boolean {
-  return !rec || typeof rec.t !== 'number' || now - rec.t > RECORD_TTL_MS
+/**
+ * 写入期标记的键：`t:<期号>:<sessionId>`，期号 = 时刻 / MARK_PERIOD_MS 取整；值无所谓。记录每次写入时，那一期的标记也在
+ * （register.ts 的 saveRec 先写它）。清理过期记录因此只看键名：`$.store` 没有批量读，每次 get 都整份读文件再解析，
+ * 逐条读出记录来比时间要「键数 × 文件大小」的开销；键名用一次 keys() 就全拿到
+ */
+export function markKey(sessionId: string, now: number): string {
+  return `t:${Math.floor(now / MARK_PERIOD_MS)}:${sessionId}`
+}
+
+const MARK_KEY = /^t:(\d+):(.+)$/
+
+/**
+ * 该删的键（keys 是 `$.store.keys()` 的结果）：最近一期标记结束已满 RECORD_TTL_MS 的对话（它最后一次写入不晚于那一期的结束），
+ * 删掉记录和它的全部标记，记录排在标记前面（删到一半进程没了，剩下的标记下次照样删）；记录已不在的标记同样处理。
+ * 没有任何标记的记录不在这里删：不知道它是什么时候写的（见 unmarkedSids）
+ */
+export function expiredKeys(keys: readonly string[], now: number): string[] {
+  const last = new Map<string, number>()
+  const marks: { key: string; sid: string }[] = []
+  const recs: string[] = []
+  for (const key of keys) {
+    if (key.startsWith('s:')) {
+      recs.push(key.slice(2))
+      continue
+    }
+    const m = MARK_KEY.exec(key)
+    if (!m) continue
+    const sid = m[2] ?? ''
+    marks.push({ key, sid })
+    last.set(sid, Math.max(last.get(sid) ?? 0, Number(m[1])))
+  }
+  const expired = (sid: string): boolean => {
+    const period = last.get(sid)
+    return period !== undefined && now - (period + 1) * MARK_PERIOD_MS >= RECORD_TTL_MS
+  }
+  return [...recs.filter(expired).map(storeKey), ...marks.filter((m) => expired(m.sid)).map((m) => m.key)]
+}
+
+/**
+ * 有记录、却没有任何写入期标记的对话（keys 是 `$.store.keys()` 的结果）：标记没写进、记录写进了的那一次（saveRec 先写标记，
+ * 标记写失败只记日志），而这个对话之后再没写过——会话已经结束的话，就不会有「下次写入」来补。没有标记就无从知道它多久没写，
+ * 会一直留着。清理时给它们各补一个当期标记：从这时起按正常规则到期，一份昨天才写的记录也要再过 RECORD_TTL_MS 才删，不会提前
+ */
+export function unmarkedSids(keys: readonly string[]): string[] {
+  const marked = new Set<string>()
+  const recs: string[] = []
+  for (const key of keys) {
+    if (key.startsWith('s:')) recs.push(key.slice(2))
+    else {
+      const m = MARK_KEY.exec(key)
+      if (m) marked.add(m[2] ?? '')
+    }
+  }
+  return recs.filter((sid) => !marked.has(sid))
 }
 
 /** 从 store 读出的值转成记录；形状不对返回 null（调用方当作没有记录）。 */
@@ -1059,8 +1142,8 @@ function cloneRec(r: Rec): Rec {
 /**
  * /clear 换了 session id 后，把旧记录搬到新 id 下：开关与 job 保留；回合、各层、挂着的作废说明、兜底压缩及其计数、
  * 续接标记、Esc 之后的挂起清零（新对话的模型对旧对话里的作废一无所知，说明不能带过去；挂起期间能跑的 /clear 只有用户亲手敲的，
- * 那本身就是人工输入），job 的 ctxGiven、userTook 也清掉
- * （新对话还没拿到交接，也还没处理过任何消息）。被搁置的重置（stalled）一起带过去（清掉旧对话的可能正是它），这两个标记同样清掉。
+ * 那本身就是人工输入），job 的 ctxGiven 也清掉（新对话还没拿到交接）。
+ * 被搁置的重置（stalled）一起带过去（清掉旧对话的可能正是它），它的 ctxGiven 同样清掉。
  */
 export function migrateRecord(old: Rec, now: number): Rec {
   const r = cloneRec(old)
@@ -1071,13 +1154,9 @@ export function migrateRecord(old: Rec, now: number): Rec {
   r.fallbackFails = 0
   r.held = false
   clearResumed(r)
-  // 新对话还没拿到 start_context（用户的 /clear 排在自家 /clear 前面时，中间那个对话拿到的不算），
-  // 被清掉的那个对话里处理过的消息也不算用户接手
+  // 新对话还没拿到 start_context（用户的 /clear 排在自家 /clear 前面时，中间那个对话拿到的不算）
   for (const j of [r.job, r.stalled]) {
-    if (!j) continue
-    j.ctxGiven = false
-    j.userTook = false
-    delete j.sameSeen
+    if (j) j.ctxGiven = false
   }
   r.t = now
   return r
@@ -1123,6 +1202,8 @@ export type Ev =
   | { kind: 'start'; queuedHere?: boolean }
   /** session.receive 来自 team-lead：本进程是 teammate */
   | { kind: 'teammate' }
+  /** session.receive：别的会话发给主对话的消息（fromAnotherSession）；origin 是它的 kind，只用于日志 */
+  | { kind: 'peerMessage'; origin: string }
   /** prompt.submit（主对话，origin 与 isMeta 原样给）；window 是 usage().context.window */
   | { kind: 'submit'; origin?: OriginLike; isMeta?: boolean; tokens?: number; window?: number }
   /** 用户敲的内置命令（command.run，origin=composer），只需给命令名 */
@@ -1254,17 +1335,22 @@ function cancelQuiet(r: Rec, fx: Effect[], why: string): void {
   fx.push({ type: 'log', text: `handoff cancelled: ${why}`, debug: true })
 }
 
+// 作废时只发 toast 的原因：作废说明随引起作废的那条消息当场送到模型（new_message、new_input），或人刚按过 Esc、就在跟前（interrupted）。
+// 其余的都发生在模型已经停下、等着重置的时候（回合结束时文件没了、回合以错误或拒绝结束、重置命令失败、久等不到回合结束、重启或重载）：
+// 没人在场时对话就停在原地，toast 十几秒就消失，所以另发通知
+const TOAST_ONLY: ReadonlySet<TellReason> = new Set<TellReason>(['new_message', 'new_input', 'interrupted'])
+
 /**
- * 作废并在下一条消息里告诉模型；notice 决定怎么通知用户：toast，或 toast 加 notify（没配置通知渠道时 notify 不显示，所以不单发）。
+ * 作废并在下一条消息里告诉模型；用户那边发 toast，按原因（TOAST_ONLY）另加 notify（没配置通知渠道时 notify 不显示，所以不单发）。
  * 当前层重新生效：最高的已提示层退回未提示，下次检查时再送一次完整提醒。
  */
-function cancelTold(r: Rec, s: Settings, fx: Effect[], tell: TellReason, notice: 'toast' | 'both'): void {
+function cancelTold(r: Rec, s: Settings, fx: Effect[], tell: TellReason): void {
   if (!r.job) return
   r.job = null
   tellModel(r, tell)
   const text = `AutoHandoff: handoff cancelled (${tellText(tell, s)})`
   fx.push({ type: 'log', text: `handoff cancelled: ${tellText(tell, s)}`, debug: true })
-  if (notice === 'both') fx.push({ type: 'notify', text })
+  if (!TOAST_ONLY.has(tell)) fx.push({ type: 'notify', text })
   fx.push({ type: 'toast', text })
 }
 
@@ -1279,19 +1365,19 @@ function tellModel(r: Rec, tell: TellReason): void {
  * 自家已排队的重置被 Esc 否决（resetFailed 带否决文字）。从这时到用户下次输入，引擎不执行自发的命令：整个交接挂起（held）。
  * 这个对话已拿到交接（用户的 /clear 或一次压缩先跑完）：没有丢什么，新对话的模型也没登记过，静默收尾；
  * 否则模型还以为登记有效、回合一结束就重置（排在重置前面的消息附的说明也是这么说的）：告诉用户，并在下一条消息告诉模型一次。
- * 不自动重新排队：是用户按的 Esc，重排也会被拒。命令当场被拒（stopped）时那次 Esc 可能是几小时前的、人不在跟前，所以加通知
+ * 不自动重新排队：是用户按的 Esc，重排也会被拒。命令当场被拒（stopped）时那次 Esc 可能是几小时前的、人不在跟前，所以加通知（TOAST_ONLY）
  */
 function vetoed(r: Rec, s: Settings, fx: Effect[], tell: 'interrupted' | 'stopped', why: string): void {
   r.held = true
   if (r.job?.ctxGiven) cancelQuiet(r, fx, `the reset was called off (${why})`)
   else {
     fx.push({ type: 'log', text: `the reset was called off (${why})`, debug: true })
-    cancelTold(r, s, fx, tell, tell === 'stopped' ? 'both' : 'toast')
+    cancelTold(r, s, fx, tell)
   }
 }
 
 /**
- * 人在场：人工消息（composer/bridge）或用户亲手敲的命令。连环交接守卫解除（PLAN §0 第 22 条 (b)），Esc 之后的挂起也到此为止
+ * 人在场：人工输入（composer、bridge、channel 的消息，PLAN §0 第 36 条）或用户亲手敲的命令。连环交接守卫解除（PLAN §0 第 22 条 (b)），Esc 之后的挂起也到此为止
  * （引擎从用户的这次输入起重新执行自发的命令，实测亲手敲一条命令也算）。两者用同一个判据，只在这里改
  */
 function userInput(r: Rec): void {
@@ -1425,8 +1511,8 @@ export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tok
     state = ` and its context has grown only ${kTokens(Math.max(0, tokens - r.resumedTokens))}k since (${kTokens(tokens)}k now)`
   } else state = ` and its context (${kTokens(tokens)}k) is below ${kTokens(s.remind_at)}k`
   const until = growth
-    ? `once the context has grown by about ${kTokens(s.resume_guard_tokens)}k since the resume, passes ${kTokens(s.remind_at)}k, or the user sends a message`
-    : `once the context passes ${kTokens(s.remind_at)}k or the user sends a message`
+    ? `once the context has grown by about ${kTokens(s.resume_guard_tokens)}k since the resume, passes ${kTokens(s.remind_at)}k, or the user or another Claude session sends a message`
+    : `once the context passes ${kTokens(s.remind_at)}k, or the user or another Claude session sends a message`
   // 先说什么时候该交接（提醒、用户或工程的指示），再给放行条件：免得模型把增量门槛当成交接的时点
   return (
     `this conversation was continued from a handoff file${when}${state}. Carry on with the work the handoff file describes, ` +
@@ -1437,8 +1523,8 @@ export function resumeGuardText(r: Pick<Rec, 'resumedAt' | 'resumedTokens'>, tok
 /** /autohandoff status 里守卫那一行：解除条件，以及增量的基准与目前的增量（排查用） */
 function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: number): string {
   const head = `Just continued from a handoff file${r.resumedAt === null ? '' : ` ${agoText(now - r.resumedAt)}`}: a new handoff is not accepted until context`
-  const tail = '(this stops a reset loop).'
-  if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k or you type a message or a command ${tail}`
+  const tail = 'or a message arrives from you or another Claude session, or you type a command (this stops a reset loop).'
+  if (s.resume_guard_tokens === 0) return `${head} passes ${kTokens(s.remind_at)}k, ${tail}`
   let base: string
   if (r.resumedTokens === null) base = 'usage after the resume not read yet'
   else if (tokens === undefined) base = `from ${kTokens(r.resumedTokens)}k`
@@ -1449,20 +1535,18 @@ function resumeStatusLine(r: Rec, tokens: number | undefined, s: Settings, now: 
     const grown = kTokens(tokens - r.resumedTokens)
     base = `from ${kTokens(tokens) - grown}k, ${grown}k so far`
   }
-  return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, or you type a message or a command ${tail}`
+  return `${head} has grown by ${kTokens(s.resume_guard_tokens)}k since the resume (${base}), passes ${kTokens(s.remind_at)}k, ${tail}`
 }
 
-/** 自家重置完成：进入续接阶段，提交续接（用户已接手时不提交）。resetDone 和孤儿 job 的 SessionStart 共用。 */
+/**
+ * 自家重置完成：进入续接阶段，提交续接。resetDone 和孤儿 job 的 SessionStart 共用。
+ * 重置之后一律续接（PLAN §0 第 38 条）：重置后的对话在这之前已经处理过用户的消息也一样——多一条续接提示无害
+ * （文案里说以用户的要求为准），少了它新对话就停在原地。
+ */
 function afterReset(r: Rec, j: Job, cfg: Config, now: number, fx: Effect[]): void {
   clearLevels(r)
   j.stage = 'resuming'
   j.resetAt = now
-  if (j.userTook) {
-    // 用户已接手（这个对话已拿到交接，userTook 只在那之后置位）：不续接，也不挡登记
-    clearResumed(r)
-    finish(r, fx, 'the user wrote during the reset; resume message skipped')
-    return
-  }
   // 续接开启的对话在解除之前不受理登记（PLAN §0 第 22、31 条）。增量基准此时通常读不到
   // （重置后到第一次响应之前没有用量），由之后第一个带用量的事件记下（trackResume）
   r.resumed = true
@@ -1556,7 +1640,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (j?.stage === 'resuming') finish(r, fx, 'restarted while resuming')
       else if (j && resetQueued(r) && ev.queuedHere === false) {
         fx.push({ type: 'log', text: `restarted: /${j.action} (request ${j.seq}) was queued by a process that has ended`, debug: true })
-        cancelTold(r, s, fx, 'reload', 'toast')
+        cancelTold(r, s, fx, 'reload')
       } else if (j && resetQueued(r)) {
         // 排了多久都不作废（命令撤不回）。计时器随重载没了，重挂；回合状态不明，先当作空闲、从此刻起重新累计：
         // 回合其实还在跑的话，它的下一次工具调用或 Stop 会把计时停掉（turnSeen）
@@ -1564,7 +1648,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         j.idleSpent = 0
         idleFrom(j, s, now, fx)
         fx.push({ type: 'log', text: `restarted or reloaded while /${j.action} was queued (request ${j.seq}); the next conversation still gets the handoff`, debug: true })
-      } else if (j) cancelTold(r, s, fx, 'reload', 'toast')
+      } else if (j) cancelTold(r, s, fx, 'reload')
       return
     }
     case 'teammate': {
@@ -1578,35 +1662,50 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       else cancelQuiet(r, fx, 'this process is an agent team teammate')
       return
     }
+    case 'peerMessage': {
+      // 别的会话给主对话发来消息（PLAN §0 第 35 条）：解除连环交接守卫——那个会话可能正是来叫它交接的，
+      // 是不是由模型读了消息再定，这里不看正文。Esc 之后的挂起不动（引擎要等用户本人输入才再执行自发的命令）
+      if (r.resumed) {
+        clearResumed(r)
+        fx.push({ type: 'log', text: `a message from another session arrived (${ev.origin}); a handoff can be registered again`, debug: true })
+      }
+      return
+    }
     case 'submit': {
       const o = classifyOrigin(ev.origin, ev.isMeta === true)
       if (o.human) {
         // teammate 进程从不收到人工输入：收到了就说明之前的判断不对
         r.human = true
         r.teammate = false
+        // 人在场：解除连环交接守卫和 Esc 之后的挂起
         userInput(r)
       }
       if (o.cls === 'own') return
       if (o.cls === 'meta') {
-        // 引擎自己的 meta 消息：不作废、不算用户接手、不附任何内容（PLAN §0 第 21 条）
+        // 引擎自己的 meta 消息：不作废、不附任何内容（PLAN §0 第 21 条）
         if (r.job) fx.push({ type: 'log', text: `an engine notice (unclassified, isMeta) arrived while ${r.job.stage}; the handoff is kept`, debug: true })
         return
       }
       const j = r.job
       if (j?.stage === 'armed') {
-        if (o.cls === 'user') cancelTold(r, s, fx, o.human ? 'new_message' : 'new_input', 'toast')
+        if (o.cls === 'user') cancelTold(r, s, fx, o.human ? 'new_message' : 'new_input')
         else fx.push({ type: 'context', text: renderPrompt(cfg, 'pending_note', promptVars(cfg, ev.tokens)) })
       } else if (j && (j.stage === 'clearing' || j.stage === 'compacting')) {
-        if (o.cls !== 'user') {
+        if (j.ctxGiven) {
+          // 这个对话已拿到交接，只是自家命令的结果还没回来（消息抢在 resetDone 前面进了串行链；或自家 /compact 排队时
+          // 用户的 /clear、/compact 先跑完，消息落在那之后的对话里）：不能再说「马上要重置、别开新工作」。用户类、代理类都什么都不附，
+          // 结果回来时续接照常提交（PLAN §0 第 38 条）
+          fx.push({
+            type: 'log',
+            text: `${o.cls === 'user' ? 'a user' : 'an agent'} message arrived after the reset, before the result of /${j.action} (request ${j.seq}); nothing attached`,
+            debug: true,
+          })
+        } else if (o.cls !== 'user') {
           // 代理类消息排在自家重置前面、在旧对话里开了一个回合：告诉模型马上要重置，别开新工作
           fx.push({ type: 'context', text: renderPrompt(cfg, 'reset_note', promptVars(cfg, ev.tokens)) })
-        } else if (j.ctxGiven) {
-          // 重置已经发生、这个对话已拿到交接，只是自家命令的结果还没回来：消息由重置后的对话处理，用户接手，不再提交续接
-          j.userTook = true
-          fx.push({ type: 'log', text: 'a user message arrived during the reset; the resume message will be skipped', debug: true })
         } else {
           // 回合结束前就在排队的消息（Remote Control 发来的、别的插件或定时任务提交的）排在自家重置前面，引擎先在旧对话里
-          // 为它开一个回合，答完才重置：不算用户接手，重置后照常续接；告诉模型答完就重置，要留给新对话的内容补进交接文件
+          // 为它开一个回合，答完才重置；告诉模型答完就重置，要留给新对话的内容补进交接文件
           fx.push({ type: 'context', text: resetUserNoteText(cfg, j.file, j.action, ev.tokens) })
           fx.push({
             type: 'log',
@@ -1741,12 +1840,12 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       if (j?.stage === 'armed') {
         if (!effectiveOn(r, s)) cancelQuiet(r, fx, 'AutoHandoff is off at the end of the turn')
         else if (aborted) cancelQuiet(r, fx, 'the turn was interrupted')
-        else if (ev.reason === 'error') cancelTold(r, s, fx, 'api_error', 'both')
-        else if (ev.reason === 'refusal') cancelTold(r, s, fx, 'refusal', 'toast')
+        else if (ev.reason === 'error') cancelTold(r, s, fx, 'api_error')
+        else if (ev.reason === 'refusal') cancelTold(r, s, fx, 'refusal')
         // 只认 answer：以后新出现的 reason 一律当作没有正常结束
         else if (ev.reason !== 'answer') cancelQuiet(r, fx, `the turn ended with reason "${ev.reason}"`)
         else if (!stopSeen) cancelQuiet(r, fx, 'the turn ended without a Stop event (a tool call was rejected)')
-        else if (!ev.file?.ok) cancelTold(r, s, fx, 'file_gone', 'toast')
+        else if (!ev.file?.ok) cancelTold(r, s, fx, 'file_gone')
         else {
           j.stage = j.action === 'clear' ? 'clearing' : 'compacting'
           j.seq = nextSeq(r)
@@ -1810,7 +1909,6 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         seq: null,
         idleAt: null,
         idleSpent: 0,
-        userTook: false,
         ctxGiven: false,
         resetAt: null,
       }
@@ -1878,7 +1976,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         // 自家 /compact 之前用户的 /clear 或 /compact 已经跑完，这个对话已拿到交接（start_context）：自家这次失败也照常续接
         fx.push({ type: 'log', text: `/compact (request ${j.seq}) failed (${clip(ev.message, 120)}), but this conversation already has the handoff; resuming`, debug: true })
         afterReset(r, j, cfg, now, fx)
-      } else cancelTold(r, s, fx, 'reset_failed', 'toast')
+      } else cancelTold(r, s, fx, 'reset_failed')
       return
     }
     case 'sessionStart': {
@@ -1913,16 +2011,6 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
         return
       }
       // 自家那种重置（排队中）或续接阶段里的任何重置：都是要拿交接的对话
-      if (resetQueued(r)) {
-        if (j.sameSeen && j.userTook) {
-          // 排队期间第二次见到同种的重置：上一次不是自家的（用户的 /compact 排在前面先跑了），那之后出队的消息是在自家重置之前、
-          // 在旧对话里处理掉的，不是「接手了重置后的对话」，自家重置之后照常续接（第 32 条）。自家这次之后、结果回来之前再到的消息
-          // 仍照常记。用户的 /clear 开出的新对话里的消息不在此列：那次确定不是自家的，接手是确定的，自家 /compact 之后也不续接
-          j.userTook = false
-          fx.push({ type: 'log', text: `a second /${ev.source} ran while /${j.action} (request ${j.seq}) is queued, so the earlier one was not ours; the message in between does not count as taking over`, debug: true })
-        }
-        j.sameSeen = true
-      }
       fx.push({ type: 'context', text: startContextText(cfg, j.file, j.action) })
       j.ctxGiven = true
       if (j.orphan && resetQueued(r)) {
@@ -1958,7 +2046,7 @@ function reduce(r: Rec, ev: Ev, env: Env, out: Step): void {
       const wait = s.wait_minutes * 60_000
       const j = r.job
       if (j?.stage === 'armed' && now - j.registeredAt >= wait) {
-        cancelTold(r, s, fx, 'timeout', 'both')
+        cancelTold(r, s, fx, 'timeout')
       } else if (j && resetQueued(r) && j.idleAt !== null && j.idleSpent + (now - j.idleAt) >= wait) {
         // 排队的命令空闲时就执行。累计空闲了 wait_minutes 仍没有结果：不让本对话永久卡在重置中，但也不丢交接（搁置）。
         // 有回合在跑（idleAt 为 null）时命令还没机会执行，不算没有结果；回合结束时接着计时
@@ -2024,7 +2112,7 @@ export function formatStatus(r: Rec, cfg: Config, x: StatusExtra, now: number): 
   if (x.configPath) lines.push(`Configuration: ${x.configPath}`)
   const problems = x.problems ?? []
   if (problems.length) {
-    lines.push('Configuration problems (built-in defaults used for these):')
+    lines.push('Configuration problems:')
     for (const p of problems) lines.push(`  - ${p}`)
   }
   return lines.join('\n')

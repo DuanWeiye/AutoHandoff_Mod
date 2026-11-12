@@ -3,7 +3,7 @@
 // clear 的 promise 先 resolve、约 180 ms 后才到 SessionStart(clear)；子代理的事件带 agentId；工具被拒的回合没有 Stop。
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { COMMAND_NAME, QUEUED_TOAST, TOOL_FULL_NAME, defaultConfigText, localStamp, storeKey } from '../hooks/core.js'
+import { COMMAND_NAME, QUEUED_TOAST, TOOL_FULL_NAME, defaultConfigText, localStamp, markKey, newRecord, storeKey } from '../hooks/core.js'
 import { CC_DIR, CWD, HANDOVER, HOME, MIN, NOW, REPO, growingHandover } from './helpers.js'
 
 const OLD = '6f1c2b8e-3a4d-4e5f-9a0b-1c2d3e4f5a6b'
@@ -93,6 +93,14 @@ function world(on: On, o: WorldOptions = {}) {
     delivered: [] as { text: string; context: readonly string[] }[],
     /** 为真时 store.set 抛错（store 满、磁盘错误） */
     storeFails: false,
+    /** 为真时只有写入期标记（t: 开头的键）写不进：记录照常写进 */
+    markFails: false,
+    /** store.get 被调用的次数 */
+    storeGets: 0,
+    /** 为真时读配置文件出错（读到一半的 I/O 错误、别的插件的 fs hook 拒绝） */
+    configUnreadable: false,
+    /** 接下来这么多次 store.get 抛错（另一个进程正在写、锁竞争重试耗尽、文件读不出来）；Infinity 表示一直读不了 */
+    storeReadFails: 0,
     /** 宿主替插件保存的 `$.state`（热重载后还在；restart() 模拟进程重启时清空） */
     state: new Map<string, unknown>(),
     /**
@@ -112,9 +120,17 @@ function world(on: On, o: WorldOptions = {}) {
   }
   if (w.config !== null) w.files.set(CONFIG, { size: w.config.length, mtimeMs: NOW - 3 * 24 * 60 * MIN })
   // store 自己扮演（测试要直接看里面的记录）；值按 JSON 存取，和真实的 store 文件一样
-  on('store.get', (_, e) => ({ value: w.store.has(e.key) ? JSON.parse(w.store.get(e.key)!) : undefined }))
+  on('store.get', (_, e) => {
+    w.storeGets += 1
+    if (w.storeReadFails > 0) {
+      w.storeReadFails -= 1
+      throw new Error('the plugin store could not be read')
+    }
+    return { value: w.store.has(e.key) ? JSON.parse(w.store.get(e.key)!) : undefined }
+  })
   on('store.set', (_, e) => {
     if (w.storeFails) throw new Error('the plugin store is full')
+    if (w.markFails && e.key.startsWith('t:')) throw new Error('the plugin store is busy')
     w.store.set(e.key, JSON.stringify(e.value))
     return { value: undefined }
   })
@@ -149,6 +165,7 @@ function world(on: On, o: WorldOptions = {}) {
     return { value: w.files.has(normalize(e.path)) || w.dirs.has(normalize(e.path)) }
   })
   on('fs.read', (_, e) => {
+    if (normalize(e.path) === CONFIG && w.configUnreadable) throw new Error(`$.fs.read(${e.path}) failed: EIO`)
     if (normalize(e.path) === CONFIG && w.config !== null) return { value: w.config }
     w.reads.push(e.path)
     const text = w.texts.get(normalize(e.path))
@@ -289,6 +306,40 @@ async function userClear($: any, w: W['w'], to = NEW): Promise<any> {
   return $.classic.SessionStart({ source: 'clear', session_id: to })
 }
 
+/** store 里的对话记录键（不含写入期标记） */
+function recordKeys(x: W): string[] {
+  return [...x.w.store.keys()].filter((k) => k.startsWith('s:'))
+}
+
+/** 等一个要靠时钟往前走才能做完的调用（读 store 失败后的重试在等 `$.clock.sleep`） */
+async function ride<T>(clock: W['clock'], p: Promise<T>): Promise<T> {
+  let done = false
+  p.then(
+    () => (done = true),
+    () => (done = true),
+  )
+  for (let i = 0; i < 40 && !done; i++) await clock.advance(25)
+  return p
+}
+
+/** 交接完成、续接回合开始后，模型照交接文件里的话又去登记：被连环交接守卫拒绝（这次的用量成为增量的基准） */
+async function resumedAndRefused($: any, x: W): Promise<void> {
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  cmd.resolve()
+  await clock.settle()
+  await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  w.tokens = 31_800
+  x.writeHandoff()
+  expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
+}
+
 function stored(x: W, sid: string): any {
   const v = x.w.store.get(storeKey(sid))
   return v === undefined ? undefined : JSON.parse(v)
@@ -401,7 +452,7 @@ test('2. clear path in the other order: SessionStart(clear) arrives before the p
   // 只有一次 clear、一次续接、一次 start_context
   expect(w.commands.length).toBe(1)
   expect(w.submits.length).toBe(1)
-  expect([...w.store.keys()].sort()).toEqual([storeKey(NEW), storeKey(OLD)].sort())
+  expect(recordKeys(x).sort()).toEqual([storeKey(NEW), storeKey(OLD)].sort())
 })
 
 test('3. action compact: /compact with the focus text, same session id, start context at SessionStart(compact), then resume', async ($, on) => {
@@ -520,7 +571,7 @@ test('7. a failed /clear cancels, is reported and the model is told', async ($, 
   expect(stored(x, OLD).job).toBeNull()
   expect(w.submits).toEqual([])
   // store 里只有对话记录（/clear 的搬迁靠模块变量和回调带的旧 sid，不留指针）
-  expect([...w.store.keys()]).toEqual([storeKey(OLD)])
+  expect(recordKeys(x)).toEqual([storeKey(OLD)])
   expect(w.toasts).toEqual(['AutoHandoff: handoff cancelled (the reset command failed)'])
   expect(w.debug).toContain('/clear (request 1) was rejected: no implementation for command.run')
   expect(w.statuses.at(-1)).toBeUndefined()
@@ -623,7 +674,7 @@ test('first run writes the default configuration file once; a broken value is re
   w.config = w.config!.replace('remind_at: 300000', 'remind_at: 300k')
   await slash($, 'status')
   expect(w.logs.slice(-2)).toEqual([
-    'Configuration problems (built-in defaults used for these):',
+    'Configuration problems:',
     '  - remind_at should be a whole number, got "300k"; using the default (300000)',
   ])
 })
@@ -756,7 +807,6 @@ test('a Remote Control message sent while the registered turn ran: Claude Code r
   expect(got.context[0]).toStartWith('[AutoHandoff] The handoff you registered is still in effect: when this turn ends, the conversation is reset with /clear')
   expect(got.context[0]).toEndWith(`Registered handoff file: "${HANDOVER}".`)
   expect(stored(x, OLD).job.stage).toBe('clearing')
-  expect(stored(x, OLD).job.userTook).toBe(false)
   expect(w.toasts).toEqual([])
   // 旧对话里的这个回合：模型把要留给新对话的内容补进交接文件（登记后文件变了不影响已排队的重置），回合正常结束
   await turnStart($, T2)
@@ -818,6 +868,128 @@ test('action compact with a message queued ahead of the /compact: answered befor
   expect(w.submits.length).toBe(1)
   expect(w.submits[0]!.text).toContain('(/compact)')
   expect(stored(x, OLD).job.stage).toBe('resuming')
+})
+
+test('a message that reaches the new conversation between SessionStart(clear) and the result of the /clear: answered there with nothing attached, and the resume message is still sent once', async ($, on) => {
+  // 另一种事件顺序（用例 2）：SessionStart(clear) 先到、命令的 promise 后 resolve。这中间新对话里到了一条消息
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  await say($, 'Before you go on: warm the cache from the staging bucket, not from production.', { kind: 'bridge' })
+  // 重置已经发生：不说「马上要重置」，也不作废；续接还没发
+  expect(w.delivered.at(-1)!.context).toEqual([])
+  expect(stored(x, NEW).job.stage).toBe('clearing')
+  expect(w.submits).toEqual([])
+  expect(w.toasts).toEqual([])
+  cmd.resolve()
+  await clock.settle()
+  // 结果回来：续接照常提交（新对话不会答完这一句就停在原地）
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.asUser).toBe(true)
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(stored(x, NEW).job.stage).toBe('resuming')
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+  expect(w.commands.length).toBe(1)
+  expect(w.submits.length).toBe(1)
+  expect(w.debug).toContain('a user message arrived after the reset, before the result of /clear (request 1); nothing attached')
+  expect(w.debug).toContain('handoff finished: resumed')
+  expect(w.debug.filter((d) => d.startsWith('handoff cancelled'))).toEqual([])
+  // 守卫在续接时置位，比那条消息晚：模型马上又去登记会被拒，用户再发一句之后照常受理
+  w.tokens = 31_800
+  x.writeHandoff()
+  expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
+  await say($, 'That is all from me; hand off whenever the reminder asks.')
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+})
+
+test('the user\'s /clear typed during the registered turn, and a message answered in the conversation it opens: our queued /clear wipes that one, and the last conversation is resumed once', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  // 用户的 /clear 先出队：OLD → MID，这个对话当场拿到交接
+  const mid = await userClear($, w, MID)
+  expect(mid.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(w.toasts).toEqual([QUEUED_TOAST])
+  // 排在自家 /clear 前面的消息在 MID 里得到一个回合：什么都不附，这期间不续接、不再发重置
+  w.tokens = 9_400
+  await say($, 'Which test file covers the eviction order?', { kind: 'bridge' })
+  expect(w.delivered.at(-1)!.context).toEqual([])
+  await turnStart($, T2)
+  w.tokens = 13_700
+  expect((await tool($)).additionalContext).toBeUndefined()
+  expect((await stop($)).block).toBeUndefined()
+  await complete($, T2)
+  await clock.settle()
+  expect(stored(x, MID).job.stage).toBe('clearing')
+  expect(w.submits).toEqual([])
+  expect(w.commands.length).toBe(1)
+  // 自家的 /clear：MID → NEW，promise 先 resolve，再到 SessionStart(clear)
+  await $.session.end({ reason: 'clear', sessionId: MID, resume: { id: MID } })
+  w.sid = NEW
+  w.tokens = undefined
+  cmd.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  const ss = await $.classic.SessionStart({ source: 'clear', session_id: NEW })
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  await turnStart($, T3)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+  expect(stored(x, NEW).resumed).toBe(true)
+  expect(w.submits.length).toBe(1)
+  expect(w.commands.length).toBe(1)
+  expect(w.debug).toContain('handoff finished: resumed')
+  expect(w.debug.filter((d) => d.startsWith('handoff cancelled'))).toEqual([])
+})
+
+test('action compact, the user\'s /clear runs first and the user works a turn in the new conversation before the queued /compact runs: the compacted conversation still gets the start context and the resume message, once', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('action: clear', 'action: compact') })
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  expect(cmd.command).toBe('compact')
+  const ss = await userClear($, w)
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  // 用户在自己清出来的新对话里先说了一句，模型干了一个回合；自家的 /compact 还排着
+  w.tokens = 8_200
+  await say($, 'Start with the failing eviction test, then the rest of the handoff.')
+  expect(w.delivered.at(-1)!.context).toEqual([])
+  await turnStart($, T2)
+  w.tokens = 12_600
+  expect((await tool($)).additionalContext).toBeUndefined()
+  expect((await stop($)).block).toBeUndefined()
+  await complete($, T2)
+  await clock.settle()
+  expect(stored(x, NEW).job.stage).toBe('compacting')
+  expect(w.submits).toEqual([])
+  expect(w.commands.length).toBe(1)
+  // 自家的 /compact 在这个对话上执行：SessionStart(compact) 再给一次交接，结果回来后续接一次
+  w.tokens = undefined
+  const sc = await $.classic.SessionStart({ source: 'compact', session_id: NEW })
+  expect(sc.additionalContext![0]).toContain('(/compact)')
+  cmd.resolve()
+  await clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain('(/compact)')
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  await turnStart($, T3)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+  expect(stored(x, NEW).resumed).toBe(true)
+  expect(w.submits.length).toBe(1)
+  expect(w.commands.length).toBe(1)
+  expect(w.debug).toContain('a user message arrived after the reset, before the result of /compact (request 1); nothing attached')
+  expect(w.debug).toContain('handoff finished: resumed')
 })
 
 test('/autohandoff off while the /clear is queued: it still resumes, and AutoHandoff is off in the new conversation', async ($, on) => {
@@ -1049,6 +1221,8 @@ test('the store failing when the turn ends: no /clear is issued (it could not be
   expect(w.toasts.length).toBe(1)
   expect(w.toasts[0]).toStartWith('AutoHandoff could not save its state (')
   expect(w.toasts[0]).toEndWith('), so the conversation was not reset.')
+  // 模型已经停下等重置：没人在场时 toast 一闪就没了，所以另有通知
+  expect(w.notifies).toEqual(w.toasts)
   expect(stored(x, OLD).job.stage).toBe('armed')
   // store 恢复后，下一条人工消息照常作废这份登记并告诉模型
   w.storeFails = false
@@ -1067,6 +1241,7 @@ test('$.state failing when the turn ends: no /clear is issued (a reload would ta
   expect(w.commands).toEqual([])
   expect(w.toasts.length).toBe(1)
   expect(w.toasts).toEqual(['AutoHandoff could not save its state ($.state.set did not write the value), so the conversation was not reset.'])
+  expect(w.notifies).toEqual(w.toasts)
   expect(w.debug).toContain('turnComplete: reset not issued because the queued reset could not be saved')
   expect(stored(x, OLD).job.stage).toBe('armed')
   expect(w.state.get('autohandoff/queued')).toBeUndefined()
@@ -1259,7 +1434,7 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   const r = await registerTool($, HANDOVER)
   expect(r.deny).toBe(
     'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 0k since (31k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 20k since the resume, passes 40k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 20k since the resume, passes 40k, or the user or another Claude session sends a message.',
   )
   expect(stored(x, NEW).job).toBeNull()
   expect(stored(x, NEW).resumedTokens).toBe(31_800)
@@ -1270,7 +1445,7 @@ test('chain guard: right after the resume, the new conversation\'s registration 
   // 用户能在 /autohandoff status 里看到登记暂不受理和增量（查看状态不算发话，不解除）
   await slash($, 'status')
   expect(w.logs).toContain(
-    'Just continued from a handoff file less than a minute ago: a new handoff is not accepted until context has grown by 20k since the resume (from 31k, 0k so far), passes 40k, or you type a message or a command (this stops a reset loop).',
+    'Just continued from a handoff file less than a minute ago: a new handoff is not accepted until context has grown by 20k since the resume (from 31k, 0k so far), passes 40k, or a message arrives from you or another Claude session, or you type a command (this stops a reset loop).',
   )
   expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
   // 用户发话之后（比如要求交接）照常受理
@@ -1360,7 +1535,7 @@ test('chain guard, driven by another session: the resumed conversation gets only
   const early = await registerTool($, HANDOVER)
   expect(early.deny).toBe(
     'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user or another Claude session sends a message.',
   )
   await stop($)
   await complete($, T3)
@@ -1538,4 +1713,384 @@ test('oversize: handoff_max_tokens 0 never reads the handoff file and registers 
   x.writeHandoffText(growingHandover(40))
   expect((await registerTool($, HANDOVER)).result).toStartWith('Handoff registered:')
   expect(x.w.reads).toEqual([])
+})
+
+// ───────── 4.3.0 ─────────
+
+test('the store unreadable when the turn ends: read again twice, then the event is skipped; the user is told once (toast and notification) and the registration stays for the next message', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await armedTurn($, x)
+  await stop($)
+  // 另一个进程把 store 文件写坏了、或锁一直拿不到：这一步读不到记录，不知道有没有登记
+  w.storeReadFails = Infinity
+  w.storeGets = 0
+  await ride(clock, complete($, T1))
+  await clock.settle()
+  expect(w.storeGets).toBe(3)
+  expect(w.commands).toEqual([])
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toStartWith('AutoHandoff could not read its saved state (')
+  expect(w.toasts[0]).toEndWith('); a handoff registered in this conversation may not run until this clears.')
+  expect(w.notifies).toEqual(w.toasts)
+  // 还读不了的时候，后面的事件不再重复提示
+  await ride(clock, say($, 'Background command "pytest -q" completed (exit code 0).', { kind: 'task-notification' }))
+  expect(w.toasts.length).toBe(1)
+  // 读得了之后：登记原样还在，下一条人工消息照常作废它并告诉模型
+  w.storeReadFails = 0
+  expect(stored(x, OLD).job.stage).toBe('armed')
+  await say($, 'what happened?')
+  expect(w.delivered.at(-1)!.context[0]).toContain('Your registered handoff was cancelled (a new message from the user arrived)')
+  // 以后再读不了，会再说一次
+  w.storeReadFails = Infinity
+  await ride(clock, turnStart($, T2))
+  expect(w.toasts.filter((t) => t.startsWith('AutoHandoff could not read its saved state')).length).toBe(2)
+})
+
+test('the store unreadable just as the queued /clear finishes: the result is delivered again a moment later, and the new conversation still gets its resume message', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  // /clear 做完的那一刻另一个进程正占着 store：命令的结果送进来，三次读都失败。这个结果只来一次
+  w.storeReadFails = 3
+  w.storeGets = 0
+  cmd.resolve()
+  await clock.settle()
+  // 约 180 ms 后的 SessionStart(clear) 排在它后面，轮到时已经读得到：记录搬到新对话，交接随 start_context 给出
+  await clock.advance(180)
+  const ss = await ride(clock, $.classic.SessionStart({ source: 'clear', session_id: NEW }))
+  expect(ss.additionalContext![0]).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(w.debug.filter((d) => d.startsWith('event skipped: the saved state could not be read')).length).toBe(1)
+  expect(stored(x, NEW).job.stage).toBe('clearing')
+  expect(w.submits).toEqual([])
+  // 结果隔半秒再送一次：这次读到了，续接照发，守卫置位——新对话没有停在原地
+  await clock.advance(500)
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+  expect(stored(x, NEW).job.stage).toBe('resuming')
+  expect(stored(x, NEW).resumed).toBe(true)
+  await turnStart($, T2)
+  w.submits[0]!.release()
+  await clock.settle()
+  expect(stored(x, NEW).job).toBeNull()
+  expect(w.debug).toContain('handoff finished: resumed')
+  // 读失败只说了一次，没有别的提示
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toStartWith('AutoHandoff could not read its saved state (')
+  expect(w.notifies).toEqual(w.toasts)
+})
+
+test('the store unreadable for the whole ten seconds after the queued /clear ran: the result is delivered five times and then given up; the user was told once, and the new conversation takes messages as a plain one', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const cmd = await clearQueued($, x)
+  await $.session.end({ reason: 'clear', sessionId: OLD, resume: { id: OLD } })
+  w.sid = NEW
+  w.tokens = undefined
+  // store 文件坏了一阵子（另一个进程写到一半被杀）：结果怎么送都读不出记录
+  w.storeReadFails = Infinity
+  w.storeGets = 0
+  cmd.resolve()
+  await clock.settle()
+  await clock.advance(180)
+  const ss = await ride(clock, $.classic.SessionStart({ source: 'clear', session_id: NEW }))
+  expect(ss.additionalContext).toBeUndefined()
+  await clock.advance(20_000)
+  // 结果送了 5 次（每次读 3 回），SessionStart(clear) 读了 3 回
+  expect(w.storeGets).toBe(18)
+  expect(w.submits).toEqual([])
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toStartWith('AutoHandoff could not read its saved state (')
+  expect(w.notifies).toEqual(w.toasts)
+  // 之后 store 好了：新对话里用户的消息照常送到，什么都不附；交接文件还在原处，由用户让模型去读
+  w.storeReadFails = 0
+  w.tokens = 30_500
+  await say($, 'The conversation was cleared but nothing came after it. Where were we?')
+  expect(w.delivered.at(-1)!.context).toEqual([])
+  expect(w.submits).toEqual([])
+})
+
+test('the wait_minutes timer firing while the store is unreadable for a moment: the tick is delivered again, and the queued /clear that never ran is still set aside with its toast and notification', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await clearQueued($, x)
+  await clock.advance(60 * MIN - 1)
+  expect(w.toasts).toEqual([])
+  // 定时器到点的那半秒 store 读不出来：登记时和回合结束时各挂的一个定时器都到点，各自重试完都没读到；到点的 tick 不会再来第二次
+  w.storeReadFails = Infinity
+  await clock.advance(1 + 500)
+  expect(stored(x, OLD).job.stage).toBe('clearing')
+  // 隔半秒再送时已经读得到
+  w.storeReadFails = 0
+  await clock.advance(500)
+  const said = 'AutoHandoff: the queued /clear did not run within 60 minutes and was set aside; if it still runs, the conversation continues from the handoff file.'
+  expect(w.toasts.filter((t) => t === said).length).toBe(1)
+  expect(w.notifies.filter((t) => t === said).length).toBe(1)
+  expect(stored(x, OLD).job).toBeNull()
+  expect(stored(x, OLD).stalled.file).toBe(HANDOVER)
+})
+
+test('the store unreadable for a moment when the turn ends (another process is writing): the second read succeeds and the /clear is issued as usual', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await armedTurn($, x)
+  await stop($)
+  w.storeReadFails = 1
+  await ride(clock, complete($, T1))
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['clear'])
+  expect(stored(x, OLD).job.stage).toBe('clearing')
+  expect(w.toasts).toEqual([])
+  expect(w.notifies).toEqual([])
+})
+
+test('a mistyped value in the configuration file is announced with a toast once, not silently replaced by the default; a different mistake later is announced again', async ($, on) => {
+  const x = world(on)
+  const { w } = x
+  await start($)
+  w.tokens = 36_500
+  await say($, 'Refactor src/cache.py and keep the tests green.')
+  expect(w.toasts).toEqual([])
+  // 用户改配置时把 true 打错了：default_on 回落成 false，开着的对话就此关掉——要让他当场知道
+  w.config = LOW_CONFIG.replace('default_on: true', 'default_on: ture')
+  await turnStart($, T1)
+  expect(w.toasts).toEqual(['AutoHandoff configuration: default_on should be true or false, got "ture"; using the default (false). /autohandoff status lists the details.'])
+  w.tokens = 41_200
+  expect((await tool($)).additionalContext).toBeUndefined()
+  await tool($)
+  expect(w.toasts.length).toBe(1)
+  // 改对了：不再提，提醒恢复
+  w.config = LOW_CONFIG
+  expect((await tool($)).additionalContext?.length).toBe(1)
+  expect(w.toasts.length).toBe(1)
+  // 又写错两处（阈值写成 40k 之后三个阈值的顺序也不对了）：再说一次，带上还有几条
+  w.config = LOW_CONFIG.replace('remind_at: 40000', 'remind_at: 40k').replace('action: clear', 'action: wipe')
+  await tool($)
+  expect(w.toasts.length).toBe(2)
+  expect(w.toasts[1]).toBe(
+    'AutoHandoff configuration: remind_at should be a whole number, got "40k"; using the default (300000) (and 2 more). /autohandoff status lists the details.',
+  )
+  await slash($, 'status')
+  expect(w.toasts.length).toBe(2)
+  expect(w.logs).toContain('  - action should be one of clear, compact, got "wipe"; using the default (clear)')
+})
+
+test('a configuration file that only sets two thresholds (other keys left out, resume_guard_tokens above remind_at) is not a mistake: no toast, listed in status only', async ($, on) => {
+  const x = world(on, { config: '## settings\nremind_at: 40000\nurge_at: 90000\n' })
+  const { w } = x
+  await start($)
+  await say($, 'hello')
+  await slash($, 'status')
+  expect(w.toasts).toEqual([])
+  expect(w.logs.some((l) => l.startsWith('  - missing settings (built-in defaults used): default_on, compact_at'))).toBe(true)
+  expect(w.logs.some((l) => l.startsWith('  - resume_guard_tokens (100000) is not below remind_at (40000), so it has no effect; treated as 0'))).toBe(true)
+})
+
+test('the configuration file unreadable when the turn ends (a read error): the configuration read last is kept, so AutoHandoff stays on and the registered handoff still resets; the user is told once', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  await armedTurn($, x)
+  // default_on: true 写在配置里；这时回落内置默认（false）的话，这个对话就成了关的，登记在回合结束时被悄悄作废
+  w.configUnreadable = true
+  await stop($)
+  await complete($, T1)
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['clear'])
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toStartWith(`AutoHandoff configuration: could not read ${CONFIG} (`)
+  expect(w.toasts[0]).toEndWith('); the configuration read last is kept. /autohandoff status lists the details.')
+  // 阈值也还是用户写的 40k，不是默认的 300k
+  await slash($, 'status')
+  expect(w.logs.some((l) => l.includes('Reminders at 40k and 90k, compaction at 300k'))).toBe(true)
+  expect(w.toasts.length).toBe(1)
+  // 读得了之后问题消失
+  w.configUnreadable = false
+  await slash($, 'status')
+  expect(w.logs.at(-1)).toBe(`Configuration: ${CONFIG}`)
+})
+
+test('a configuration file on a share that reads only now and then: the read error is announced once and the mistake in the file once, however often it flips; a new mistake is still announced', async ($, on) => {
+  const x = world(on, { config: LOW_CONFIG.replace('action: clear', 'action: wipe') })
+  const { w } = x
+  const MISTAKE = 'AutoHandoff configuration: action should be one of clear, compact, got "wipe"; using the default (clear). /autohandoff status lists the details.'
+  await start($)
+  w.tokens = 36_500
+  await say($, 'Refactor src/cache.py and keep the tests green.')
+  expect(w.toasts).toEqual([MISTAKE])
+  await turnStart($, T1)
+  // 文件读不出来了：说一次读不了；沿用的那份配置里的写错不再重复
+  w.configUnreadable = true
+  await tool($)
+  expect(w.toasts.length).toBe(2)
+  expect(w.toasts[1]).toStartWith(`AutoHandoff configuration: could not read ${CONFIG} (`)
+  expect(w.toasts[1]).toEndWith('); the configuration read last is kept. /autohandoff status lists the details.')
+  // 之后读得到、读不到来回翻转：一个 toast 都不再弹
+  for (let i = 0; i < 4; i++) {
+    w.configUnreadable = i % 2 === 1
+    await tool($)
+    await slash($, 'status')
+  }
+  expect(w.toasts.length).toBe(2)
+  // 两样都还在 status 里
+  w.configUnreadable = true
+  await slash($, 'status')
+  expect(w.logs.some((l) => l.startsWith(`  - could not read ${CONFIG} (`))).toBe(true)
+  expect(w.logs).toContain('  - action should be one of clear, compact, got "wipe"; using the default (clear)')
+  // 读得到的时候用户又写错一处：只说新的这一处
+  w.configUnreadable = false
+  w.config = w.config!.replace('urge_block: true', 'urge_block: yes')
+  await tool($)
+  expect(w.toasts.length).toBe(3)
+  expect(w.toasts[2]).toBe('AutoHandoff configuration: urge_block should be true or false, got "yes"; using the default (true). /autohandoff status lists the details.')
+  // 把 action 改对了，过后又写错：消失后再出现的要再说
+  w.config = w.config!.replace('action: wipe', 'action: clear')
+  await tool($)
+  expect(w.toasts.length).toBe(3)
+  w.config = w.config!.replace('action: clear', 'action: wipe')
+  await tool($)
+  expect(w.toasts.length).toBe(4)
+  expect(w.toasts[3]).toBe(MISTAKE)
+})
+
+test('session start drops records not written for 30 days by reading the key names once; no record is read for it, and every record written carries a write mark', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const DAY = 24 * 60 * MIN
+  const sid = (i: number): string => `${String(i).padStart(8, '0')}-3a4d-4e5f-9a0b-1c2d3e4f5a6b`
+  // 一个用了几个月的 store：60 个对话在一个多月前最后写过，200 个最近两周还在用，3 个的记录没有标记
+  for (let i = 0; i < 263; i++) {
+    const at = NOW - (i < 60 ? 41 + (i % 20) : i % 14) * DAY
+    w.store.set(storeKey(sid(i)), JSON.stringify({ ...newRecord(at), on: i % 3 === 0 ? true : null, human: true }))
+    if (i < 260) w.store.set(markKey(sid(i), at), '1')
+  }
+  await start($)
+  // 启动只为本会话自己的记录读了一次 store，不随键数增加
+  expect(w.storeGets).toBe(1)
+  const left = recordKeys(x)
+  expect(left.length).toBe(203)
+  expect(left.includes(storeKey(sid(0)))).toBe(false)
+  expect(left.includes(storeKey(sid(59)))).toBe(false)
+  expect(left.includes(storeKey(sid(60)))).toBe(true)
+  expect(left.includes(storeKey(sid(262)))).toBe(true)
+  // 删掉的对话的标记也没了；3 份没有标记的记录各补了一个这一期的标记，没有删
+  expect([...w.store.keys()].filter((k) => k.startsWith('t:')).length).toBe(203)
+  for (const i of [260, 261, 262]) expect(w.store.has(markKey(sid(i), NOW))).toBe(true)
+  // 本会话写下记录时带上这一期的标记
+  await say($, 'Refactor src/cache.py and keep the tests green.')
+  expect(w.store.has(storeKey(OLD))).toBe(true)
+  expect(w.store.has(markKey(OLD, NOW))).toBe(true)
+  // 补了标记的那 3 份从这时起算：四周后的启动还留着，六周后的启动删掉，连同补的标记
+  await clock.advance(28 * DAY)
+  await start($)
+  expect(recordKeys(x).includes(storeKey(sid(262)))).toBe(true)
+  await clock.advance(14 * DAY)
+  await start($)
+  for (const i of [260, 261, 262]) {
+    expect(w.store.has(storeKey(sid(i)))).toBe(false)
+    expect(w.store.has(markKey(sid(i), NOW))).toBe(false)
+  }
+})
+
+test('a write mark that could not be saved while the record was (the store was busy), in a conversation that never writes again: the next session start gives the record a mark, and it is dropped 30 to 40 days later like any other', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const DAY = 24 * 60 * MIN
+  const marks = (): string[] => [...w.store.keys()].filter((k) => k.startsWith('t:'))
+  await start($)
+  // 这个对话第一次写记录时标记没写进（另一个进程占着 store），记录写进了；之后用户关了终端，它再没写过
+  w.markFails = true
+  await say($, 'Refactor src/cache.py and keep the tests green.')
+  w.markFails = false
+  expect(w.store.has(storeKey(OLD))).toBe(true)
+  expect(marks()).toEqual([])
+  expect(w.debug.some((d) => d.startsWith(`could not save the write mark of session ${OLD}: `))).toBe(true)
+  await $.session.end({ reason: 'other', sessionId: OLD, resume: { id: OLD } })
+  // 第二天在同一个工程里开了新会话：那份记录没有被读，补上了当天这一期的标记
+  await clock.advance(DAY)
+  w.sid = NEW
+  w.storeGets = 0
+  await start($)
+  expect(w.storeGets).toBe(1)
+  expect(marks()).toEqual([markKey(OLD, NOW + DAY)])
+  expect(w.store.has(storeKey(OLD))).toBe(true)
+  // 再启动不重复补；四周后还在（用户 --resume 回去照样找得到它的开关）
+  await clock.advance(28 * DAY)
+  await start($)
+  expect(marks()).toEqual([markKey(OLD, NOW + DAY)])
+  expect(w.store.has(storeKey(OLD))).toBe(true)
+  // 六周后的启动把它和标记一起删掉
+  await clock.advance(14 * DAY)
+  await start($)
+  expect(w.store.has(storeKey(OLD))).toBe(false)
+  expect(marks()).toEqual([])
+})
+
+test('chain guard: a message another session delivers to the main conversation lifts it; a report from one of this session\'s own subagents, a task notification, a delivery for an agent and the agent-team mailbox do not', async ($, on) => {
+  const x = world(on)
+  const { w } = x
+  await resumedAndRefused($, x)
+  const PEER = { kind: 'peer' }
+  const refused = async (): Promise<void> => {
+    expect((await registerTool($, HANDOVER)).deny).toStartWith('Not registered: this conversation was continued from a handoff file')
+  }
+  // 后台子代理的最终汇报：prompt.submit 的来源也是 peer，但它不经过 session.receive
+  await say($, 'The reviewer agent has finished: two minor findings in src/cache.py, no blockers.', PEER)
+  await refused()
+  // 后台命令结束的通知
+  await say($, 'Background command "pytest -q" completed (exit code 0).', { kind: 'task-notification' })
+  await refused()
+  // 别的会话发给本会话某个子代理的消息、agent team 信箱里 teammate 的消息
+  await $.session.receive({ origin: PEER, text: 'ping for the worker agent', agentId: AGENT })
+  await $.session.receive({ origin: { kind: 'peer', teammate: 'researcher', isVerified: true }, text: 'notes from the researcher' })
+  await refused()
+  expect(stored(x, NEW).resumed).toBe(true)
+  // 协调会话发来消息：先是 session.receive（投给主对话，没有 agentId），之后才是它的 prompt.submit
+  const text = 'Message from the coordinating session: the release is cut at 18:00, wrap up and hand off once the tests pass.'
+  await $.session.receive({ origin: PEER, text })
+  expect(w.debug).toContain('delivery: origin peer')
+  expect(w.debug).toContain('a message from another session arrived (peer); a handoff can be registered again')
+  expect(stored(x, NEW).resumed).toBe(false)
+  await say($, text, PEER)
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+})
+
+test('chain guard: a message the user sends through a channel (Telegram) lifts it like a typed one', async ($, on) => {
+  const x = world(on)
+  await resumedAndRefused($, x)
+  await say($, 'how far along are you? hand off now if the migration is done', { kind: 'channel', server: 'plugin:telegram:telegram' })
+  expect(stored(x, NEW).resumed).toBe(false)
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+})
+
+test('default_on in a session nobody has typed in: a scheduled prompt does not switch AutoHandoff on, the first channel message (Telegram) does, and the reminder, registration and reset then work as usual', async ($, on) => {
+  const x = world(on)
+  const { w, clock } = x
+  const TG = { kind: 'channel', server: 'plugin:telegram:telegram' }
+  await start($)
+  // 定时任务先开了一个回合，越过了 remind_at：没人发过话，default_on 还没生效，不提醒
+  w.tokens = 36_500
+  await say($, 'Nightly check: list the failing tests.', { kind: 'scheduled-trigger' })
+  await turnStart($, T1)
+  w.tokens = 41_200
+  expect((await tool($)).additionalContext).toBeUndefined()
+  expect((await stop($)).block).toBeUndefined()
+  await complete($, T1)
+  await clock.settle()
+  expect(stored(x, OLD).human).toBe(false)
+  // 用户从 Telegram 发来第一句话：从这条消息起生效，已越线，完整提醒随它送到
+  await say($, 'Fix the two cache tests that failed last night and tell me when they pass.', TG)
+  expect(stored(x, OLD).human).toBe(true)
+  expect(w.delivered.at(-1)!.context.length).toBe(1)
+  expect(w.delivered.at(-1)!.context[0]).toContain('past the first threshold of 40k')
+  await turnStart($, T2)
+  x.writeHandoff()
+  w.tokens = 43_900
+  expect((await registerTool($, HANDOVER)).result).toContain('Handoff registered')
+  await stop($)
+  await complete($, T2)
+  await clock.settle()
+  expect(w.commands.map((c) => c.command)).toEqual(['clear'])
 })

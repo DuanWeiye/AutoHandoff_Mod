@@ -10,7 +10,7 @@
   drive.py <工作目录> --cleanup-only        （--keep 跑过之后清理）
 场景：clear draft dialog deny interject notify cmp slash print
       compact fallback ctype agentdialog reload restart esc apierr subreg urge userclear chain limit
-      queued queuedc escq
+      queued queuedc escq handback tasknote
       （缺省全跑；--repeat N 每个场景跑 N 次并统计）
 同一个仓库（worktree）同时只跑一组 drive.py：store 文件被同一插件目录的所有 --plugin-dir 会话共用，清理时要改它。
 清理时发现别的 --plugin-dir 会话还在跑、或这次运行期间有别的会话写过记录，就跳过 store 这一步并打印出来。
@@ -107,7 +107,7 @@ class Session:
                 self.keys("Down")
                 time.sleep(0.3)
                 self.keys("Enter")
-            elif "manual mode" in p or "? for shortcuts" in p or re.search(r"^❯ ", p, re.M):
+            elif "manual mode" in p or "auto mode on" in p or "? for shortcuts" in p or re.search(r"^❯ ", p, re.M):
                 if self.sids():
                     time.sleep(1.5)
                     return
@@ -927,8 +927,9 @@ CTYPE_WORD = "MANGO-5521"
 
 def scenario_ctype(work):
     """压缩窗口里的人工消息（PLAN §0 第 23 条）：action=compact，自家 /compact 正在跑时用户发一句话（带暗号）。
-    期望：不作废；只压缩一次；用户的话在压缩后的对话里得到回答（暗号）；有 start_context；续接至多一次
-    （消息在压缩中被引擎收下 → 用户接手、不续接；排在压缩之后才收下 → 续接一次，续接文案里「以用户为准」）。"""
+    期望：不作废；只压缩一次；用户的话在压缩后的对话里得到回答（暗号）；有 start_context；续接恰好一次
+    （重置后一律续接，PLAN §0 第 38 条：消息在自家命令的结果回来之前还是之后被引擎交出都一样，续接文案里「以用户为准」；
+    哪一种只记进 note）。"""
     reset_project(work)
     c = Check("ctype: a user message typed while the queued /compact runs")
     s = Session(work, "ctype", config=os.path.join(work, "autohandoff-compact.md"))
@@ -946,7 +947,7 @@ def scenario_ctype(work):
         ent = s.entries(sid)
         post = after_compact(ent)
         t_ss = log_time(s.debug, "Hooks: SessionStart:compact")
-        took = "a user message arrived during the reset; the resume message will be skipped" in a
+        early = any(x.startswith("a user message arrived after the reset, before the result of /compact") for x in a)
         n_resume = len(resume_entries(post))
         c.ok(t_ss is not None and t_type < t_ss, f"the message was typed while the compaction ran ({fmt_t(t_type)} < {fmt_t(t_ss)})")
         c.ok(s.count("turn ended; running /compact") == 1, "/compact queued exactly once")
@@ -955,10 +956,10 @@ def scenario_ctype(work):
         c.ok(not any(x.startswith("handoff cancelled") for x in a), "nothing cancelled")
         c.ok(any(x.startswith("handoff finished") for x in a), "the handoff finished")
         c.ok(attachments(post, "This conversation was just reset by AutoHandoff (/compact)"), "start context after the compaction")
-        c.ok(n_resume == (0 if took else 1), f"resume message {'skipped (user took over)' if took else 'sent once'} ({n_resume})")
+        c.ok(n_resume == 1, f"resume message sent once ({n_resume})")
         c.ok(CTYPE_WORD in assistant_text(post), f"the user's message was answered after the compaction ({CTYPE_WORD})")
         msgs = [x for x in a if x.startswith("message: origin")]
-        c.note(f"took over: {took}; messages: {msgs}")
+        c.note(f"the message reached AutoHandoff before the result of /compact: {early}; messages: {msgs}")
         c.note(" | ".join(x for x in a if x.startswith(("handoff", "turn ended", "a user message", "reset request"))))
     except TimeoutError as e:
         c.ok(False, str(e).splitlines()[0])
@@ -1185,6 +1186,119 @@ def scenario_agentdialog(work):
         c.note("\n".join(str(e).splitlines()[1:40]))
     finally:
         s.close()
+    return c
+
+
+def stored_record(sid):
+    """插件 store 里这个对话的记录（--plugin-dir 加载的 autohandoff 的 store 文件）；没有、或文件正被改写而读不出时返回 None"""
+    store_dir = os.path.join(CC, "plugins", "store")
+    for f in sorted(os.listdir(store_dir)) if os.path.isdir(store_dir) else []:
+        if not (f.startswith("autohandoff_inline-") and f.endswith(".json")):
+            continue
+        try:
+            rec = json.load(open(os.path.join(store_dir, f), encoding="utf-8")).get("s:" + sid)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
+def guard_on(sid):
+    """连环交接守卫是否还在（记录里的 resumed）；读不到记录时为 None"""
+    for _ in range(6):
+        rec = stored_record(sid)
+        if rec is not None:
+            return rec.get("resumed") is True
+        time.sleep(0.5)
+    return None
+
+
+def scenario_handback(work, mode="auto"):
+    """本会话后台子代理的最终汇报不解除连环交接守卫，别的会话发来的消息才解除（PLAN §0 第 35 条）。
+    守卫的解除在 session.receive 上认；这个场景核对引擎的两件事，引擎升级后重跑：
+      (1) 子代理的最终汇报不触发主对话的 session.receive。两种到达方式各一个场景：
+          handback：权限模式 auto 下汇报经 SubagentHandback 交回，以「另一个会话的消息」的样子进主对话
+          （prompt.submit 的 origin 是 peer，transcript 的 origin 带 handback: true）；
+          tasknote：其它权限模式下以任务通知到达（origin task-notification）。
+      (2) 别的会话发来的消息触发它（origin peer），守卫解除。它同时是 (1) 的对照：证明 session.receive 上的识别在这个版本是通的，
+          (1) 里没有 `delivery:` 审计行不是因为 hook 没接上。
+    流程：旧对话起一个后台子代理（等 .go-agent 出现才结束）→ 写交接文件、登记 → /clear → 续接，守卫置位
+    （配置用 autohandoff-chain.md：remind_at 150k，守卫靠增量挡着，这个场景里不会自己解除）→ 驱动建 .go-agent → 汇报落进新对话
+    → 没有 `delivery:` 审计行、记录里守卫还在 → 另起会话 B，让它用 SendMessage 按名字给这个会话发一条消息
+    → `delivery: origin peer`、守卫解除。
+    守卫是否还在直接读 store 里的记录（resumed）：敲 /autohandoff status 也看得到，但那是往被测会话里多发一次输入。"""
+    reset_project(work)
+    tag = "handback" if mode == "auto" else "tasknote"
+    how = "a hand-back (auto permission mode)" if mode == "auto" else "a task notification"
+    c = Check(f"{tag}: a subagent's final report arriving as {how} keeps the chain guard; a message from another session lifts it")
+    config = os.path.join(work, "autohandoff-chain.md")
+    flags = ("--permission-mode", "auto") if mode == "auto" else ()
+    name = f"ah-e2e-{tag}-{os.getpid()}"
+    s = Session(work, tag, extra=("-n", name, *flags), config=config)
+    b = None
+    try:
+        s.send(
+            TEST_INTRO + "(1) Start one background subagent: Agent tool, subagent_type general-purpose, run_in_background true, with this task: "
+            "'Run `python3 tools/wait_for.py .go-agent` with the Bash tool, then report the single word DONE.' "
+            "(2) Write docs/HANDOVER.md (replace its content) with: '# Handover\\n\\nA background subagent is running (it waits for the file .go-agent). "
+            "When its report arrives, tell the user AGENT-REPORTED. When a message from another Claude session arrives, tell the user PEER-SEEN.\\n"
+            "Next step: wait; do nothing else until one of them arrives.' "
+            f"(3) Call the {TOOL} tool with file docs/HANDOVER.md. (4) End your turn with one short sentence."
+        )
+        s.wait(lambda: s.has("handoff finished") or s.has("handoff cancelled"), 300, "the reset and resume")
+        s.wait(lambda: len(s.sids()) >= 2 and s.stops(s.sids()[-1]), 300, "the resumed turn to end")
+        s.wait_idle()
+        new = s.sids()[-1]
+        guard_before = guard_on(new)
+        i_report = len(s.audit())
+        n_stops = len(s.stops(new))
+        # (1) 子代理结束，它的最终汇报落进续接出来的新对话
+        open(os.path.join(proj(work), ".go-agent"), "w").close()
+        s.wait(lambda: any(x.startswith("message: origin") for x in s.audit()[i_report:]), 300, "the subagent's report in the new conversation")
+        s.wait(lambda: len(s.stops(new)) > n_stops, 240, "the turn the report opened to end")
+        s.wait_idle()
+        a = s.audit()
+        arrived = [x for x in a[i_report:] if x.startswith("message: origin")]
+        ent = s.entries(new)
+        marked = [e for e in ent if e.get("type") == "user" and (e.get("origin") or {}).get("handback") is True]
+        c.ok("handoff finished: resumed" in a and len(s.sids()) == 2, f"one reset and one resume ({len(s.sids())} sessions)")
+        c.ok(guard_before is True, f"the chain guard is set after the resume (record.resumed: {guard_before})")
+        if mode == "auto":
+            c.ok(bool(arrived) and all(x.startswith("message: origin peer") for x in arrived), f"the report reached AutoHandoff as a message from an agent ({arrived})")
+            c.ok(len(marked) == 1 and marked[0]["origin"].get("kind") == "peer" and "[Subagent hand-back]" in text_of(marked[0]),
+                 f"the transcript has it as a subagent hand-back: origin peer, handback true ({len(marked)})")
+        else:
+            c.ok(bool(arrived) and all(x.startswith("message: origin task-notification") for x in arrived), f"the report reached AutoHandoff as a task notification ({arrived})")
+            c.ok(not marked, "no hand-back in the transcript")
+        c.ok(not any(x.startswith("delivery:") for x in a), "the report raised no session.receive that AutoHandoff takes for another session (no `delivery:` audit line)")
+        guard_after = guard_on(new)
+        c.ok(guard_after is True, f"the chain guard is still set after the report (record.resumed: {guard_after})")
+        # (2) 另一个会话按名字给它发消息
+        b = Session(work, tag + "b", extra=flags, config=config)
+        n_stops = len(s.stops(new))
+        b.send(
+            f'This is a test of messaging between two Claude sessions. Call the SendMessage tool once with to "{name}" and the message '
+            '"A note from another session: the nightly build is green. Tell your user PEER-SEEN." If the tool says the name is unknown, '
+            "call ListAgents and send again with the name it lists. Then end your turn with one short sentence saying whether it was delivered."
+        )
+        s.wait(lambda: s.has("delivery: origin"), 240, "the other session's message")
+        s.wait(lambda: len(s.stops(new)) > n_stops, 240, "the turn the message opened to end")
+        s.wait_idle()
+        a = s.audit()
+        c.ok("delivery: origin peer" in a, "the other session's message raised session.receive with origin peer")
+        c.ok("a message from another session arrived (peer); a handoff can be registered again" in a, "it lifted the chain guard")
+        guard_end = guard_on(new)
+        c.ok(guard_end is False, f"the chain guard is off in the record (record.resumed: {guard_end})")
+        c.ok(s.count("turn ended; running /clear") == 1 and not any(x.startswith("handoff cancelled") for x in a), "nothing else was reset or cancelled")
+        c.note(" | ".join(x for x in a if x.startswith(("handoff", "turn ended", "record moved", "message:", "delivery:", "a message from"))))
+    except TimeoutError as e:
+        c.ok(False, str(e).splitlines()[0])
+        c.note("\n".join(str(e).splitlines()[1:40]))
+    finally:
+        s.close()
+        if b is not None:
+            b.close()
     return c
 
 
@@ -1610,6 +1724,8 @@ SCENARIOS = {
     "queued": scenario_queued,
     "queuedc": lambda w: scenario_queued(w, action="compact"),
     "escq": scenario_escq,
+    "handback": scenario_handback,
+    "tasknote": lambda w: scenario_handback(w, mode="default"),
 }
 
 
@@ -1727,7 +1843,8 @@ def cleanup(work, keep):
             continue
         path = os.path.join(store_dir, f)
         d = json.load(open(path, encoding="utf-8"))
-        gone = [k for k in d if k[:2] in ("s:", "c:") and k[2:] in sids]
+        # 记录、以及记录旁边的写入期标记 t:<期号>:<sid>（4.3.0 起每条记录带一个）
+        gone = [k for k in d if (k[:2] in ("s:", "c:") and k[2:] in sids) or (k.startswith("t:") and k.split(":", 2)[-1] in sids)]
         # 这个 store 文件被同一插件目录的所有 --plugin-dir 会话共用：别的会话还在跑（或这次运行期间写过别的记录）时，
         # 读-改-写会和它的写入互相覆盖，所以这一步跳过，留给人手动清
         foreign = [k for k, v in d.items() if k.startswith("s:") and k[2:] not in sids and isinstance(v, dict) and v.get("t", 0) >= RUN_STARTED * 1000]

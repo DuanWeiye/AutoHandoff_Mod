@@ -219,7 +219,6 @@ test('an agent message that opens a turn while the reset is queued gets the rese
   const { rec } = clearing()
   const a = run(rec, [{ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 318_400 }])
   expect(a.rec.job?.stage).toBe('clearing')
-  expect(a.rec.job?.userTook).toBe(false)
   expect(contexts(a.all)).toEqual([
     "[AutoHandoff] The conversation is about to be reset with /clear and continued from the registered handoff file; this message arrived in between. Keep this turn short and do not start new work. If this message changes anything recorded in the handoff file (for example a subagent's result), update the file now; the next conversation reads it after the reset.",
   ])
@@ -525,7 +524,7 @@ test('/autohandoff: toggle, on, off, status and bad arguments; user /clear cance
       'Context: 309k of 1000k. Reminders at 300k and 450k, compaction at 650k; reset with /clear.',
       `Handoff: "${HANDOVER}" (armed).`,
       'Configuration: /home/user/.claude/autohandoff.md',
-      'Configuration problems (built-in defaults used for these):',
+      'Configuration problems:',
       '  - remind_at should be a whole number, got "300k"; using the default (300000)',
     ].join('\n'),
   )
@@ -620,7 +619,6 @@ test('a message sent through Remote Control while the model worked is queued ahe
   expect(ofType(a.all, 'clear')).toEqual([])
   expect(ofType(a.all, 'toast')).toEqual([])
   expect(a.rec.job?.stage).toBe('clearing')
-  expect(a.rec.job?.userTook).toBe(false)
   expect(run(a.rec, [REG]).steps[0]!.reply).toBe('Not registered: a reset is already in progress.')
   // /clear 执行：promise 先 resolve（记录已搬到新 sid），再到 SessionStart(clear)。续接照常提交，新对话带连环交接守卫
   const b = run(migrateRecord(a.rec, NOW + 30_000), [
@@ -647,7 +645,7 @@ test('several messages queued ahead of the reset (Remote Control, a scheduled tr
   const a = run(rec, [
     { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
     ...oldTurn(T2, 320_100),
-    // 定时任务的 prompt 也是「用户类」来源：同样附说明，不算用户接手
+    // 定时任务的 prompt 也是「用户类」来源：同样附说明
     { kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 320_100 },
     ...oldTurn('9c2f6a1e-7b3d-4e8f-a1c2-5d6e7f8a9b0c', 323_900),
     // 后台任务的通知是代理类：附 reset_note
@@ -664,7 +662,7 @@ test('several messages queued ahead of the reset (Remote Control, a scheduled tr
   expect(b.rec.job).toBe(null)
 })
 
-test('every user-class source queued ahead of the reset is treated alike, typed by a person or not: note in the old conversation, no takeover, resume after the reset', () => {
+test('every user-class source queued ahead of the reset is treated alike, typed by a person or not: note in the old conversation, resume after the reset', () => {
   // 判断的是「消息落在哪个对话」，不是「是不是人工输入」：定时任务、Telegram 之类的 channel、别的插件、协调会话下发的消息、
   // Slack 提醒、SDK 主机的回合、来源不明的输入，在 clearing/compacting 阶段都不得让续接被跳过
   const origins = [
@@ -685,7 +683,6 @@ test('every user-class source queued ahead of the reset is treated alike, typed 
       const { rec, seq } = clearing(cfg)
       const a = run(rec, [{ kind: 'submit', origin, tokens: 318_400 }, ...oldTurn(T2, 320_300)], cfg)
       expect(contexts(a.all)).toEqual([userNote(action)])
-      expect(a.rec.job?.userTook).toBe(false)
       const after = action === 'clear' ? migrateRecord(a.rec, NOW + 20_000) : a.rec
       const b = run(after, [{ kind: 'sessionStart', source: action }, { kind: 'resetDone', seq }], cfg)
       expect(ofType(b.all, 'resume').length).toBe(1)
@@ -743,37 +740,80 @@ test('the queued message\'s turn in the old conversation is interrupted with Esc
   expect(contexts(run(own.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 310_000 }]).all)[0]).toStartWith('[AutoHandoff] Context usage is about 310k tokens')
 })
 
-test('a user message in the reset conversation before the reset result comes back: the user has taken over, no resume message and no chain guard', () => {
-  // SessionStart(clear) 先到（新对话已拿到交接）、promise 还没 resolve 的窗口里用户发了消息：它由新对话处理
+test('a user message that reaches the reset conversation before the reset result comes back gets nothing attached, and the resume message is still sent, with the chain guard (clear and compact, every user-class source)', () => {
+  // SessionStart 先到（重置后的对话已拿到交接）、命令的结果还没回来的窗口里到了一条用户类消息：它由重置后的对话处理。
+  // 不附「即将重置」的说明（重置已经发生）；结果回来时续接照常提交——少了它，新对话答完这一句就停在原地（PLAN §0 第 38 条）
+  const origins = [COMPOSER, BRIDGE, { kind: 'channel', server: 'plugin:telegram:telegram' }, { kind: 'scheduled-trigger' }, { kind: 'plugin', name: 'daily-digest' }]
+  for (const cfg of [defaultConfig(), CFG_COMPACT]) {
+    const action = cfg.settings.action
+    for (const origin of origins) {
+      const { rec, seq } = clearing(cfg)
+      const a = run(
+        action === 'clear' ? migrateRecord(rec, NOW) : rec,
+        [{ kind: 'sessionStart', source: action }, { kind: 'submit', origin, tokens: 9_000 }, { kind: 'resetDone', seq }],
+        cfg,
+      )
+      expect(contexts(a.steps[0]!.fx)[0]).toContain(`"${HANDOVER}"`)
+      expect(contexts(a.steps[1]!.fx)).toEqual([])
+      expect(ofType(a.steps[1]!.fx, 'log').map((f) => f.text)).toEqual([`a user message arrived after the reset, before the result of /${action} (request ${seq}); nothing attached`])
+      expect(a.steps[1]!.rec.job?.stage).toBe(action === 'clear' ? 'clearing' : 'compacting')
+      const resume = ofType(a.all, 'resume')
+      expect(resume.length).toBe(1)
+      expect(resume[0]!.seq).toBe(seq)
+      expect(resume[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+      expect(a.rec.job?.stage).toBe('resuming')
+      // 守卫在续接时置位，比这条消息晚：这条消息解除不了它，用户在重置后的对话里再输入一次（或增量够了）才解除
+      expect([a.rec.resumed, a.rec.resumedAt]).toEqual([true, NOW])
+      const done = run(a.rec, [{ kind: 'resumeDone', seq }], cfg)
+      expect(done.rec.job).toBe(null)
+      expect(ofType(done.all, 'log').map((f) => f.text)).toEqual(['handoff finished: resumed'])
+      expect(run(done.rec, [{ kind: 'register', verdict: FILE_OK, tokens: 11_000 }], cfg).steps[0]!.accepted).toBe(false)
+      const again = run(done.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 12_000 }, { kind: 'register', verdict: FILE_OK, tokens: 12_500 }], cfg)
+      expect(again.steps[0]!.rec.resumed).toBe(false)
+      expect(again.steps[1]!.accepted).toBe(true)
+    }
+  }
+  // 几条消息落在这个窗口里：续接仍只有一次
   const { rec, seq } = clearing()
-  const a = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: COMPOSER, tokens: 9_000 }, { kind: 'resetDone', seq }])
-  expect(contexts(a.steps[0]!.fx)[0]).toContain(`"${HANDOVER}"`)
-  // 不附「即将重置」的说明：重置已经发生
-  expect(contexts(a.steps[1]!.fx)).toEqual([])
-  expect(a.steps[1]!.rec.job?.userTook).toBe(true)
-  expect(ofType(a.all, 'resume')).toEqual([])
-  expect(a.rec.job).toBe(null)
-  expect(a.rec.resumed).toBe(false)
-  expect(ofType(a.steps[2]!.fx, 'log').map((f) => f.text)).toEqual(['handoff finished: the user wrote during the reset; resume message skipped'])
-  // 代理类消息不算用户接手
-  const b = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: { kind: 'task-notification' } }, { kind: 'resetDone', seq }])
-  expect(ofType(b.all, 'resume').length).toBe(1)
+  const many = run(migrateRecord(rec, NOW), [
+    { kind: 'sessionStart', source: 'clear' },
+    { kind: 'submit', origin: BRIDGE, tokens: 9_000 },
+    { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 9_000 },
+    { kind: 'submit', origin: COMPOSER, tokens: 9_000 },
+    { kind: 'resetDone', seq },
+    { kind: 'resumeDone', seq },
+  ])
+  expect(contexts(many.all).length).toBe(1)
+  expect(ofType(many.all, 'resume').length).toBe(1)
+  expect(many.rec.job).toBe(null)
 })
 
 test('the user\'s own /clear runs first and a queued message is answered in that in-between conversation: our /clear wipes it, so the last conversation is still resumed', () => {
   const { rec, seq } = clearing()
-  // 用户的 /clear 先出队：中间这个对话拿到了交接，排队的消息在这里处理（这时看上去像用户接手）
+  // 用户的 /clear 先出队：中间这个对话拿到了交接，排队的消息在这里处理（已拿到交接的对话：什么都不附），期间不续接
   const mid = run(migrateRecord(rec, NOW + 1_000), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: BRIDGE, tokens: 9_000 }, ...oldTurn(T2, 14_000)])
+  expect(contexts(mid.steps[0]!.fx)[0]).toContain(`"${HANDOVER}"`)
+  expect(contexts(mid.all).length).toBe(1)
+  expect(ofType(mid.all, 'resume')).toEqual([])
   expect(mid.rec.job?.stage).toBe('clearing')
-  expect(mid.rec.job?.userTook).toBe(true)
-  // 自家的 /clear 随后把它清掉：搬迁时「用户接手」作废，最后这个对话照常续接
-  const last = run(migrateRecord(mid.rec, NOW + 20_000), [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }])
-  expect(ofType(last.all, 'resume').length).toBe(1)
-  expect(contexts(last.steps[1]!.fx)[0]).toContain(`"${HANDOVER}"`)
-  expect(last.rec.job?.stage).toBe('resuming')
+  expect(mid.rec.job?.ctxGiven).toBe(true)
+  // 自家的 /clear 随后把它清掉：最后这个对话还没拿到交接，SessionStart 给一次，续接一次、带守卫
+  const moved = migrateRecord(mid.rec, NOW + 20_000)
+  expect(moved.job?.ctxGiven).toBe(false)
+  for (const order of [
+    [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'clear' }],
+    [{ kind: 'sessionStart', source: 'clear' }, { kind: 'resetDone', seq }],
+  ] satisfies Ev[][]) {
+    const last = run(moved, order)
+    expect(ofType(last.all, 'resume').length).toBe(1)
+    expect(contexts(last.all).length).toBe(1)
+    expect(contexts(last.all)[0]).toContain(`"${HANDOVER}"`)
+    expect(last.rec.job?.stage).toBe('resuming')
+    expect(last.rec.resumed).toBe(true)
+  }
 })
 
-test('action compact, two messages queued ahead of our /compact, and a compaction that is not ours runs in between (Claude Code compacts in the middle of the first message\'s turn, or the user\'s own /compact goes first): the second message is not the user taking over, and the resume still follows our compaction', () => {
+test('action compact, two messages queued ahead of our /compact, and a compaction that is not ours runs in between (Claude Code compacts in the middle of the first message\'s turn, or the user\'s own /compact goes first): the resume still follows our compaction, whichever of its two events comes first', () => {
   const cfg = CFG_COMPACT
   const { rec, seq } = clearing(cfg)
   const T3 = '9c2f6a1e-7b3d-4e8f-a1c2-5d6e7f8a9b0c'
@@ -801,7 +841,6 @@ test('action compact, two messages queued ahead of our /compact, and a compactio
   // 第二条出队，在压缩过的这个对话里处理；自家的 /compact 还排在它后面，所以它和第一条一样被告知「登记仍有效，答完就重置」
   const second = run(first.rec, [{ kind: 'submit', origin: SCHEDULED, tokens: 52_000 }, ...oldTurn(T3, 57_000)], cfg)
   expect(contexts(second.steps[0]!.fx)).toEqual([userNote('compact')])
-  expect(second.rec.job?.userTook).toBe(false)
   expect(second.rec.job?.stage).toBe('compacting')
   expect(ofType(second.all, 'compact')).toEqual([])
   // 自家的 /compact 执行：SessionStart(compact) 再给一次交接，promise resolve 后照常续接、带守卫
@@ -811,31 +850,35 @@ test('action compact, two messages queued ahead of our /compact, and a compactio
   expect(own.rec.job?.stage).toBe('resuming')
   expect(own.rec.resumed).toBe(true)
 
-  // 用户在第一条的回合里敲了 /compact，它比自家的先执行：结果相同
-  const user = run(
-    rec,
-    [
-      { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
-      { kind: 'turnStart', turnId: T2 },
-      { kind: 'userCommand', command: 'compact' },
-      { kind: 'stop', active: false, tokens: 321_000 },
-      { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 321_000 },
-      { kind: 'sessionStart', source: 'compact' },
-      { kind: 'submit', origin: SCHEDULED },
-      ...oldTurn(T3, 44_000),
-      { kind: 'sessionStart', source: 'compact' },
-      { kind: 'resetDone', seq },
-    ],
-    cfg,
-  )
-  expect(ofType(user.all, 'resume').length).toBe(1)
-  expect(user.rec.resumed).toBe(true)
+  // 用户在第一条的回合里敲了 /compact，它比自家的先执行：它的 SessionStart(compact) 与自家的分不清，这个对话当场拿到交接，
+  // 第二条消息什么都不附；自家的压缩之后续接一次。自家这次的 SessionStart(compact) 与命令结果谁先到都一样
+  const userFirst: Ev[] = [
+    { kind: 'submit', origin: BRIDGE, tokens: 318_400 },
+    { kind: 'turnStart', turnId: T2 },
+    { kind: 'userCommand', command: 'compact' },
+    { kind: 'stop', active: false, tokens: 321_000 },
+    { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 321_000 },
+    { kind: 'sessionStart', source: 'compact' },
+    { kind: 'submit', origin: SCHEDULED },
+    ...oldTurn(T3, 44_000),
+  ]
+  for (const order of [
+    [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }],
+    [{ kind: 'resetDone', seq }, { kind: 'sessionStart', source: 'compact' }],
+  ] satisfies Ev[][]) {
+    const user = run(rec, [...userFirst, ...order], cfg)
+    expect(contexts(user.steps[6]!.fx)).toEqual([])
+    expect(ofType(user.all, 'resume').length).toBe(1)
+    expect(user.rec.job?.stage).toBe('resuming')
+    expect(user.rec.resumed).toBe(true)
+  }
 
-  // 自家这次压缩的 SessionStart 之后、结果回来之前才到的消息，才是重置后的对话里的消息：仍算用户接手，不续接
-  const took = run(second.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: COMPOSER }, { kind: 'resetDone', seq }], cfg)
-  expect(ofType(took.all, 'resume')).toEqual([])
-  expect(took.rec.job).toBe(null)
-  expect(took.rec.resumed).toBe(false)
+  // 自家这次压缩的 SessionStart 之后、结果回来之前才到的消息：由压缩后的对话处理，什么都不附，续接照常
+  const late = run(second.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: COMPOSER }, { kind: 'resetDone', seq }], cfg)
+  expect(contexts(late.steps[1]!.fx)).toEqual([])
+  expect(ofType(late.all, 'resume').length).toBe(1)
+  expect(late.rec.job?.stage).toBe('resuming')
+  expect(late.rec.resumed).toBe(true)
 
   // action=clear：回合中途的压缩不是新对话（不给交接），第二条消息照样附说明；/clear 之后续接
   const c = clearing()
@@ -1383,8 +1426,8 @@ test('a queued reset set aside in a conversation that already has the handoff: t
     expect(ran.rec.stalled).toBe(null)
   }
 
-  // 被搁置的 /clear 终究执行、记录搬到新 sid：被清掉的那个对话里的「已拿到交接」「用户已接手」不带过去，新对话照常续接。
-  // 经过：用户的 /clear 先跑完，在中间那个对话里发了消息（已拿到交接 → 记用户接手）；自家 /clear 的结果一直不来，空闲满一小时被搁置；
+  // 被搁置的 /clear 终究执行、记录搬到新 sid：被清掉的那个对话里的「已拿到交接」不带过去，新对话照常拿到交接并续接。
+  // 经过：用户的 /clear 先跑完，在中间那个对话里发了消息（这个对话已拿到交接）；自家 /clear 的结果一直不来，空闲满一小时被搁置；
   // 之后它执行了
   const c = clearing()
   const m = run(migrateRecord(run(c.rec, [{ kind: 'userCommand', command: 'clear' }]).rec, NOW + 2_000), [
@@ -1395,12 +1438,11 @@ test('a queued reset set aside in a conversation that already has the handoff: t
     [{ kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 45_000 }, NOW + 2 * MIN],
     [{ kind: 'tick' }, NOW + 2 * MIN + WAIT],
   ])
-  expect(m.rec.stalled?.userTook).toBe(true)
   expect(m.rec.stalled?.ctxGiven).toBe(true)
   expect(m.rec.tell).toBe(null)
   const late = NOW + 2 * MIN + WAIT + 30 * MIN
   const moved = migrateRecord(m.rec, late)
-  expect([moved.stalled?.userTook, moved.stalled?.ctxGiven]).toEqual([false, false])
+  expect(moved.stalled?.ctxGiven).toBe(false)
   const fin = run(moved, [[{ kind: 'resetDone', seq: c.seq }, late], [{ kind: 'sessionStart', source: 'clear' }, late + 200]])
   expect(ofType(fin.all, 'resume').length).toBe(1)
   expect(contexts(fin.steps[1]!.fx)[0]).toContain(`Handoff file: "${HANDOVER}"`)
@@ -1585,9 +1627,9 @@ function states(): Record<string, { rec: Rec; seq: number; cfg: ReturnType<typeo
   }
 }
 
-/** 一步之后的形态：job 的阶段（没有 job 为 none）、兜底压缩在不在、挂着的作废说明、用户是否已接手（在重置后的对话里发了消息）、有没有被搁置的重置 */
+/** 一步之后的形态：job 的阶段（没有 job 为 none）、兜底压缩在不在、挂着的作废说明、有没有被搁置的重置、是否挂起 */
 function shape(r: Rec): string {
-  return `${r.job ? r.job.stage : 'none'}${r.fallback ? '+fallback' : ''}${r.tell ? ` tell:${r.tell}` : ''}${r.job?.userTook ? ' took' : ''}${r.stalled ? ' stalled' : ''}${r.held ? ' held' : ''}`
+  return `${r.job ? r.job.stage : 'none'}${r.fallback ? '+fallback' : ''}${r.tell ? ` tell:${r.tell}` : ''}${r.stalled ? ' stalled' : ''}${r.held ? ' held' : ''}`
 }
 
 test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and §0 items 20, 21, 23, 24)', () => {
@@ -1595,17 +1637,16 @@ test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and
   // 第 4 项（可选）：送事件前先改记录
   type Row = [string, (seq: number) => Ev | [Ev, number], Record<(typeof S)[number], string>, ((r: Rec) => Rec)?]
   const kept = { idle: 'none', armed: 'armed', clearing: 'clearing', compacting: 'compacting', resuming: 'resuming', fallback: 'none+fallback' }
-  // 人工消息作废登记时，作废说明当场附在这条消息上（tell 随即清空）；排在已排队的重置前面的消息不作废也不算用户接手
+  // 人工消息作废登记时，作废说明当场附在这条消息上（tell 随即清空）；重置已排队之后到的消息——排在它前面的、
+  // 重置后的对话已拿到交接而自家命令的结果还没回来时到的——都不作废，job 留在原阶段等结果（之后照常续接）
   const cancelsArmed = { ...kept, armed: 'none' }
-  // 重置后的对话已拿到交接、自家命令的结果还没回来时到的消息：记下用户已接手
-  const tookOver = { ...kept, armed: 'none', clearing: 'clearing took', compacting: 'compacting took' }
   const handoffGiven = (r: Rec): Rec => (r.job ? { ...r, job: { ...r.job, ctxGiven: true } } : r)
   const rows: Row[] = [
     // 消息：人工、来源不明、引擎 meta、代理、自家
     ['human message', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), cancelsArmed],
     ['unclassified message without isMeta', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), cancelsArmed],
-    ['human message, handoff already given to this conversation', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), tookOver, handoffGiven],
-    ['unclassified message without isMeta, handoff already given', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), tookOver, handoffGiven],
+    ['human message, handoff already given to this conversation', () => ({ kind: 'submit', origin: COMPOSER, tokens: 320_000 }), cancelsArmed, handoffGiven],
+    ['unclassified message without isMeta, handoff already given', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, tokens: 320_000 }), cancelsArmed, handoffGiven],
     ['task notification, handoff already given', () => ({ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 320_000 }), kept, handoffGiven],
     ['engine meta message (unclassified + isMeta)', () => ({ kind: 'submit', origin: { kind: 'unclassified' }, isMeta: true, tokens: 320_000 }), kept],
     ['task notification', () => ({ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 320_000 }), kept],
@@ -1674,17 +1715,17 @@ test('cancel matrix: every event that can cancel, in every state (PLAN §3.3 and
   expect(fails).toEqual([])
 })
 
-test('isMeta: an engine notice (unclassified + isMeta) never cancels, never counts as the user taking over, adds nothing, and is not human input', () => {
+test('isMeta: an engine notice (unclassified + isMeta) never cancels, adds nothing, and is not human input', () => {
   const META: Ev = { kind: 'submit', origin: { kind: 'unclassified' }, isMeta: true, tokens: 320_000 }
   const a = run(armed().rec, [META])
   expect(a.rec.job?.stage).toBe('armed')
   expect(contexts(a.all)).toEqual([])
   expect(ofType(a.all, 'toast')).toEqual([])
   expect(ofType(a.all, 'log')[0]!.text).toBe('an engine notice (unclassified, isMeta) arrived while armed; the handoff is kept')
-  // 排队中：不算用户接手，重置后照常续接
+  // 排队中：重置后照常续接
   const { rec, seq } = clearing()
   const q = run(rec, [META, { kind: 'resetDone', seq }])
-  expect(q.rec.job?.userTook).toBe(false)
+  expect(q.steps[0]!.rec.job?.stage).toBe('clearing')
   expect(ofType(q.all, 'resume').length).toBe(1)
   expect(contexts(q.all)).toEqual([])
   // 不算人工输入：default_on 不因它生效；提醒与挂着的作废说明也不附在它上面
@@ -1724,7 +1765,7 @@ test('chain guard: a conversation just continued from a handoff refuses to regis
   expect(a.steps[1]!.rec.resumedTokens).toBe(61_000)
   expect(a.steps[2]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file less than a minute ago and its context has grown only 2k since (63k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 300k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 300k, or the user or another Claude session sends a message.',
   )
   expect(a.steps[2]!.accepted).toBe(false)
   expect(a.rec.job).toBe(null)
@@ -1754,11 +1795,12 @@ test('chain guard: a conversation just continued from a handoff refuses to regis
   expect(run(r, [{ kind: 'register', verdict: FILE_OK, tokens: 301_000 }]).steps[0]!.accepted).toBe(true)
   // compact 路径同样
   expect(resumed(CFG_COMPACT).resumed).toBe(true)
-  // 用户在重置后的对话里、自家命令的结果回来之前发了消息（接手了）：不挡
+  // 用户在重置后的对话里、自家命令的结果回来之前发了消息：续接照常提交，守卫在续接时才置位，这条消息解除不了它；再输入一次才解除
   const { rec, seq } = clearing()
-  const took = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: COMPOSER, tokens: 9_000 }, { kind: 'resetDone', seq }])
-  expect([took.rec.resumed, took.rec.resumedAt, took.rec.resumedTokens]).toEqual([false, null, null])
-  // 排在重置前面、在旧对话里处理掉的人工消息不算：新对话照常续接、带守卫，人在新对话里再输入一次才解除
+  const early = run(migrateRecord(rec, NOW), [{ kind: 'sessionStart', source: 'clear' }, { kind: 'submit', origin: COMPOSER, tokens: 9_000 }, { kind: 'resetDone', seq }])
+  expect([early.rec.resumed, early.rec.resumedAt, early.rec.resumedTokens]).toEqual([true, NOW, null])
+  expect(run(early.rec, [{ kind: 'submit', origin: COMPOSER, tokens: 12_000 }]).rec.resumed).toBe(false)
+  // 排在重置前面、在旧对话里处理掉的人工消息同样：新对话照常续接、带守卫，人在新对话里再输入一次才解除
   const before = run(rec, [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 318_400 }, { kind: 'resetDone', seq }])
   expect([before.rec.resumed, before.rec.resumedAt, before.rec.resumedTokens]).toEqual([true, NOW, null])
   expect(run(before.rec, [{ kind: 'submit', origin: { kind: 'bridge' }, tokens: 52_000 }]).rec.resumed).toBe(false)
@@ -1815,7 +1857,7 @@ test('chain guard: a conversation driven by another session (agent messages only
   expect(t.steps[1]!.rec.resumedTokens).toBe(38_400)
   expect(t.steps[7]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file 107 minutes ago and its context has grown only 82k since (121k now). ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context has grown by about 100k since the resume, passes 400k, or the user or another Claude session sends a message.',
   )
   // 主人这时看 /autohandoff status：守卫那一行给出基准与目前的增量（查看状态不算发话，不解除）。
   // 增量 83,600 取整为 83k，基准按 122k − 83k 显示为 39k（实际 38,400），与 Context 行的 122k 对得上
@@ -1823,7 +1865,7 @@ test('chain guard: a conversation driven by another session (agent messages only
   const lines = ofType(st.all, 'log')[0]!.text.split('\n')
   expect(lines).toContain('Context: 122k of 1000k. Reminders at 400k and 450k, compaction at 650k; reset with /clear.')
   expect(lines).toContain(
-    'Just continued from a handoff file about 2 hours ago: a new handoff is not accepted until context has grown by 100k since the resume (from 39k, 83k so far), passes 400k, or you type a message or a command (this stops a reset loop).',
+    'Just continued from a handoff file about 2 hours ago: a new handoff is not accepted until context has grown by 100k since the resume (from 39k, 83k so far), passes 400k, or a message arrives from you or another Claude session, or you type a command (this stops a reset loop).',
   )
   expect(st.rec.resumed).toBe(true)
   // 第二批：增量差一个 token 时仍挡着，到 100k 解除；之后到 296k 按工程规则（约 300k 主动交接）交接，受理
@@ -1865,11 +1907,11 @@ test('chain guard: resume_guard_tokens 0 leaves only remind_at and the user\'s m
   expect(t.steps[2]!.accepted).toBe(false)
   expect(t.steps[2]!.reply).toBe(
     'Not registered: this conversation was continued from a handoff file about 3 hours ago and its context (251k) is below 400k. ' +
-      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 400k or the user sends a message.',
+      'Carry on with the work the handoff file describes, and hand off only when an AutoHandoff reminder asks for it or the user\'s or the project\'s instructions call for ending this conversation and continuing in a new one (updating a handover or notes document such as HANDOVER.md does not count). Registering works again once the context passes 400k, or the user or another Claude session sends a message.',
   )
   const st = run(t.rec, [[{ kind: 'toggle', args: 'status', tokens: 251_000 }, NOW + 3 * 60 * MIN]], cfg)
   expect(ofType(st.all, 'log')[0]!.text).toContain(
-    'Just continued from a handoff file about 3 hours ago: a new handoff is not accepted until context passes 400k or you type a message or a command (this stops a reset loop).',
+    'Just continued from a handoff file about 3 hours ago: a new handoff is not accepted until context passes 400k, or a message arrives from you or another Claude session, or you type a command (this stops a reset loop).',
   )
   // 越过 remind_at：解除，提醒照常
   const big = run(t.rec, [{ kind: 'postTool', tokens: 401_000 }, { kind: 'register', verdict: FILE_OK, tokens: 402_000 }], cfg)
@@ -1883,11 +1925,11 @@ test('chain guard in /autohandoff status: before the first usage reading after t
   const r = resumed()
   const unread = ofType(run(r, [[{ kind: 'toggle', args: 'status' }, NOW + 4 * MIN]]).all, 'log')[0]!.text
   expect(unread).toContain(
-    'Just continued from a handoff file 4 minutes ago: a new handoff is not accepted until context has grown by 100k since the resume (usage after the resume not read yet), passes 300k, or you type a message or a command (this stops a reset loop).',
+    'Just continued from a handoff file 4 minutes ago: a new handoff is not accepted until context has grown by 100k since the resume (usage after the resume not read yet), passes 300k, or a message arrives from you or another Claude session, or you type a command (this stops a reset loop).',
   )
   const first = run(r, [[{ kind: 'toggle', args: 'status', tokens: 52_300 }, NOW + 4 * MIN]])
   expect(first.rec.resumedTokens).toBe(52_300)
-  expect(ofType(first.all, 'log')[0]!.text).toContain('(from 52k, 0k so far), passes 300k, or you type a message or a command')
+  expect(ofType(first.all, 'log')[0]!.text).toContain('(from 52k, 0k so far), passes 300k, or a message arrives from you or another Claude session, or you type a command')
 })
 
 test('chain guard with action compact: set when our /compact resolves; the growth base is the first usage reading after the compaction', () => {
@@ -1998,7 +2040,7 @@ test('chain guard and Claude Code\'s own compaction: usage falling below the bas
   expect(t.steps[5]!.accepted).toBe(false)
   expect(t.steps[5]!.reply).toContain('continued from a handoff file 43 minutes ago and its context has grown only 0k since (41k now).')
   const st = ofType(run(t.rec, [[{ kind: 'toggle', args: 'status', typed: true, tokens: 41_000 }, NOW + 44 * MIN]], cfg).all, 'log')[0]!.text
-  expect(st).toContain('has grown by 100k since the resume (from 70k; the context is below that now), passes 400k, or you type a message or a command')
+  expect(st).toContain('has grown by 100k since the resume (from 70k; the context is below that now), passes 400k, or a message arrives from you or another Claude session, or you type a command')
   // 要涨到基准 + 100k（170k）才解除
   const u = run(
     t.rec,
@@ -2048,12 +2090,12 @@ test('compact window (action compact): a human message, an agent message, /autoh
   expect(ofType(h.all, 'compact')).toEqual([])
   expect(h.rec.job?.stage).toBe('resuming')
   expect(h.rec.resumed).toBe(true)
-  // SessionStart(compact) 之后、promise resolve 之前到的人工消息：由压缩后的对话处理（用户接手），不附说明、不续接
+  // SessionStart(compact) 之后、promise resolve 之前到的人工消息：由压缩后的对话处理，不附说明；结果回来时续接照常提交
   const h2 = run(rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: COMPOSER }, { kind: 'resetDone', seq }], cfg)
   expect(contexts(h2.steps[1]!.fx)).toEqual([])
-  expect(ofType(h2.all, 'resume')).toEqual([])
-  expect(h2.rec.job).toBe(null)
-  expect(h2.rec.resumed).toBe(false)
+  expect(ofType(h2.all, 'resume').length).toBe(1)
+  expect(h2.rec.job?.stage).toBe('resuming')
+  expect(h2.rec.resumed).toBe(true)
   // 实测的顺序（压缩窗口里敲的消息要等压缩完才交出，这时已是续接阶段）：续接已提交，消息照常处理
   const h3 = run(rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }, { kind: 'submit', origin: COMPOSER }], cfg)
   expect(ofType(h3.all, 'resume').length).toBe(1)
@@ -2094,8 +2136,8 @@ test('compact window: the user\'s /clear runs before the queued /compact; the ne
   const ok = run(ss.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'resetDone', seq }], cfg)
   expect(contexts(ok.all).length).toBe(1)
   expect(ofType(ok.all, 'resume').length).toBe(1)
-  // 用户在自己 /clear 出来的新对话里发了消息、模型答了（这个对话已拿到交接：用户已接手），之后自家的 /compact 才在这个对话上执行：
-  // 压缩完不再硬塞一条续接，也不置守卫。SessionStart(compact) 与命令结果谁先到都一样
+  // 用户在自己 /clear 出来的新对话里发了消息、模型答了（这个对话已拿到交接，消息什么都不附），之后自家的 /compact 才在这个对话上执行：
+  // 压缩完照常续接一次、置守卫（压缩抹掉了 start_context，SessionStart(compact) 再给一次）。SessionStart(compact) 与命令结果谁先到都一样
   const inNew = run(
     ss.rec,
     [
@@ -2107,15 +2149,21 @@ test('compact window: the user\'s /clear runs before the queued /compact; the ne
     ],
     cfg,
   )
-  expect(contexts(inNew.steps[0]!.fx)).toEqual([])
-  expect(inNew.rec.job?.userTook).toBe(true)
+  expect(contexts(inNew.all)).toEqual([])
+  expect(ofType(inNew.all, 'resume')).toEqual([])
+  expect(inNew.rec.job?.stage).toBe('compacting')
   const ssCompact: Ev = { kind: 'sessionStart', source: 'compact' }
   const result: Ev = { kind: 'resetDone', seq }
   for (const order of [[ssCompact, result], [result, ssCompact]]) {
     const end = run(inNew.rec, order, cfg)
-    expect(ofType(end.all, 'resume')).toEqual([])
-    expect(end.rec.job).toBe(null)
-    expect(end.rec.resumed).toBe(false)
+    const resume = ofType(end.all, 'resume')
+    expect(resume.length).toBe(1)
+    expect(resume[0]!.text).toContain(`Handoff file: "${HANDOVER}"`)
+    expect(contexts(end.all).length).toBe(1)
+    expect(contexts(end.all)[0]).toContain(`Handoff file: "${HANDOVER}"`)
+    expect(end.rec.job?.stage).toBe('resuming')
+    expect(end.rec.resumed).toBe(true)
+    expect(run(end.rec, [{ kind: 'resumeDone', seq }], cfg).rec.job).toBe(null)
   }
   // 自家 /compact 在几乎空的新对话上失败：不告诉模型「重置失败」，照常续接
   const failed = run(ss.rec, [{ kind: 'resetFailed', seq, message: 'autohandoff: $.command.run: Error: Not enough messages to compact.' }], cfg)
@@ -2432,4 +2480,211 @@ test('a refused registration says an earlier registration still stands (it is no
   const c = run(a.rec, [{ kind: 'register', verdict: { ok: false, why: 'the file does not exist' } }])
   expect(c.steps[0]!.reply).toBe(`Not registered: the file does not exist. Your earlier registration of "${P}" is still in effect.`)
   expect(run(onRecord(), [{ kind: 'register', verdict: { ok: false, why: 'the file does not exist' } }]).steps[0]!.reply).toBe('Not registered: the file does not exist.')
+})
+
+// ───────── 4.3.0：通知、来源（别的会话、channel）、重置后先到的代理消息 ─────────
+
+const TELEGRAM = { kind: 'channel', server: 'plugin:telegram:telegram' }
+
+test('an agent message handled after the reset but before our own result gets no "about to reset" note; the resume still follows (clear and compact)', () => {
+  // /clear：新对话的 SessionStart(clear) 已经给了交接，排着的任务通知抢在 resetDone 前面进来。这时再说「马上要重置、别开新工作」
+  // 就是对新对话说的，模型会把子代理的结果敷衍过去
+  const { rec, seq } = clearing()
+  const a = run(migrateRecord(rec, NOW), [
+    { kind: 'sessionStart', source: 'clear' },
+    { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 21_000 },
+    { kind: 'resetDone', seq },
+  ])
+  expect(contexts(a.steps[0]!.fx).length).toBe(1)
+  expect(contexts(a.steps[1]!.fx)).toEqual([])
+  expect(ofType(a.steps[1]!.fx, 'log').map((f) => f.text)).toEqual([`an agent message arrived after the reset, before the result of /clear (request ${seq}); nothing attached`])
+  expect(ofType(a.all, 'resume').length).toBe(1)
+  expect(a.rec.resumed).toBe(true)
+  // /compact（SessionStart(compact) 实测先于命令的结果）：别的会话的消息落在这个窗口里，同样不附
+  const c = run(armed(onRecord(), CFG_COMPACT).rec, [{ kind: 'stop', active: false }, DONE], CFG_COMPACT)
+  const cseq = lastSeq(c.all)
+  const b = run(c.rec, [{ kind: 'sessionStart', source: 'compact' }, { kind: 'submit', origin: { kind: 'peer' }, isMeta: true }, { kind: 'resetDone', seq: cseq }], CFG_COMPACT)
+  expect(contexts(b.steps[1]!.fx)).toEqual([])
+  expect(ofType(b.all, 'resume').length).toBe(1)
+  // 重置之前到的（排在自家命令前面、在旧对话里开回合）照旧附说明
+  const before = run(rec, [{ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 318_900 }])
+  expect(contexts(before.all)[0]).toStartWith('[AutoHandoff] The conversation is about to be reset with /clear')
+})
+
+test('a handoff that fails after the model has stopped to wait for the reset is notified, not only toasted; a cancellation the model hears about at once is not', () => {
+  const notified = (t: { all: readonly { type: string }[] }): [number, number] => [ofType(t.all as never, 'notify').length, ofType(t.all as never, 'toast').length]
+  const a = armed().rec
+  const stopped: Ev = { kind: 'stop', active: false }
+  // 回合结束时交接文件没了
+  expect(notified(run(a, [stopped, { ...DONE, file: { ok: false, why: 'missing' } }]))).toEqual([1, 1])
+  // 回合以 API 错误、拒绝结束
+  expect(notified(run(a, [{ ...DONE, reason: 'error' }]))).toEqual([1, 1])
+  expect(notified(run(a, [{ ...DONE, reason: 'refusal' }]))).toEqual([1, 1])
+  // 重置命令失败（不是 Esc）
+  const q = clearing()
+  const failed = run(q.rec, [{ kind: 'resetFailed', seq: q.seq, message: 'autohandoff: $.command.run: /clear is not available right now' }])
+  expect(notified(failed)).toEqual([1, 1])
+  expect(ofType(failed.all, 'notify')[0]!.text).toBe('AutoHandoff: handoff cancelled (the reset command failed)')
+  // 登记后久等不到回合结束；重启或重载
+  expect(notified(run(a, [[{ kind: 'tick' }, NOW + WAIT]]))).toEqual([1, 1])
+  expect(notified(run(a, [{ kind: 'start' }]))).toEqual([1, 1])
+  expect(notified(run(q.rec, [{ kind: 'start', queuedHere: false }]))).toEqual([1, 1])
+  // 之前按过 Esc、命令当场被拒：人多半不在
+  expect(notified(run(q.rec, [{ kind: 'resetFailed', seq: q.seq, message: VETO }]))).toEqual([1, 1])
+  // 只 toast：作废说明随这条消息当场送到模型（用户的消息、定时任务），或人刚按了 Esc
+  expect(notified(run(a, [{ kind: 'submit', origin: COMPOSER, tokens: 310_000 }]))).toEqual([0, 1])
+  expect(notified(run(a, [{ kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 310_000 }]))).toEqual([0, 1])
+  expect(notified(run(q.rec, [{ kind: 'resetFailed', seq: q.seq, message: 'autohandoff: $.command.run: the command was removed from the queue before it ran' }]))).toEqual([0, 1])
+  // 用户自己的操作照旧不出声
+  expect(notified(run(a, [{ ...DONE, reason: 'aborted', isAborted: true }]))).toEqual([0, 0])
+  expect(notified(run(a, [{ kind: 'userCommand', command: 'clear' }]))).toEqual([0, 0])
+})
+
+test('chain guard: a message from another session lifts it; this session\'s own subagent reports and task notifications do not', () => {
+  const r = resumed()
+  const base: [Ev, number][] = [
+    [{ kind: 'turnStart', turnId: T2 }, NOW + 1_000],
+    [{ kind: 'postTool', tokens: 58_000 }, NOW + 20_000],
+  ]
+  const reg: [Ev, number] = [{ kind: 'register', verdict: FILE_OK, tokens: 96_000 }, NOW + 50 * MIN]
+  // 后台子代理的最终汇报（prompt.submit 的来源同样是 peer，但没有 session.receive）、后台命令的通知：守卫还在
+  const own = run(r, [
+    ...base,
+    [{ kind: 'submit', origin: { kind: 'peer' }, isMeta: true, tokens: 71_000 }, NOW + 30 * MIN],
+    [{ kind: 'submit', origin: { kind: 'task-notification' }, tokens: 84_000 }, NOW + 40 * MIN],
+    reg,
+  ])
+  expect(own.rec.resumed).toBe(true)
+  expect(own.steps.at(-1)!.accepted).toBe(false)
+  expect(own.steps.at(-1)!.reply).toContain('or the user or another Claude session sends a message.')
+  // 协调会话发来消息（session.receive，随后才是它的 prompt.submit）：解除，之后的登记受理
+  for (const origin of ['peer', 'peer-send-message', 'projects-relay']) {
+    const t = run(r, [
+      ...base,
+      [{ kind: 'peerMessage', origin }, NOW + 30 * MIN],
+      [{ kind: 'submit', origin: { kind: origin }, isMeta: true, tokens: 71_000 }, NOW + 30 * MIN + 40],
+      reg,
+    ])
+    expect([t.steps[2]!.rec.resumed, t.steps[2]!.rec.resumedAt, t.steps[2]!.rec.resumedTokens]).toEqual([false, null, null])
+    expect(ofType(t.steps[2]!.fx, 'log').map((f) => f.text)).toEqual([`a message from another session arrived (${origin}); a handoff can be registered again`])
+    expect(t.steps.at(-1)!.accepted).toBe(true)
+  }
+  // 没有守卫时什么都不动；登记中、重置排队中也不受影响
+  const plain = onRecord()
+  expect(run(plain, [{ kind: 'peerMessage', origin: 'peer' }]).rec).toEqual({ ...plain, t: NOW })
+  const a = armed().rec
+  expect(run(a, [{ kind: 'peerMessage', origin: 'peer' }]).rec.job).toEqual(a.job)
+})
+
+test('a message from another session does not end the pause after Esc: Claude Code still runs no reset until the user\'s own input', () => {
+  const q = clearing()
+  const held = run(q.rec, [{ kind: 'resetFailed', seq: q.seq, message: VETO }]).rec
+  expect(held.held).toBe(true)
+  const t = run(held, [{ kind: 'peerMessage', origin: 'peer' }, { kind: 'submit', origin: { kind: 'peer' }, isMeta: true, tokens: 320_000 }, { kind: 'register', verdict: FILE_OK, tokens: 321_000 }])
+  expect(t.rec.held).toBe(true)
+  expect(t.steps.at(-1)!.reply).toBe(`Not registered: ${HELD_TEXT}`)
+})
+
+test('a channel message (Telegram) is the user\'s own: it lifts the chain guard and the pause after Esc, and cancels a registration as "a new message from the user"', () => {
+  // 连环交接守卫
+  const r = resumed()
+  const g = run(r, [
+    [{ kind: 'turnStart', turnId: T2 }, NOW + 1_000],
+    [{ kind: 'postTool', tokens: 58_000 }, NOW + 20_000],
+    [{ kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 64_000 }, NOW + 25 * MIN],
+    [{ kind: 'register', verdict: FILE_OK, tokens: 66_000 }, NOW + 26 * MIN],
+  ])
+  expect(g.steps[2]!.rec.resumed).toBe(false)
+  expect(g.steps.at(-1)!.accepted).toBe(true)
+  // Esc 之后的挂起：提醒随这条消息恢复（先送挂着的作废说明，不带「暂停」那句），之后登记受理
+  const q = clearing()
+  const held = run(q.rec, [{ kind: 'resetFailed', seq: q.seq, message: VETO }]).rec
+  const h = run(held, [{ kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 322_000 }, { kind: 'register', verdict: FILE_OK, tokens: 323_000 }])
+  expect(h.steps[0]!.rec.held).toBe(false)
+  expect(contexts(h.steps[0]!.fx).length).toBe(1)
+  expect(contexts(h.steps[0]!.fx)[0]).toContain('Your registered handoff was cancelled')
+  expect(contexts(h.steps[0]!.fx)[0]).not.toContain(HELD_NOTE)
+  expect(h.steps[1]!.accepted).toBe(true)
+  // 登记中：作废，原因说成用户的新消息（不再是「不是用户打的」）
+  const c = run(armed().rec, [{ kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 311_000 }])
+  expect(c.rec.job).toBe(null)
+  expect(contexts(c.all)[0]).toContain('Your registered handoff was cancelled (a new message from the user arrived)')
+  // 定时任务、别的插件的消息照旧：不解除守卫，说成「不是用户打的」
+  const s = run(r, [{ kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 60_000 }])
+  expect(s.rec.resumed).toBe(true)
+  expect(contexts(run(armed().rec, [{ kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 311_000 }]).all)[0]).toContain('that was not typed by the user')
+})
+
+test('a session that has never had keyboard input and whose first input is a channel message (Telegram): default_on takes effect from that message, and the reminders, the Stop block and registering follow the thresholds as usual', () => {
+  // 无人值守起的会话（没人在终端里打过字），用户只从 Telegram 给它派活
+  const cfg = cfgWith({ default_on: true })
+  const fresh = newRecord(NOW - MIN)
+  expect(fresh.human).toBe(false)
+  // 在这之前到的定时任务、任务通知不让 default_on 生效：越线也不提醒
+  const idle = run(fresh, [{ kind: 'submit', origin: { kind: 'scheduled-trigger' }, tokens: 304_000 }, { kind: 'submit', origin: { kind: 'task-notification' }, tokens: 304_500 }], cfg)
+  expect(idle.rec.human).toBe(false)
+  expect(contexts(idle.all)).toEqual([])
+  // 第一条 channel 消息（还在阈值之下）：从此生效，这条消息本身不带提醒
+  const a = run(idle.rec, [
+    { kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 212_000 },
+    { kind: 'turnStart', turnId: T1 },
+    { kind: 'postTool', tokens: 268_000 },
+    // 越过 remind_at 的那次工具调用：完整提醒，只送一次
+    { kind: 'postTool', tokens: 301_900 },
+    { kind: 'postTool', tokens: 309_300 },
+    { kind: 'stop', active: false, tokens: 310_000 },
+    { kind: 'turnComplete', turnId: T1, reason: 'answer', isAborted: false, tokens: 310_000 },
+  ], cfg)
+  expect(a.steps[0]!.rec.human).toBe(true)
+  expect(contexts(a.steps[0]!.fx)).toEqual([])
+  expect(contexts(a.steps[2]!.fx)).toEqual([])
+  expect(contexts(a.steps[3]!.fx).length).toBe(1)
+  expect(contexts(a.steps[3]!.fx)[0]).toContain('past the first threshold of 300k')
+  expect(contexts(a.steps[4]!.fx)).toEqual([])
+  expect(a.rec.levels).toEqual({ remind: true, urge: false })
+  // 下一条 channel 消息带每回合短提醒；越过 urge_at 送 urge，回合结束前被 Stop block 拦一次；登记受理，回合结束后重置
+  const b = run(a.rec, [
+    { kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 310_000 },
+    { kind: 'turnStart', turnId: T2 },
+    { kind: 'postTool', tokens: 502_000 },
+    { kind: 'stop', active: false, tokens: 503_000 },
+    { kind: 'register', verdict: FILE_OK, tokens: 505_000 },
+    { kind: 'stop', active: true, tokens: 505_000 },
+    { kind: 'turnComplete', turnId: T2, reason: 'answer', isAborted: false, tokens: 505_000, file: FILE_OK },
+  ], cfg)
+  expect(contexts(b.steps[0]!.fx).length).toBe(1)
+  expect(contexts(b.steps[0]!.fx)[0]).toStartWith('[AutoHandoff] Context usage is about 310k tokens')
+  expect(contexts(b.steps[2]!.fx).length).toBe(1)
+  expect(b.steps[2]!.rec.levels).toEqual({ remind: true, urge: true })
+  expect(ofType(b.steps[3]!.fx, 'block').length).toBe(1)
+  expect(b.steps[4]!.accepted).toBe(true)
+  expect(ofType(b.all, 'clear').length).toBe(1)
+  expect(b.rec.job?.stage).toBe('clearing')
+  // /autohandoff status：生效之前说「第一条消息起生效」，之后不说
+  const before = run(fresh, [{ kind: 'toggle', args: 'status', tokens: 212_000, window: 1_000_000 }], cfg)
+  expect(ofType(before.all, 'log')[0]!.text).toStartWith('AutoHandoff is off for this conversation (default_on: true; it switches on at your first message).\n')
+  const after = run(a.steps[0]!.rec, [{ kind: 'toggle', args: 'status', tokens: 212_000, window: 1_000_000 }], cfg)
+  expect(ofType(after.all, 'log')[0]!.text).toStartWith('AutoHandoff is on for this conversation (default_on: true).\n')
+  // default_on 关着时 channel 消息不会把它打开
+  const off = run(fresh, [{ kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 305_000 }])
+  expect(off.rec.human).toBe(true)
+  expect(contexts(off.all)).toEqual([])
+})
+
+test('a channel message clears a wrong teammate mark, and a team-lead delivery after one is ignored, as with typed input', () => {
+  const cfg = cfgWith({ default_on: true })
+  const fresh = newRecord(NOW - MIN)
+  // 被误标成 teammate 的进程收到用户从 channel 发的消息：标记撤掉，default_on 生效
+  const mate = run(fresh, [{ kind: 'teammate' }, { kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 305_000 }], cfg)
+  expect(mate.steps[0]!.rec.teammate).toBe(true)
+  expect([mate.rec.teammate, mate.rec.human]).toEqual([false, true])
+  expect(contexts(mate.steps[1]!.fx).length).toBe(1)
+  // 收到过 channel 消息的进程之后再来 team-lead 的投递：不标成 teammate
+  const later = run(fresh, [{ kind: 'submit', origin: TELEGRAM, isMeta: true, tokens: 120_000 }, { kind: 'teammate' }], cfg)
+  expect(later.rec.teammate).toBe(false)
+  // Slack 提醒、定时任务照旧不算人工输入：标记留着
+  for (const kind of ['slack-ping', 'scheduled-trigger', 'coordinator']) {
+    const kept = run(fresh, [{ kind: 'teammate' }, { kind: 'submit', origin: { kind }, tokens: 305_000 }], cfg)
+    expect([kept.rec.teammate, kept.rec.human]).toEqual([true, false])
+  }
 })
